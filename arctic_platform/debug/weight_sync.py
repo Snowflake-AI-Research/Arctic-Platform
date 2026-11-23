@@ -795,6 +795,9 @@ class ShadowVerifier:
         return {
             "status": "ok",
             "received": self.received,
+            # The bytes of every parameter this rank now serves, hashed as vLLM's ``compute_weight_checksums`` hashes them,
+            # so the same TP rank can be compared across replicas and against an independently built shard.
+            "installed": {name: tensor_manifest(value)["sha256"] for name, value in self.parameters.items()},
             "destinations": destinations,
             "unverifiable_destinations": [],
             "non_parameter_destinations": [],
