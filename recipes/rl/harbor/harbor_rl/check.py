@@ -109,6 +109,7 @@ def check_first_task(
     env_kwargs: dict[str, Any],
     rollouts: int,
     prepare_task_fn: Callable[[dict, Path], Any],
+    verifier_env: dict[str, str] | None = None,
 ) -> None:
     """Raise ``SystemExit`` if the first task in ``train_file`` can't start, run a command, and be graded on ``env``."""
     with tempfile.TemporaryDirectory(prefix="harbor-rl-check-") as tmp:
@@ -131,6 +132,7 @@ def check_first_task(
                     base_url="http://127.0.0.1:9",
                     api_key="check",
                     env_kwargs=env_kwargs,
+                    verifier_env=verifier_env,
                 )
             )
             error = result.get("exception")
