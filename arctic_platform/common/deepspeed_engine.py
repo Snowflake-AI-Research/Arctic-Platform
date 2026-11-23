@@ -457,16 +457,13 @@ def _aligned_first(params: list) -> list:
 
 
 def _refuse_restoring_another_parameter_layout(zero_optimizer) -> None:
-    """Refuse to restore ZeRO-1/2 or BF16-optimizer masters and Adam moments saved with the parameters elsewhere.
+    """Check the parameter slices DeepSpeed restores by position, including repartitioned ZeRO masters."""
+    from itertools import repeat
+    from math import inf
 
-    DeepSpeed restores both by position in each group's flat buffer, so a checkpoint saved with another parameter
-    order (before ``_aligned_first``, for one) loads without error onto other parameters. Every saved partition
-    records each named parameter's address in it (``param_slice_mappings``); the restore goes ahead only when the
-    saved addresses, placed in the whole flat buffer, are this rank's addresses now. That also covers a resized
-    masters-only restore, which reads every saved partition. Activation-checkpoint wrappers rename parameters
-    without moving them, so their name segment is ignored.
-    """
     from deepspeed import comm as dist
+    from deepspeed.checkpoint.constants import GROUP_PADDINGS
+    from deepspeed.checkpoint.constants import PARAM_ALIGNMENT_PADDINGS
     from deepspeed.checkpoint.constants import PARAM_SLICE_MAPPINGS
     from deepspeed.checkpoint.constants import SINGLE_PARTITION_OF_FP32_GROUPS
     from deepspeed.runtime.bf16_optimizer import BF16_Optimizer
@@ -475,27 +472,8 @@ def _refuse_restoring_another_parameter_layout(zero_optimizer) -> None:
     if not isinstance(zero_optimizer, (DeepSpeedZeroOptimizer, BF16_Optimizer)):
         return
     load = zero_optimizer._load_legacy_checkpoint
-    if isinstance(zero_optimizer, BF16_Optimizer):
-        partitions = zero_optimizer.fp32_groups_flat_partition
-    else:
-        partitions = zero_optimizer.single_partition_of_fp32_groups
-
-    def spans(located, lo, hi):
-        """Each parameter's [start, end) pieces within [lo, hi), from (partition offset, mappings) pairs."""
-        result: dict[str, list[list[int]]] = {}
-        for start, end, name in sorted(
-            (offset + at.start, offset + at.start + at.numel, name.replace("._checkpoint_wrapped_module", ""))
-            for offset, mappings in located
-            for name, at in mappings.items()
-        ):
-            start, end = max(lo, start), min(hi, end)
-            if start < end:
-                pieces = result.setdefault(name, [])
-                if pieces and pieces[-1][1] == start:
-                    pieces[-1][1] = end
-                else:
-                    pieces.append([start, end])
-        return result
+    bf16 = isinstance(zero_optimizer, BF16_Optimizer)
+    groups = zero_optimizer.bf16_groups if bf16 else zero_optimizer.round_robin_bit16_groups
 
     def refuse(rank, detail):
         raise RuntimeError(
@@ -507,15 +485,52 @@ def _refuse_restoring_another_parameter_layout(zero_optimizer) -> None:
     def load_same_layout(state_dict_list, load_optimizer_states=True, load_from_fp32_weights=False):
         if load_optimizer_states or load_from_fp32_weights:
             rank = dist.get_rank(group=zero_optimizer.dp_process_group)
-            saved = [sd[PARAM_SLICE_MAPPINGS] for sd in state_dict_list]
-            if any(len(groups) != len(partitions) for groups in saved):
-                refuse(rank, f"{len(saved[0])} parameter groups saved, {len(partitions)} now")
-            for group, partition in enumerate(partitions):
-                # Every saved partition but the last is full, so partition k starts at k times the first one's size.
-                saved_width = state_dict_list[0][SINGLE_PARTITION_OF_FP32_GROUPS][group].numel()
-                lo, hi = rank * partition.numel(), (rank + 1) * partition.numel()
-                new = spans([(lo, zero_optimizer._param_slice_mappings[group])], lo, hi)
-                old = spans([(index * saved_width, groups[group]) for index, groups in enumerate(saved)], lo, hi)
+            resized = len(state_dict_list) != dist.get_world_size(group=zero_optimizer.dp_process_group)
+            # With unchanged DP, DeepSpeed can leave every checkpoint but this rank's unread (None).
+            states = state_dict_list if resized else [state_dict_list[rank]]
+            for state in states:
+                count = len(state[PARAM_SLICE_MAPPINGS])
+                if count != len(groups):
+                    refuse(rank, f"{count} parameter groups saved, {len(groups)} now")
+            for group, params in enumerate(groups):
+                saved = zero_optimizer._checkpoint_group_state_dicts(states, group) if resized else states
+                lo, hi = 0, inf
+                if not resized:
+                    dp = zero_optimizer.real_dp_process_group[group]
+                    group_rank = dist.get_rank(group=dp)
+                    # ZeRO strips trailing DP padding when saving, while BF16 saves the entire partition.
+                    width = saved[0][SINGLE_PARTITION_OF_FP32_GROUPS][group].numel()
+                    if not bf16:
+                        width += saved[0][GROUP_PADDINGS][group]
+                    lo = group_rank * width
+                    if group_rank + 1 < dist.get_world_size(group=dp):
+                        hi = lo + width
+
+                old = {}
+                offset = lo
+                for state in saved:
+                    for name, at in state[PARAM_SLICE_MAPPINGS][group].items():
+                        name = name.replace("._checkpoint_wrapped_module", "")
+                        start, end = offset + at.start, offset + at.start + at.numel
+                        if name in old and old[name][1] != start:
+                            refuse(rank, f"group {group}: disjoint saved slices of {name}")
+                        old[name] = (old[name][0] if name in old else start, end)
+                    offset += state[SINGLE_PARTITION_OF_FP32_GROUPS][group].numel()
+
+                # DeepSpeed inserts between-parameter alignment on restore from a legacy compact checkpoint.
+                padding = (
+                    zero_optimizer.round_robin_bit16_padding[group]
+                    if PARAM_ALIGNMENT_PADDINGS in saved[0]
+                    else repeat(0)
+                )
+                new = {}
+                start = 0
+                for param, pad in zip(params, padding):
+                    end = start + param.numel()
+                    if max(start, lo) < min(end, hi):
+                        name = zero_optimizer.param_names[param].replace("._checkpoint_wrapped_module", "")
+                        new[name] = (max(start, lo), min(end, hi))
+                    start = end + pad
                 if old != new:
                     name = next(name for name in {**old, **new} if old.get(name) != new.get(name))
                     refuse(rank, f"group {group}: {name} saved at {old.get(name)}, now at {new.get(name)}")

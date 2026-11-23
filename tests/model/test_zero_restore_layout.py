@@ -14,6 +14,8 @@
 # limitations under the License.
 """Real ZeRO-2 save/resume preserves each GLM-5.3 parameter's master and moments, or refuses a reordered checkpoint."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -34,7 +36,7 @@ ZERO = {
 }
 
 
-def _engine(checkpoint_wrapped_layers=0, zero="zero2-offload"):
+def _engine(checkpoint_wrapped_layers=0, zero="zero2-offload", *, parameter_alignment=False):
     from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
 
     from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
@@ -54,7 +56,7 @@ def _engine(checkpoint_wrapped_layers=0, zero="zero2-offload"):
         world_size=1,
         fp32_masters=True,
         ds_overrides={
-            "zero_optimization": ZERO[zero],
+            "zero_optimization": {**ZERO[zero], "parameter_alignment": parameter_alignment},
             "zero_force_ds_cpu_optimizer": False,
             "data_types": {"grad_accum_dtype": "fp32"},
         },
@@ -117,6 +119,23 @@ def test_resume_restores_every_parameters_own_master_and_moments(
 
 
 @require_deepspeed
+def test_legacy_compact_layout_restores_into_aligned_zero_groups(single_rank_group, tmp_path):
+    from deepspeed.checkpoint.constants import OPTIMIZER_STATE_DICT
+    from deepspeed.checkpoint.constants import PARAM_ALIGNMENT_PADDINGS
+
+    expected = _train_and_save(_engine(), tmp_path)
+    (path,) = tmp_path.glob("step/*_optim_states.pt")
+    state = torch.load(path, weights_only=False)
+    del state[OPTIMIZER_STATE_DICT][PARAM_ALIGNMENT_PADDINGS]
+    torch.save(state, path)
+    resumed = _engine(parameter_alignment=True)
+    resumed.load_checkpoint(tmp_path, tag="step")
+    for name, values in _optimizer_state(resumed).items():
+        for actual, saved in zip(values, expected[name]):
+            torch_assert_equal(actual, saved)
+
+
+@require_deepspeed
 @pytest.mark.parametrize("zero", list(ZERO))
 def test_resume_across_a_parameter_order_change_refuses_or_restores_every_parameter(
     single_rank_group, tmp_path, monkeypatch, zero
@@ -141,31 +160,54 @@ def test_resume_across_a_parameter_order_change_refuses_or_restores_every_parame
     assert not wrong, f"{len(wrong)} of {len(expected)} parameters resumed with another one's state: {wrong[:4]}"
 
 
-def _resized_restore(monkeypatch, saved_order):
-    """A masters-only restore of one saved 8-element partition into rank 1 of two 4-element partitions."""
+@require_deepspeed
+@pytest.mark.parametrize(
+    ("saved_dp", "current_dp", "bf16"),
+    [(1, 2, False), (2, 1, False), (2, 2, False), (2, 2, True)],
+    ids=["expand", "shrink", "rigid-zero", "rigid-bf16"],
+)
+def test_restore_checks_the_saved_partitions_deepspeed_reads(monkeypatch, saved_dp, current_dp, bf16):
     from deepspeed import comm as dist
+    from deepspeed.checkpoint.constants import GROUP_PADDINGS
     from deepspeed.checkpoint.constants import PARAM_SLICE_MAPPINGS
     from deepspeed.checkpoint.constants import SINGLE_PARTITION_OF_FP32_GROUPS
+    from deepspeed.runtime.bf16_optimizer import BF16_Optimizer
     from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
     from deepspeed.utils.tensor_fragment import fragment_address
 
-    zero = DeepSpeedZeroOptimizer.__new__(DeepSpeedZeroOptimizer)
-    restored = []
-    zero._load_legacy_checkpoint = lambda *args: restored.append(args)
+    cls = BF16_Optimizer if bf16 else DeepSpeedZeroOptimizer
+    zero = cls.__new__(cls)
     zero.dp_process_group = None
-    zero.single_partition_of_fp32_groups = [torch.zeros(4)]
-    zero._param_slice_mappings = [{"b": fragment_address(numel=4, start=0)}]
-    saved = {name: fragment_address(numel=4, start=4 * index) for index, name in enumerate(saved_order)}
-    state = [{PARAM_SLICE_MAPPINGS: [saved], SINGLE_PARTITION_OF_FP32_GROUPS: [torch.zeros(8)]}]
-    monkeypatch.setattr(dist, "get_rank", lambda group=None: 1)
-    monkeypatch.setattr(dist, "get_world_size", lambda group=None: 2)
+    zero.real_dp_process_group = [None]
+    zero.optimizer = SimpleNamespace(param_groups=[{}])
+    a, b = torch.zeros(5), torch.zeros(2)
+    zero.param_names = {a: "a", b: "b"}
+    if bf16:
+        zero.bf16_groups = [[a, b]]
+    else:
+        zero.round_robin_bit16_groups = [[a, b]]
+    zero._load_legacy_checkpoint = lambda states, *_: states
+    rank = current_dp - 1
+    monkeypatch.setattr(dist, "get_rank", lambda group=None: rank)
+    monkeypatch.setattr(dist, "get_world_size", lambda group=None: current_dp)
+
+    def state(mapping, width, padding):
+        return {
+            PARAM_SLICE_MAPPINGS: [mapping],
+            SINGLE_PARTITION_OF_FP32_GROUPS: [torch.zeros(width if bf16 else width - padding)],
+            GROUP_PADDINGS: [padding],
+        }
+
+    if saved_dp == 1:
+        saved = [state({"a": fragment_address(5, 0), "b": fragment_address(2, 5)}, 8, 1)]
+    else:
+        saved = [
+            state({"a": fragment_address(4, 0)}, 4, 0) if saved_dp != current_dp else None,
+            state({"a": fragment_address(1, 0), "b": fragment_address(2, 1)}, 4, 1),
+        ]
     deepspeed_engine._refuse_restoring_another_parameter_layout(zero)
-    zero._load_legacy_checkpoint(state, False, True)
-    return restored
-
-
-@require_deepspeed
-def test_resized_masters_only_restore_compares_positions_in_the_whole_flat_buffer(monkeypatch):
-    assert len(_resized_restore(monkeypatch, ["a", "b"])) == 1
+    assert zero._load_legacy_checkpoint(saved, False, True) is saved
+    mapping = saved[-1][PARAM_SLICE_MAPPINGS][0]
+    mapping["other"] = mapping.pop("b")
     with pytest.raises(RuntimeError, match="saved with the parameters at other positions"):
-        _resized_restore(monkeypatch, ["b", "a"])
+        zero._load_legacy_checkpoint(saved, False, True)
