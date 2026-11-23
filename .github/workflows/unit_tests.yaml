@@ -71,3 +71,7 @@ jobs:
         run: |
           PYTHONPATH=$PWD:$PWD/tests/inference/streaming python -m pytest -v -m "not gpu" \
             -c tests/inference/streaming/pytest.ini tests/inference/streaming
+      # Own interpreter: the script replaces vllm and ray in sys.modules.
+      - name: Sampling Counter Contract
+        run: |
+          python tests/inference/cpu_sampling_counters.py
