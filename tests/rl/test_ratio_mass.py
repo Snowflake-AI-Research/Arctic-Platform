@@ -483,11 +483,10 @@ class TestRatioMass(TestCasePlus):
                 # fp32 expm1 at 4.85e8 has ulp 32 (~7e-8 relative); 1e-6 is ~16 ulp. Unclamped, 25 is 150x off.
                 torch_assert_close(metrics[K3_KEY], k3(delta), rtol=1e-6, atol=0)
 
-    def test_non_finite_trainer_logprob_is_sanitised_to_zero_and_still_counted_in_the_k3_population(self):
-        # docs/rl.md: a trainer log-prob that is not finite is replaced by 0 before the loss, its token still counts in
-        # ratio_trainable_token_count and in the kept population, and its log ratio is then minus the sampler
-        # log-prob. (dss-platform's trainable_logprob_lowvar_all/mean leaves such a token out of its count and its
-        # sum.)
+    def test_non_finite_trainer_logprob_is_left_out_of_the_k3_population_and_counted_apart(self):
+        # docs/rl.md: a trainer log-prob that is not finite contributes nothing to the loss, is left out of
+        # ratio_trainable_token_count and the kept population, and is counted in grpo_nonfinite_logprob_token_count
+        # (as dss-platform's trainable_logprob_lowvar_all/mean leaves such a token out of its count and its sum).
         sampler = torch.tensor([[-3.0, -2.0, -2.0, -2.0]])
         for value in (float("-inf"), float("nan"), float("inf")):
             with self.subTest(trainer_logprob=value):
@@ -503,12 +502,11 @@ class TestRatioMass(TestCasePlus):
                 loss, metrics = grpo_loss({"logprobs": trainer}, context, {}, config, "cpu")
                 loss.backward()
                 self.assertTrue(torch.isfinite(loss) and torch.isfinite(trainer.grad).all())
-                self.assertEqual(metrics["ratio_trainable_token_count"], 4.0)
+                self.assertEqual(metrics["ratio_trainable_token_count"], 3.0)
                 self.assertEqual(metrics["ratio_mask_dropped_token_count"], 0.0)
-                self.assertTrue(math.isfinite(metrics[K3_KEY]))
-                # The other three tokens have a log ratio of 0 and add nothing: the sum is k3(0 - (-3)) = e^3 - 4 = 16.09.
-                # fp32 expm1 against a float64 reference: ~1e-7 relative.
-                torch_assert_close(metrics[K3_KEY], k3(0.0 - sampler[0, 0].item()), rtol=1e-6, atol=0)
+                self.assertEqual(metrics["grpo_nonfinite_logprob_token_count"], 1.0)
+                # The three tokens left have a log ratio of 0 and add nothing.
+                self.assertEqual(metrics[K3_KEY], 0.0)
 
     def test_non_finite_sampler_logprob_is_neither_sanitised_nor_excluded_from_the_k3_population(self):
         # docs/rl.md: unlike the trainer side, a sampler log-prob that is not finite is not replaced. Its token counts

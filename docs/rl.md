@@ -233,6 +233,13 @@ objective. An explicit `false` of `ratio_stats` or of `ratio_mask_rebalance`
 with no other ratio control is inert: no echo, no metrics and no
 `use_cispo_loss` requirement.
 
+Every GRPO variant reports `grpo_nonfinite_logprob_token_count`, the number of
+requested policy positions with a NaN or infinite trainer log-probability.
+The count sums across microbatches and ranks. Such positions contribute zero to
+the policy numerator and are excluded from ratio statistics. Loss normalization
+retains their original weight in the denominator. Padding contributes zero to
+the count. An active `nll_mask` position still requires a finite log-probability.
+
 Whenever ratio controls are active (any ratio-control key, or
 `ratio_stats=True`, or `ratio_mask_rebalance=True`), the loss also reports four
 additive signed-mass metrics,
@@ -319,11 +326,10 @@ dss-platform's: it evaluates `exp(Δ) − 1 − Δ` in fp32, which loses precisi
 |Δ| of about 1e-3 or less (k3 is then about Δ²/2, far below the fp32 resolution
 of `exp(Δ) − 1`), while this code uses `expm1`. A gap in that regime comes from
 the dss-platform expression, not from a different definition. A trainer
-log-probability that is not finite is replaced by 0 before the loss, and its
-token still counts in this population (its Δ is then minus the sampler
-log-probability), whereas `trainable_logprob_lowvar_all/mean` leaves such tokens
-out of both its sum and its count. A sampler log-probability that is not finite
-is not sanitised here: its token counts too, and adds k3 at the clamped Δ (4.85e8
+log-probability that is not finite is left out of this population and counted in
+`grpo_nonfinite_logprob_token_count`, as `trainable_logprob_lowvar_all/mean`
+leaves such tokens out of both its sum and its count. A sampler log-probability
+that is not finite is not sanitised here: its token counts, and adds k3 at the clamped Δ (4.85e8
 for a −inf sampler log-probability, 19 for +inf) or makes the sum NaN for a NaN
 one, whereas `trainable_logprob_lowvar_all/mean` leaves it out.
 

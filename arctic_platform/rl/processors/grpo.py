@@ -125,13 +125,14 @@ def _validate_nll_mask(nll_mask: torch.Tensor, loss_mask: torch.Tensor) -> torch
     return mask
 
 
-def _source_statistics(stat: dict, mask: torch.Tensor) -> dict[str, float]:
+def _source_statistics(stat: dict, mask: torch.Tensor, nonfinite_count: float) -> dict[str, float]:
     def total(values):
         return float(torch.where(mask, values.detach().double(), 0.0).sum())
 
     count = float(mask.sum())
     metrics = {
         "grpo_stats_token_count": count,
+        "grpo_nonfinite_logprob_token_count": nonfinite_count,
         "grpo_importance_weight_sum": total(stat["importance_weight"]),
         "grpo_log_ratio_sum": total(stat["approx_kl"]),
         "grpo_clipped_token_count": total(stat["clip_mask"]),
@@ -413,7 +414,6 @@ def _internal_grpo_loss_fn(
 ) -> Tuple[torch.Tensor, dict]:
     """Internal GRPO loss — same interface as dss/loss_fns/grpo.py."""
     dp_size = _resolve_dp_size(dp_size, batch_num_tokens)
-    old_logp = input_data["old_log_probs"]
     advantages = input_data["advantages"]
     loss_mask = canonicalize_loss_mask(
         input_data["loss_mask"],
@@ -428,12 +428,26 @@ def _internal_grpo_loss_fn(
             raise ValueError("grpo labels must match loss_mask when labels are present")
         if ((labels == -100) & loss_mask).any().item():
             raise ValueError("grpo loss_mask must be zero where labels use ignore_index=-100")
-    # ECHO disjointness is validated against the client's policy mask, not the
-    # (possibly M2PO-shrunk) mask used for the policy loss below.
-    policy_loss_mask = loss_mask
+    requested_mask = loss_mask
     nll_mask = input_data.get("nll_mask")
     if nll_mask is not None:
         nll_mask = _validate_nll_mask(nll_mask, loss_mask)
+    finite = torch.isfinite(logprobs)
+    missing = None
+    nonfinite_count = 0.0
+    if not finite.all():
+        missing = loss_mask & ~finite
+        if nll_mask is not None and (missing & nll_mask).any().item():
+            raise ValueError("logprobs must be finite at every active nll_mask position")
+        nonfinite_count = float(missing.sum())
+        loss_mask = loss_mask & finite
+        # where also selects zero in backward when an excluded ratio overflows.
+        logprobs = torch.where(finite, logprobs, 0.0)
+        entropy = torch.where(finite, entropy, 0.0)
+    policy_loss_mask = loss_mask
+    old_logp = input_data["old_log_probs"]
+    if old_logp is None:
+        old_logp = logprobs.detach()
     prox_logp_gt = input_data.get("prox_logp")
     if nll_mask is not None:
         old_logp = torch.where(nll_mask, 0.0, old_logp)
@@ -448,8 +462,7 @@ def _internal_grpo_loss_fn(
     # NaN (surfacing as "rank=k loss contains non-finite values"). Mirror
     # ArcticTraining's SFTTrainer: emit a finite zero that still carries grads
     # (via logprobs) so DeepSpeed's cross-rank gradient all-reduce stays in lockstep
-    # and this empty shard contributes nothing. nan_to_num keeps the forward value
-    # finite even if the shard produced non-finite logits; the * 0.0 zeroes the grad.
+    # and this empty shard contributes nothing.
     #
     # When ECHO is configured, skip the early return so sft_mask /
     # echo_observation_mask can still contribute. Empty-policy shards still
@@ -472,7 +485,7 @@ def _internal_grpo_loss_fn(
         and not reduces_across_sequence_parallel
         and not validates_zero_denominator
     ):
-        zero_loss = torch.nan_to_num(logprobs).sum() * 0.0
+        zero_loss = logprobs.sum() * 0.0
         metrics = {
             "approx_kl": 0.0,
             "importance_weight": 0.0,
@@ -483,7 +496,7 @@ def _internal_grpo_loss_fn(
         stat = dict(importance_weight=zeros, approx_kl=zeros, clip_mask=zeros)
         if use_cispo_loss and is_weight_clip_max is not None:
             stat.update(clipped_is_weight=zeros, lower_tail_mask=zeros)
-        metrics.update(_source_statistics(stat, loss_mask))
+        metrics.update(_source_statistics(stat, loss_mask, nonfinite_count))
         metrics["grpo_entropy_sum"] = 0.0
         if nll_mask is not None:
             metrics.update(nll_trainable_token_count=0.0, nll_sum=0.0)
@@ -498,17 +511,6 @@ def _internal_grpo_loss_fn(
             metrics.update(sampler_kl_coef=sampler_kl_coef, sampler_kl_token_count=0.0, sampler_kl_sum=0.0)
         return zero_loss, metrics
 
-    # Degenerate-shard logprob sanitization. Under Ulysses SP a short/padded batch
-    # can hand a rank a tail shard where some "valid" query positions have no
-    # attendable keys, so attention emits non-finite logits -> non-finite logprobs
-    # that poison the PPO/CISPO loss (a single NaN makes the whole scalar NaN).
-    # Zero the non-finite logprobs before the loss math: nan_to_num keeps the
-    # forward finite and yields zero gradient at those positions, so malformed
-    # tokens drop out while well-formed tokens are untouched. At real training
-    # seqlens the shards are large and this is a no-op.
-    if not torch.isfinite(logprobs).all():
-        logprobs = torch.nan_to_num(logprobs, nan=0.0, posinf=0.0, neginf=0.0)
-
     prox_logp = _resolve_proximal_logp(
         prox_logp_gt=prox_logp_gt,
         prox_logp_method=prox_logp_method,
@@ -520,15 +522,12 @@ def _internal_grpo_loss_fn(
 
     if m2_threshold is not None:
         loss_mask = _apply_m2po_masking(old_logp, prox_logp, loss_mask, m2_threshold)
+    normalization_mask = None if missing is None else loss_mask | missing
 
     teacher_metrics: dict[str, float] = {}
     if teacher_tau > 0.0:
         teacher_delta = input_data["teacher_log_probs"].detach() - logprobs.detach()
-        teacher_scored = (
-            (loss_mask if nll_mask is None else loss_mask & ~nll_mask)
-            & input_data["teacher_policy_finite"]
-            & torch.isfinite(teacher_delta)
-        )
+        teacher_scored = (loss_mask if nll_mask is None else loss_mask & ~nll_mask) & torch.isfinite(teacher_delta)
         teacher_term = torch.where(
             teacher_scored,
             teacher_delta.clamp(
@@ -550,7 +549,7 @@ def _internal_grpo_loss_fn(
         and not reduces_across_sequence_parallel
         and not validates_zero_denominator
     ):
-        loss = torch.nan_to_num(logprobs).sum() * 0.0
+        loss = logprobs.sum() * 0.0
         metrics = {
             "approx_kl": 0.0,
             "importance_weight": 0.0,
@@ -561,7 +560,7 @@ def _internal_grpo_loss_fn(
         stat = dict(importance_weight=zeros, approx_kl=zeros, clip_mask=zeros)
         if use_cispo_loss and is_weight_clip_max is not None:
             stat.update(clipped_is_weight=zeros, lower_tail_mask=zeros)
-        metrics.update(_source_statistics(stat, loss_mask))
+        metrics.update(_source_statistics(stat, loss_mask, nonfinite_count))
         metrics["grpo_entropy_sum"] = 0.0
         if nll_mask is not None:
             metrics.update(nll_trainable_token_count=0.0, nll_sum=0.0)
@@ -589,6 +588,7 @@ def _internal_grpo_loss_fn(
                 tau_pos=sapo_tau_pos,
                 tau_neg=sapo_tau_neg,
                 loss_mask=loss_mask,
+                normalization_mask=normalization_mask,
                 importance_sampling_level=importance_sampling_level,
                 cu_seqlens=input_data.get("cu_seqlens"),
                 loss_agg_mode=loss_agg_mode,
@@ -610,6 +610,7 @@ def _internal_grpo_loss_fn(
                 eps_clip_higher=eps_clip_higher,
                 is_weight_clip_max=is_weight_clip_max,
                 loss_mask=loss_mask,
+                normalization_mask=normalization_mask,
                 behav_imp_weight_cap=behav_imp_weight_cap,
                 importance_sampling_level=importance_sampling_level,
                 cu_seqlens=input_data.get("cu_seqlens"),
@@ -634,6 +635,7 @@ def _internal_grpo_loss_fn(
                 eps_clip=eps_clip,
                 eps_clip_higher=eps_clip_higher,
                 loss_mask=loss_mask,
+                normalization_mask=normalization_mask,
                 c_clip=c_clip,
                 proximal_logprobs=prox_logp,
                 behav_imp_weight_cap=behav_imp_weight_cap,
@@ -654,6 +656,7 @@ def _internal_grpo_loss_fn(
             entropy_loss = agg_loss(
                 -entropy.float(),
                 loss_mask,
+                normalization_mask=normalization_mask,
                 loss_agg_mode=loss_agg_mode,
                 dp_size=dp_size,
                 batch_num_tokens=batch_num_tokens,
@@ -677,6 +680,7 @@ def _internal_grpo_loss_fn(
             kl_loss = agg_loss(
                 kl,
                 loss_mask,
+                normalization_mask=normalization_mask,
                 loss_agg_mode=loss_agg_mode,
                 dp_size=dp_size,
                 batch_num_tokens=batch_num_tokens,
@@ -701,6 +705,7 @@ def _internal_grpo_loss_fn(
             sampler_kl_loss = agg_loss(
                 sampler_kl,
                 policy_loss_mask,
+                normalization_mask=requested_mask if missing is not None else None,
                 loss_agg_mode=loss_agg_mode,
                 dp_size=dp_size,
                 batch_num_tokens=batch_num_tokens,
@@ -728,7 +733,7 @@ def _internal_grpo_loss_fn(
             "clip_ratio": _masked_mean_float(stat["clip_mask"].float(), stats_mask),
             "entropy": _masked_mean_float(entropy.float(), stats_mask),
         }
-        metrics.update(_source_statistics(stat, stats_mask))
+        metrics.update(_source_statistics(stat, stats_mask, nonfinite_count))
         metrics["grpo_entropy_sum"] = float(torch.where(stats_mask, entropy.double(), 0.0).sum())
         metrics.update(stat.get("ratio_mask_metrics", {}))
         metrics.update(sampler_kl_metrics)
@@ -779,7 +784,7 @@ def _internal_grpo_loss_fn(
             logprobs=logprobs,
             sft_mask=sft_mask,
             observation_mask=observation_mask,
-            loss_mask=policy_loss_mask,
+            loss_mask=requested_mask,
             global_num_echo_sequences=echo_global_num_sequences,
             batch_denominator=echo_batch_denominator,
             cu_seqlens=input_data.get("cu_seqlens"),
@@ -1029,44 +1034,19 @@ def _grpo_loss(
         # packed representation — 1-D [T] — may exist past this point.
         logprobs = _packed_singleton_to_1d(logprobs)
 
-    # Degenerate-shard logprob sanitization (see _internal_grpo_loss_fn). Under
-    # Ulysses SP a short/padded batch can hand a rank a tail shard whose "valid"
-    # positions have no attendable keys, so attention emits non-finite logits ->
-    # non-finite logprobs. A single NaN poisons both the loss and the entropy
-    # metric ("result.metrics.entropy is non-finite"). Zero them here, before
-    # entropy is derived, so downstream loss + metrics stay finite; nan_to_num
-    # yields zero gradient at those positions. No-op at real training seqlens.
-    teacher_policy_finite = torch.isfinite(logprobs)
-    nll_mask = context.get("nll_mask")
-    if nll_mask is not None:
-        nll_mask = nll_mask.to(logprobs.device)
-        if cu_seqlens is not None:
-            nll_mask = _packed_singleton_to_1d(nll_mask)
-        active_nll_mask = canonicalize_loss_mask(
-            nll_mask,
-            logprobs,
-            objective="nll_mask",
-            binary=True,
-        )
-        if ((~teacher_policy_finite) & active_nll_mask).any().item():
-            raise ValueError("logprobs must be finite at every active nll_mask position")
-    if not teacher_policy_finite.all():
-        logprobs = torch.nan_to_num(logprobs, nan=0.0, posinf=0.0, neginf=0.0)
-
     entropy = -logprobs.detach()
 
     old_log_probs_ctx = context.get("old_log_probs_shifted")
     input_data = {
-        "old_log_probs": old_log_probs_ctx.to(logprobs.device) if old_log_probs_ctx is not None else logprobs.detach(),
+        "old_log_probs": old_log_probs_ctx.to(logprobs.device) if old_log_probs_ctx is not None else None,
         "advantages": context["advantages"].to(logprobs.device),
         "loss_mask": context["loss_mask"].to(logprobs.device),
         "prox_logp": context.get("prox_logp_shifted"),
         "versions": context.get("versions"),
         "cu_seqlens": cu_seqlens,
         "ref_log_probs": context.get("ref_log_probs_shifted"),
-        "nll_mask": nll_mask,
+        "nll_mask": context.get("nll_mask"),
         "teacher_log_probs": context.get("teacher_log_probs_shifted"),
-        "teacher_policy_finite": teacher_policy_finite,
         "sampler_kl_weights": context.get("sampler_kl_weights"),
         "sft_mask": context.get("sft_mask"),
         "echo_observation_mask": context.get("echo_observation_mask"),
@@ -1108,7 +1088,6 @@ def _grpo_loss(
             "ref_log_probs",
             "nll_mask",
             "teacher_log_probs",
-            "teacher_policy_finite",
             "sampler_kl_weights",
             "sft_mask",
             "echo_observation_mask",
@@ -1148,7 +1127,7 @@ def _grpo_loss(
 
     # Every key of the config tables is a keyword of _internal_grpo_loss_fn
     # under the same name; the tensors below are the only non-config arguments.
-    loss, metrics = _internal_grpo_loss_fn(
+    return _internal_grpo_loss_fn(
         logprobs=logprobs,
         entropy=entropy,
         input_data=input_data,
@@ -1159,7 +1138,6 @@ def _grpo_loss(
         loss_scale_factor=context.get("packed_loss_scale_factor"),
         **values,
     )
-    return loss, metrics
 
 
 # Objective-term contributions and token/sequence counts the ECHO path emits.

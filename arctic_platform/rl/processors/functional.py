@@ -282,6 +282,7 @@ def agg_loss(
     prompt_token_counts: Optional[torch.Tensor] = None,
     sequence_loss_weights: Optional[torch.Tensor] = None,
     cu_seqlens: Optional[torch.Tensor] = None,
+    normalization_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Aggregate a per-token loss matrix into a scalar.
 
@@ -312,6 +313,10 @@ def agg_loss(
     DeepSpeed's DP gradient averaging. Under sequence parallelism, packed
     segment boundaries must cover each token window with one segment per row.
     """
+    # Packed microbatch weights are chosen from the request before the forward pass can reveal a missing log-prob.
+    if normalization_mask is not None:
+        loss_mat = _masked_values(loss_mat, loss_mask)
+        loss_mask = normalization_mask
     _validate_loss_denominators(batch_num_tokens, global_batch_size)
     if loss_scale_factor is not None and (
         isinstance(loss_scale_factor, bool) or not isinstance(loss_scale_factor, Integral) or loss_scale_factor < 1
@@ -743,6 +748,7 @@ def ppo_actor_loss_fn(
     prompt_group_ids: Optional[torch.Tensor] = None,
     prompt_token_counts: Optional[torch.Tensor] = None,
     sequence_loss_weights: Optional[torch.Tensor] = None,
+    normalization_mask: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict]:
     if importance_sampling_level == "sequence":
         log_ratio = logprobs - proximal_logprobs
@@ -781,6 +787,7 @@ def ppo_actor_loss_fn(
     pg_loss = agg_loss(
         pg_loss,
         loss_mask,
+        normalization_mask=normalization_mask,
         loss_agg_mode=loss_agg_mode,
         dp_size=dp_size,
         batch_num_tokens=batch_num_tokens,
@@ -824,6 +831,7 @@ def sapo_loss_fn(
     prompt_group_ids: Optional[torch.Tensor] = None,
     prompt_token_counts: Optional[torch.Tensor] = None,
     sequence_loss_weights: Optional[torch.Tensor] = None,
+    normalization_mask: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict]:
     if tau_pos <= 0 or tau_neg <= 0:
         raise ValueError("SAPO temperatures must be positive.")
@@ -845,6 +853,7 @@ def sapo_loss_fn(
     pg_loss = agg_loss(
         pg_loss,
         loss_mask,
+        normalization_mask=normalization_mask,
         loss_agg_mode=loss_agg_mode,
         dp_size=dp_size,
         batch_num_tokens=batch_num_tokens,
@@ -1215,6 +1224,7 @@ def cispo_actor_loss_fn(
     nll_mask: torch.Tensor | None = None,
     ratio_masks: RatioMasks | None = None,
     ratio_m2_keep: torch.Tensor | None = None,
+    normalization_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """CISPO policy loss (https://arxiv.org/abs/2506.13585).
 
@@ -1260,6 +1270,7 @@ def cispo_actor_loss_fn(
     aggregate = partial(
         agg_loss,
         loss_mask=objective_mask,
+        normalization_mask=normalization_mask,
         loss_agg_mode=loss_agg_mode,
         dp_size=dp_size,
         batch_num_tokens=batch_num_tokens,
