@@ -257,12 +257,19 @@ JOBS = "\n".join(json.dumps({"hardware": "H200", "sub_job_configs": [c["job"]["s
 
 
 SHA = "ec015a7f4b954c09ba21f30c5533f3d8c43ac11f"
-CONFIGS = f"https://github.com/o/cortex-training/blob/{SHA}/model-catalog/semip_models/jobs.jsonl"
+OFFICIAL = f"https://github.com/snowflakedb/cortex-training/blob/{SHA}/model-catalog/semip_models/jobs.jsonl"
+FORK = OFFICIAL.replace("/snowflakedb/", "/o/")
+COMPARE = f"https://api.github.com/repos/snowflakedb/cortex-training/compare/{SHA}...main"
 
 
-def _dry_run(tmp_path, monkeypatch, nodes, **extra):
+def _dry_run(tmp_path, monkeypatch, nodes, configs=OFFICIAL, **extra):
+    """A dry run of ``JOBS``; the official catalog's ``SHA`` is on main."""
+    owner = configs.split("/")[3]
+
     def get(url, accept=None):
-        assert url == f"https://raw.githubusercontent.com/o/cortex-training/{SHA}/model-catalog/semip_models/jobs.jsonl"
+        if url == COMPARE:
+            return json.dumps({"status": "ahead"}).encode()
+        assert url == f"https://raw.githubusercontent.com/{owner}/cortex-training/{SHA}/model-catalog/semip_models/jobs.jsonl"
         return JOBS.encode()
 
     def refuse(*_a, **_k):
@@ -270,7 +277,7 @@ def _dry_run(tmp_path, monkeypatch, nodes, **extra):
 
     monkeypatch.setattr(semip_job.subprocess, "Popen", refuse)
     (tmp_path / "c.json").write_text(json.dumps({"host": "h", "pat": "p"}))
-    args = {"cluster": "qa6", "image_tag": "release_20261119_163502_6ed8c6d2361-h", "configs": CONFIGS,
+    args = {"cluster": "qa6", "image_tag": "release_20261119_163502_6ed8c6d2361-h", "configs": configs,
             "max_gpus": "16", "connection": str(tmp_path / "c.json"), "out_dir": str(tmp_path / "out"),
             "dry_run": "true", **extra}
     assert semip_job.main([f"{k}={v}" for k, v in args.items()], get=get, run_child=refuse, nodes=nodes) == 0
@@ -289,6 +296,9 @@ def test_a_dry_run_reports_existing_skeletons_for_this_image(tmp_path, monkeypat
     assert "skeletons: 1 will restore (all nodes), 1 exist but not on all nodes, 0 will dump\n" in text
     assert "node cache  4 model-cache node(s) on sfc-or-dev-meta-k8s-2, env_hash fc37441c0c27" in text
     assert plan["node_cache"]["summary"] == {"restore": 1, "partial": 1, "dump": 0, "unknown": 0, "other_image": 0}
+    assert "visibility  official catalog (snowflakedb/cortex-training main; ec015a7f4b95 is on main)\n" in text
+    assert plan["visibility"] == {"official": True, "show_all": False,
+                                  "reason": "official catalog (snowflakedb/cortex-training main; ec015a7f4b95 is on main)"}
 
 
 def test_a_dry_run_without_env_hash_leaves_the_env_unconfirmed(tmp_path, monkeypatch):
@@ -316,6 +326,83 @@ def test_a_failing_kubectl_skips_the_lookup_with_a_note(tmp_path, monkeypatch):
     plan, text = _dry_run(tmp_path, monkeypatch, lambda ctx: semip_job.cluster_nodes(ctx, fail))
     assert plan["node_cache"]["checked"] is False and "skeletons: not checked (kubectl --context=" in text
     assert plan["jobs"][1]["cfg12"] == "ed76d47780e3" and plan["jobs"][0]["cfg12"] is None
+
+
+def _table(text):
+    return [line for line in text.splitlines() if line.startswith("| ")]
+
+
+def test_a_restricted_dry_run_reports_only_this_images_own_skeletons(tmp_path, monkeypatch):
+    plan, text = _dry_run(tmp_path, monkeypatch, lambda ctx: _cluster(), configs=FORK, env_hash=ENV)
+    reason = f"restricted: o/cortex-training@{SHA} is not the official catalog on main"
+    assert f"visibility  {reason}\n" in text
+    assert plan["visibility"] == {"official": False, "reason": reason, "show_all": False}
+    qwen, ds = plan["jobs"]
+    assert (qwen["cfg12"], qwen["reasoning_parser"], qwen["reasoning_parser_from"]) == ("a65858a869ba", "qwen3",
+                                                                                         "node labels")
+    assert "| a65858a869ba | exists: 4/4 nodes |" in text and "| ed76d47780e3 | exists: 2/4 nodes |" in text
+    assert (qwen["skeleton"], ds["skeleton"]) == ("restore", "partial")
+    assert ds["existing"] == [{"env": ENV, "nodes": 2, "of": 4, "match": "exists"}]
+    assert "skeletons: 1 will restore (all nodes), 1 exist but not on all nodes, 0 will dump\n" in text
+    dumped = json.dumps(plan)
+    assert "env_candidates" not in plan["node_cache"] and plan["node_cache"]["restricted"] is True
+    for other in (OLD, OLD[:10], "another image", "GLM", "Inkling", "9" * 12):
+        assert other not in dumped and other not in text, other
+
+
+def test_a_restricted_dry_run_says_none_for_another_env_and_never_names_the_others(tmp_path, monkeypatch):
+    plan, text = _dry_run(tmp_path, monkeypatch, lambda ctx: _cluster(), configs=FORK, env_hash="123456789abc")
+    assert "| ? | none (will dump) |" in text and "| ed76d47780e3 | none (will dump) |" in text
+    assert [j["skeleton"] for j in plan["jobs"]] == ["dump", "dump"] and plan["jobs"][0]["existing"] == []
+    assert "cfg12 ?: the job names no reasoning_parser and no candidate's skeleton was found for this image" in text
+    assert "skeletons: 0 will restore (all nodes), 0 exist but not on all nodes, 2 will dump\n" in text
+    for other in (ENV, ENV[:10], OLD, OLD[:10], "another image"):
+        assert other not in json.dumps(plan) and other not in text, other
+
+
+def test_a_restricted_dry_run_without_env_hash_reads_no_labels(tmp_path, monkeypatch):
+    def nodes(context):
+        raise AssertionError("a restricted dry run without env_hash read the node labels")
+
+    plan, text = _dry_run(tmp_path, monkeypatch, nodes, configs=FORK)
+    assert "| a65858a869ba |" not in text and text.count("| not checked: pass env_hash= for this image |") == 2
+    assert "skeletons: not checked (restricted list, the lookup needs env_hash= for this image)" in text
+    assert "node cache  not checked: restricted list, the lookup needs env_hash= for this image" in text
+    assert plan["node_cache"]["checked"] is False and plan["node_cache"]["summary"] is None
+    assert all(j["existing"] == [] and j["skeleton"] == "not checked" for j in plan["jobs"])
+    assert "cfg12 ?: the job names no reasoning_parser and the node labels were not checked" in text
+
+
+def test_a_restricted_dry_run_cannot_confirm_a_label_cut_too_short(tmp_path, monkeypatch):
+    nodes = [_node(_label(DS, f"ed76d47780e3_{OLD}_4008d4360385"))]
+    plan, text = _dry_run(tmp_path, monkeypatch, lambda ctx: nodes, configs=FORK, env_hash=ENV)
+    assert plan["jobs"][1]["skeleton"] == "unknown" and OLD[:6] not in json.dumps(plan)
+    assert f"| ed76d47780e3 | ? (labels of {DS} are cut too short to confirm this image's skeleton) |" in text
+
+
+def test_show_all_restores_the_full_output_for_a_restricted_list(tmp_path, monkeypatch, caplog):
+    for run in ("a", "b"):
+        (tmp_path / run).mkdir()
+    official, official_text = _dry_run(tmp_path / "a", monkeypatch, lambda ctx: _cluster(), env_hash=ENV)
+    with caplog.at_level(logging.WARNING, logger=semip_job.__name__):
+        plan, text = _dry_run(tmp_path / "b", monkeypatch, lambda ctx: _cluster(), configs=FORK, env_hash=ENV,
+                              show_all="true")
+    assert _table(text) == _table(official_text) and "exists for another image: 263a697cd9 4/4" in text
+    assert plan["node_cache"]["env_candidates"] == official["node_cache"]["env_candidates"] == sorted([ENV, OLD])
+    assert plan["visibility"]["official"] is False and plan["visibility"]["show_all"] is True
+    assert "is not the official catalog on main; show_all=true (admin override)\n" in text
+    assert any("show_all=true (admin override)" in r.getMessage() for r in caplog.records)
+
+
+def test_label_shows_the_cfg12_and_env12_characters_left_by_the_cut():
+    assert keys.label_shows("m") == (12, 12)
+    assert keys.label_shows(QWEN) == (12, 10) and keys.label_shows(DS) == (9, 0) and keys.label_shows(NEMO) == (0, 0)
+    for label, directory in LIVE.items():
+        _, slug, kind, key = directory.split("/")
+        if kind == "skeleton":
+            cfg_chars, env_chars = keys.label_shows(slug)
+            shown = label.rsplit("-", 1)[0][len(keys._segment_prefix(f"image-cache/{slug}/skeleton/")):]
+            assert shown == key[:cfg_chars] + (f"_{key[13:13 + env_chars]}" if env_chars else ""), label
 
 
 def test_env_hash_must_be_twelve_hex():

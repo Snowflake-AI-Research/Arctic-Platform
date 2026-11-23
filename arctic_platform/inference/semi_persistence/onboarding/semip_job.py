@@ -18,7 +18,7 @@
     python -m arctic_platform.inference.semi_persistence.onboarding.semip_job \\
         cluster=qa6|prod image_tag=TAG configs=URL max_gpus=N \\
         [tests=functional,correctness,performance] [dry_run=false] [out_dir=semip_job] \\
-        [connection=CONN.json] [kube_context=CTX] [env_hash=ENV12]
+        [connection=CONN.json] [kube_context=CTX] [env_hash=ENV12] [show_all=false]
 
 The driver behind the semip-publish Jenkins job; it runs the same anywhere.
 
@@ -43,6 +43,8 @@ The driver behind the semip-publish Jenkins job; it runs the same anywhere.
   kube_context default: the cluster's
   env_hash     dry run only: the env12 that image_tag's skeleton keys carry, to
                tell a skeleton of this image from one of another
+  show_all     dry run only, for admins: report the full skeleton lookup for any
+               list (default false); it changes what is printed, not access
 
 ``configs`` is fetched from raw.githubusercontent.com at the resolved commit
 (GitHub's API resolves a branch; ``GITHUB_TOKEN``, if set, authenticates both)
@@ -73,6 +75,15 @@ those skeletons the model-cache nodes have verified: per env12, on how many of
 them. ``existing`` is ``none`` when publish would dump; with ``env_hash`` a
 skeleton is marked as this image's or another image's, and without it the env
 is unconfirmed. Without kubectl the lookup is skipped with a note.
+
+That full lookup is for the official catalog only: configs in
+snowflakedb/cortex-training at ``main`` or at a commit on main (GitHub's compare
+API says main is ``identical`` or ``ahead``; if it cannot be asked, the list is
+not official). Any other list is restricted, so it cannot show other users'
+dumps: with ``env_hash`` each job gets only its own skeleton under that env12
+(``exists: N/M nodes`` or ``none (will dump)``), without it the node labels are
+not read. ``visibility`` in the plan says which, and ``show_all=true`` forces
+the full lookup.
 """
 
 from __future__ import annotations
@@ -129,6 +140,8 @@ DEV_IMAGE_TAG = re.compile(r"^dev_\d{8}_\d{6}_[0-9a-f]{11}(-[hab])?$")
 TESTS = ("functional", "correctness", "performance")
 CONFIGS_REPO = "cortex-training"
 CONFIGS_DIR = "model-catalog/semip_models/"
+OFFICIAL_OWNER = "snowflakedb"
+OFFICIAL_BRANCH = "main"
 COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 ENV_HASH = re.compile(r"^[0-9a-f]{12}$")
 PUBLISHED = ("published", "already")
@@ -258,6 +271,25 @@ def raw_url(configs: ConfigsRef, sha: str) -> str:
     return f"https://raw.githubusercontent.com/{configs.repo}/{sha}/{urllib.parse.quote(configs.path)}"
 
 
+def visibility(configs: ConfigsRef, sha: str, get: Callable = http_get) -> tuple[bool, str]:
+    """``(official, why)``: official when the configs are in snowflakedb/cortex-training at a
+    commit on main (the ref is main, or GitHub's compare puts ``sha`` at or behind main's head)."""
+    official = f"official catalog ({OFFICIAL_OWNER}/{CONFIGS_REPO} {OFFICIAL_BRANCH})"
+    restricted = f"restricted: {configs.repo}@{configs.ref} is not the official catalog on {OFFICIAL_BRANCH}"
+    if configs.owner.lower() != OFFICIAL_OWNER:
+        return False, restricted
+    if configs.ref == OFFICIAL_BRANCH:
+        return True, official
+    url = f"https://api.github.com/repos/{OFFICIAL_OWNER}/{CONFIGS_REPO}/compare/{sha}...{OFFICIAL_BRANCH}"
+    try:
+        status = json.loads(get(url, "application/vnd.github+json"))["status"]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        return False, f"{restricted} (could not check: {exc})"
+    if status in ("identical", "ahead"):
+        return True, f"{official[:-1]}; {sha[:12]} is on {OFFICIAL_BRANCH})"
+    return False, f"{restricted} (compare {sha[:12]}...{OFFICIAL_BRANCH}: {status})"
+
+
 def connection_path(args: dict[str, str], cluster: str) -> str | None:
     return (args.get("connection") or os.environ.get(f"{CONNECTION_ENV}_{cluster.upper()}")
             or os.environ.get(CONNECTION_ENV) or None)
@@ -352,6 +384,19 @@ def match_of(found: keys.Found, env_hash: str | None, weights_known: bool) -> st
     return "exists" if len(found.env) >= ENV_PREFIX_CHARS else "unconfirmed"
 
 
+def own_nodes(cache: keys.NodeCache, slug: str, cfg12: str, env_hash: str) -> int:
+    """On how many nodes image ``env_hash``'s skeleton of ``slug`` with ``cfg12`` is verified."""
+    weights_known = bool(cache.weights(slug))
+    return max((f.nodes for f in cache.lookup(slug, cfg12).found
+                if match_of(f, env_hash, weights_known) == "exists"), default=0)
+
+
+def confirmable(cache: keys.NodeCache, slug: str) -> bool:
+    """Whether a missing skeleton of ``slug`` means none, rather than labels cut too short to tell:
+    the node labels show its weight hash, or enough of every env12."""
+    return bool(cache.weights(slug)) or keys.label_shows(slug)[1] >= ENV_PREFIX_CHARS
+
+
 def skeleton_status(found: list[keys.Found], matches: list[str], nodes: int, env_hash: str | None) -> str:
     """``restore`` (this image's skeleton is on every node), ``partial``, ``dump`` or
     ``unknown``; without ``env_hash`` any env counts as this image's."""
@@ -387,6 +432,7 @@ class SemipJob:
         self.dry_run = as_bool(args.get("dry_run") or "false")
         self.configs = parse_configs_url(args.get("configs"))
         self.env_hash = parse_env_hash(args.get("env_hash"))
+        self.show_all = as_bool(args.get("show_all") or "false")
         self.nodes = nodes or cluster_nodes
         self.kube_context = args.get("kube_context") or CLUSTERS[self.cluster].kube_context
         self.model_bucket = CLUSTERS[self.cluster].model_bucket
@@ -452,7 +498,16 @@ class SemipJob:
                 self.warnings.append(f"{len(too_big)} of {len(specs)} config(s) need more than max_gpus="
                                      f"{self.max_gpus} for their tests; they are published but not tested, "
                                      "and the run fails")
-        skeletons = self.skeletons(specs, plan) if self.dry_run else {}
+        skeletons: dict[str, dict] = {}
+        if self.dry_run:
+            official, why = visibility(self.configs, self.sha, self.get)
+            plan["visibility"] = {"official": official, "reason": why, "show_all": self.show_all}
+            logger.info("visibility: %s", why)
+            if self.show_all:
+                logger.warning("show_all=true (admin override): reporting every skeleton the node cache has "
+                               "for these jobs, of any image")
+            full = official or self.show_all
+            skeletons = self.skeletons(specs, plan) if full else self.own_skeletons(specs, plan)
         for s in specs:
             entry = {"name": s.name, "line": line_number(s), "model_name": s.sub_job.get("model_name"),
                      "max_seq_len": s.max_seq_len, "n_gpus": s.n_gpus, "tensor_parallel_size": s.tensor_parallel_size}
@@ -540,6 +595,73 @@ class SemipJob:
                               "summary": counts if cache else None}
         return out
 
+    def own_skeletons(self, specs: list[ModelSpec], plan: dict) -> dict[str, dict]:
+        """``skeletons`` for a list that is not the official catalog: only each job's own
+        skeleton under ``env_hash``, and without ``env_hash`` no node labels at all. Nothing
+        about other images, other cfg12 candidates or other labels is reported."""
+        keyings = {s.name: keys.keying(s.sub_job, json.loads(self.lines[s.name]).get("hardware")) for s in specs}
+        cache, note = None, "not checked: restricted list, the lookup needs env_hash= for this image"
+        if self.env_hash:
+            try:
+                cache, note = keys.NodeCache(self.nodes(self.kube_context), self.env_hash), None
+            except NodesUnavailable as exc:
+                note = f"not checked: {exc}"
+        if note:
+            logger.info("node cache %s", note)
+        hits: dict[str, dict] = {}
+        chosen: dict[str, set] = {}
+        for s in specs:
+            k = keyings[s.name]
+            cfgs = {k.reasoning_parser: k.cfg12} if k.cfg12 else k.candidates
+            hits[s.name] = {r: own_nodes(cache, k.slug, c, self.env_hash) for r, c in cfgs.items()} if cache else {}
+            hit = [r for r, n in hits[s.name].items() if n]
+            if not k.cfg12 and len(hit) == 1:
+                chosen.setdefault(s.sub_job.get("model_name"), set()).add(hit[0])
+        reasoner = {m: next(iter(rs)) for m, rs in chosen.items() if len(rs) == 1}
+        out: dict[str, dict] = {}
+        counts = {"restore": 0, "partial": 0, "dump": 0, "unknown": 0}
+        for s in specs:
+            k = keyings[s.name]
+            entry: dict[str, Any] = {"slug": k.slug, "cfg12": k.cfg12, "reasoning_parser": k.reasoning_parser,
+                                     "reasoning_parser_from": "job" if k.cfg12 else None}
+            if k.reason:
+                entry["cfg12_note"] = k.reason
+            mine = hits[s.name]
+            if not k.cfg12 and k.candidates:
+                entry["cfg12_candidates"] = {r or "none": c for r, c in k.candidates.items()}
+                r = reasoner.get(s.sub_job.get("model_name"), "?")
+                if r != "?":
+                    entry.update(cfg12=k.candidates[r], reasoning_parser=r, reasoning_parser_from="node labels")
+                    mine = {r: mine[r]}
+                else:
+                    entry["cfg12_note"] = ("the job names no reasoning_parser, so cfg12 depends on the one chat "
+                                           "pairs with the checkpoint's architecture; "
+                                           + ("no candidate's skeleton exists for this image" if cache
+                                              else "with env_hash= the node labels tell which"))
+            if cache is None:
+                text = "not checked: pass env_hash= for this image" if not self.env_hash else "not checked"
+                entry.update(skeleton="not checked", existing=[], existing_text=text)
+                out[s.name] = entry
+                continue
+            nodes = max(mine.values(), default=0)
+            if k.reason:
+                status, text = "unknown", f"? ({k.reason})"
+            elif nodes:
+                status, text = "restore" if nodes == cache.nodes else "partial", f"exists: {nodes}/{cache.nodes} nodes"
+            elif not confirmable(cache, k.slug):
+                status, text = "unknown", f"? (labels of {k.slug} are cut too short to confirm this image's skeleton)"
+            else:
+                status, text = "dump", "none (will dump)"
+            counts[status] += 1
+            entry.update(skeleton=status, existing_text=text,
+                         existing=[{"env": self.env_hash, "nodes": nodes, "of": cache.nodes, "match": "exists"}]
+                         if nodes else [])
+            out[s.name] = entry
+        plan["node_cache"] = {"checked": cache is not None, "restricted": True, "note": note,
+                              "kube_context": self.kube_context, "env_hash": self.env_hash,
+                              "nodes": cache.nodes if cache else None, "summary": counts if cache else None}
+        return out
+
     def run(self, specs: list[ModelSpec], run_child: Callable | None = None) -> int:
         """Publish, then onboard what published and fits; write and log the result."""
         run_child = run_child or child_process
@@ -600,6 +722,9 @@ def plan_text(plan: dict) -> str:
         f"max_gpus    {plan['max_gpus']} (reserve_gpus=0)",
         f"connection  {plan['connection'] or '-'}",
     ]
+    vis = plan.get("visibility")
+    if vis:
+        lines.append(f"visibility  {vis['reason']}" + ("; show_all=true (admin override)" if vis["show_all"] else ""))
     cache = plan.get("node_cache")
     if cache:
         lines.append("node cache  " + (cache["note"] or f"{cache['nodes']} model-cache node(s) on {cache['kube_context']}, "
@@ -618,8 +743,10 @@ def plan_text(plan: dict) -> str:
     if cache:
         lines += ["", skeleton_summary(cache)]
         if any(not j["cfg12"] and "cfg12_candidates" in j for j in plan["jobs"]):
-            lines.append("cfg12 ?: the job names no reasoning_parser and the node labels did not show which one chat "
-                         "adds for the checkpoint (plan.json lists the candidates)")
+            why = ("the node labels did not show which one chat adds for the checkpoint" if not cache.get("restricted")
+                   else "no candidate's skeleton was found for this image" if cache["checked"]
+                   else "the node labels were not checked")
+            lines.append(f"cfg12 ?: the job names no reasoning_parser and {why} (plan.json lists the candidates)")
     lines += ["", f"publish: {plan['commands']['publish']}"]
     if "onboard" in plan["commands"]:
         lines.append(f"onboard: {plan['commands']['onboard']}")
@@ -633,7 +760,7 @@ def skeleton_summary(cache: dict) -> str:
         return f"skeletons: not checked ({cache['note'].removeprefix('not checked: ')})"
     text = (f"skeletons: {counts['restore']} will restore (all nodes), {counts['partial']} exist but not on "
             f"all nodes, {counts['dump']} will dump")
-    if counts["other_image"]:
+    if counts.get("other_image"):
         text += f" ({counts['other_image']} of them exist for another image)"
     if counts["unknown"]:
         text += f", {counts['unknown']} unknown"

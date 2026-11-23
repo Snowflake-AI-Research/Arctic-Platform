@@ -144,6 +144,67 @@ def test_a_commit_is_used_as_is_and_a_branch_is_resolved_through_the_api():
         semip_job.resolve_ref(semip_job.parse_configs_url(BRANCH_LINK), _GitHub(refs={"mert/semip-jobs-sample": "<html>"}))
 
 
+OFFICIAL = "https://github.com/snowflakedb/cortex-training/blob"
+COMPARE = f"https://api.github.com/repos/snowflakedb/cortex-training/compare/{SHA}...main"
+
+
+class _Compare:
+    """Answers GitHub's compare API for ``SHA...main`` with ``status``, or fails with ``error``."""
+
+    def __init__(self, status=None, error=None):
+        self.status, self.error, self.calls = status, error, []
+
+    def __call__(self, url, accept=None):
+        self.calls.append((url, accept))
+        assert url == COMPARE
+        if self.error:
+            raise self.error
+        return json.dumps({"status": self.status, "ahead_by": 3, "behind_by": 0}).encode()
+
+
+def test_main_of_the_snowflakedb_repo_is_official_without_asking_github():
+    compare = _Compare()
+    configs = semip_job.parse_configs_url(f"{OFFICIAL}/main/model-catalog/semip_models/h200/all.jsonl")
+    assert semip_job.visibility(configs, SHA, compare) == (True, "official catalog (snowflakedb/cortex-training main)")
+    assert compare.calls == []
+
+
+@pytest.mark.parametrize("ref", [SHA, "mert/release-branch"])
+@pytest.mark.parametrize("status", ["ahead", "identical"])
+def test_a_commit_on_main_is_official(ref, status):
+    compare = _Compare(status)
+    configs = semip_job.parse_configs_url(f"{OFFICIAL}/{ref}/model-catalog/semip_models/jobs.jsonl")
+    assert semip_job.visibility(configs, SHA, compare) == (
+        True, "official catalog (snowflakedb/cortex-training main; c55112cb5959 is on main)")
+    assert compare.calls == [(COMPARE, "application/vnd.github+json")]
+
+
+@pytest.mark.parametrize("status", ["diverged", "behind"])
+def test_a_commit_off_main_is_restricted(status):
+    configs = semip_job.parse_configs_url(f"{OFFICIAL}/{SHA}/model-catalog/semip_models/jobs.jsonl")
+    assert semip_job.visibility(configs, SHA, _Compare(status)) == (
+        False, f"restricted: snowflakedb/cortex-training@{SHA} is not the official catalog on main "
+               f"(compare c55112cb5959...main: {status})")
+
+
+@pytest.mark.parametrize("error", [ValueError(f"GET {COMPARE}: HTTP 403 rate limit exceeded"), TimeoutError("timed out")])
+def test_a_failed_compare_is_restricted_and_says_so(error):
+    configs = semip_job.parse_configs_url(f"{OFFICIAL}/{SHA}/model-catalog/semip_models/jobs.jsonl")
+    official, why = semip_job.visibility(configs, SHA, _Compare(error=error))
+    assert not official and why == (f"restricted: snowflakedb/cortex-training@{SHA} is not the official catalog "
+                                    f"on main (could not check: {error})")
+    assert not semip_job.visibility(configs, SHA, lambda url, accept=None: b"<html>")[0]
+
+
+@pytest.mark.parametrize("url", [PERMALINK, BRANCH_LINK.replace("mert/semip-jobs-sample", "main")])
+def test_a_fork_is_restricted_even_on_main(url):
+    compare = _Compare("identical")
+    configs = semip_job.parse_configs_url(url)
+    assert semip_job.visibility(configs, SHA, compare) == (
+        False, f"restricted: {OWNER}/cortex-training@{configs.ref} is not the official catalog on main")
+    assert compare.calls == []
+
+
 def test_http_get_sends_github_token_and_keeps_it_out_of_errors(monkeypatch):
     seen = []
 
@@ -271,9 +332,11 @@ def test_a_dry_run_records_the_configs_and_the_plan_and_submits_nothing(monkeypa
     assert any("2 of 3 config(s) need more than max_gpus=16" in w for w in plan["warnings"])
     text = (out / "plan.txt").read_text()
     assert f"@{SHA} model-catalog/semip_models/jobs.jsonl (requested ref mert/semip-jobs-sample)" in text
-    assert f"| 4 | {ONE} | org/one | 32768 | 1 | 1 | ? | not checked | 2 | yes |" in text
-    assert "node cache  not checked: kubectl is not on PATH" in text
-    assert "skeletons: not checked (kubectl is not on PATH)" in text
+    assert f"| 4 | {ONE} | org/one | 32768 | 1 | 1 | ? | not checked: pass env_hash= for this image | 2 | yes |" in text
+    assert (f"visibility  restricted: {OWNER}/cortex-training@mert/semip-jobs-sample is not the official catalog "
+            "on main\n") in text
+    assert "node cache  not checked: restricted list, the lookup needs env_hash= for this image" in text
+    assert "skeletons: not checked (restricted list, the lookup needs env_hash= for this image)" in text
     assert plan["node_cache"]["checked"] is False and plan["jobs"][2]["skeleton"] == "not checked"
     assert set(plan["jobs"][2]["cfg12_candidates"]) == {"none", *keys.CHAT_REASONERS[1:]}
     assert f"publish: {pub}" in text and f"onboard: {onb}" in text
@@ -397,7 +460,7 @@ def test_a_publish_only_run_passes_when_every_config_published(monkeypatch, tmp_
     assert semip_job.main(_args(tmp_path, connection), get=_GitHub(), run_child=run_child, nodes=nodes) == 0
     assert json.loads((tmp_path / "out" / "result.json").read_text())["failed"] == []
     plan = json.loads((tmp_path / "out" / "plan.json").read_text())
-    assert "node_cache" not in plan and all("cfg12" not in j for j in plan["jobs"])
+    assert "node_cache" not in plan and "visibility" not in plan and all("cfg12" not in j for j in plan["jobs"])
     assert "| line | job | model_name | max_seq_len | n_gpus | TP |\n" in (tmp_path / "out" / "plan.txt").read_text()
 
 

@@ -344,6 +344,16 @@ def _segment_prefix(name: str) -> str:
     return re.sub(r"^[^A-Za-z0-9]+", "", pub._LABEL_DISALLOWED_RUN.sub(".", name))
 
 
+def label_shows(slug: str) -> tuple[int, int]:
+    """How many characters of cfg12 and of env12 every skeleton label of ``slug`` shows."""
+    pub = _publisher()
+    before = _segment_prefix(f"{pub.DEFAULT_PREFIX}/{slug}/{pub.SKELETON_DIR}/")
+    if len(before) + 3 * HASH_LEN + 2 <= pub._LABEL_MAX_SEGMENT:
+        return HASH_LEN, HASH_LEN
+    room = _CUT - len(before)
+    return min(HASH_LEN, max(0, room)), min(HASH_LEN, max(0, room - HASH_LEN - 1))
+
+
 @dataclass(frozen=True)
 class Found:
     """Skeleton labels for one model and cfg12 under one env12 (``env_exact``) or the start

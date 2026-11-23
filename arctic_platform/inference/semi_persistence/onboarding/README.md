@@ -224,7 +224,7 @@ one that waits for the nodes to verify the image. Then onboard the models with
 python -m arctic_platform.inference.semi_persistence.onboarding.semip_job cluster=qa6 \
     image_tag=release_20261119_163502_6ed8c6d2361-h max_gpus=16 tests=functional,correctness \
     configs=https://github.com/OWNER/cortex-training/blob/REF/model-catalog/semip_models/jobs.jsonl \
-    connection=qa6.config [dry_run=true] [env_hash=ENV12] [out_dir=semip_job]
+    connection=qa6.config [dry_run=true] [env_hash=ENV12] [show_all=false] [out_dir=semip_job]
 ```
 
 `cluster` (`qa6` or `prod`) sets `model_bucket` and the kubeconfig context the
@@ -257,6 +257,18 @@ skipped with a note. Two things stay `?`: a job that names no
 only a matching label reveals, and labels cut by the 63-character limit before
 cfg12 (long model names such as `NVIDIA-Nemotron-3-Nano-30B-A3B-BF16`) cannot
 be read.
+
+That full lookup is only for the official catalog: `snowflakedb/cortex-training`
+at `main`, or at a commit on main (GitHub's compare API with main says
+`identical` or `ahead`; if the API fails, the list is not official). Any other
+list (a fork, a branch off main) is restricted so that it cannot reveal other
+users' dumps: with `env_hash=` each job gets only its own key under that env12,
+`exists: N/M nodes` or `none (will dump)`, and nothing about other images,
+labels or reasoning_parser candidates; without `env_hash=` the node labels are
+not read (`not checked: pass env_hash= for this image`). The plan's
+`visibility` line and `plan.json` say which applies and why. `show_all=true`
+is for admins: it forces the full output for any list and is logged; it only
+changes what is printed, not who can read the node labels.
 
 ## Model configs
 
