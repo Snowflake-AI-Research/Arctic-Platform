@@ -326,11 +326,10 @@ dss-platform's: it evaluates `exp(Δ) − 1 − Δ` in fp32, which loses precisi
 |Δ| of about 1e-3 or less (k3 is then about Δ²/2, far below the fp32 resolution
 of `exp(Δ) − 1`), while this code uses `expm1`. A gap in that regime comes from
 the dss-platform expression, not from a different definition. A trainer
-log-probability that is not finite is replaced by 0 before the loss, and its
-token still counts in this population (its Δ is then minus the sampler
-log-probability), whereas `trainable_logprob_lowvar_all/mean` leaves such tokens
-out of both its sum and its count. A sampler log-probability that is not finite
-is not sanitised here: its token counts too, and adds k3 at the clamped Δ (4.85e8
+log-probability that is not finite is left out of this population and counted in
+`grpo_nonfinite_logprob_token_count`, as `trainable_logprob_lowvar_all/mean`
+leaves such tokens out of both its sum and its count. A sampler log-probability
+that is not finite is not sanitised here: its token counts, and adds k3 at the clamped Δ (4.85e8
 for a −inf sampler log-probability, 19 for +inf) or makes the sum NaN for a NaN
 one, whereas `trainable_logprob_lowvar_all/mean` leaves it out.
 
