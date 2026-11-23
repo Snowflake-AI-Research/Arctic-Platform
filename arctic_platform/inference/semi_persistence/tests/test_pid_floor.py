@@ -334,6 +334,7 @@ class _FakeInstance:
     def __init__(self, log):
         self.log = log
         self.meta_extra = None
+        self.last_info = {}
         log.append("Instance()")
 
     def criu_dump(self, filename=None, meta_extra=None):
