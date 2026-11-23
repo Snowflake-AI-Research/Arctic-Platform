@@ -1353,15 +1353,16 @@ def test_engine_initializes_once_inside_optional_trace(monkeypatch, with_optimiz
     monkeypatch.setattr("deepspeed.initialize", initialize)
 
     def run():
-        return initialize_training_engine(
-            model,
-            ds_config,
-            optimizer=OptimizerSettings(fused=True) if with_optimizer else None,
-            ep_size=1,
-            mpu=mpu,
-            model_path="unused",
-            rank=0,
-        )
+        with deepspeed_zero_initialization.maybe_trace_zero_initialization(ds_config, 0) as init_config:
+            return initialize_training_engine(
+                model,
+                init_config,
+                optimizer=OptimizerSettings(fused=True) if with_optimizer else None,
+                ep_size=1,
+                mpu=mpu,
+                model_path="unused",
+                rank=0,
+            )
 
     if fail_initialize:
         with pytest.raises(RuntimeError) as caught:

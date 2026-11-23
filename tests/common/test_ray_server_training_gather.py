@@ -905,10 +905,7 @@ class TestNcclWeightSyncRefs(TestCasePlus):
             ]
         )
         schedule_class = SimpleNamespace(build=lambda **kwargs: schedule)
-        with (
-            patch("arctic_platform.common.ray_server._transfer_schedule_cls", return_value=schedule_class),
-            patch("arctic_platform.debug.lora.selected_lora_request", return_value=None),
-        ):
+        with patch("arctic_platform.common.ray_server._transfer_schedule_cls", return_value=schedule_class):
             async with server._training_op_lock:
                 result = await server._sync_weights_nccl(workers, pool)
         return server, result
@@ -939,8 +936,15 @@ class TestNcclWeightSyncRefs(TestCasePlus):
         asyncio.run(_run())
 
     def test_completed_byte_verification_receipts_are_retained(self):
-        sent = {"all_rank_weight_sync_verification": {"sender": True}}
-        received = {"workers": [{"all_rank_weight_sync_verification": {"receiver": True}}]}
+        sent = {"sent_l2_sq": 32.5, "all_rank_weight_sync_verification": {"sender": True}}
+        received = {"workers": [{"recv_l2_sq": 32.5, "all_rank_weight_sync_verification": {"receiver": True}}]}
+        completed = []
+        original = ArcticRLRayServer._await_weight_sync_refs
+
+        async def _collect(server, *args):
+            receipts = await original(server, *args)
+            completed.append(receipts)
+            return receipts
 
         async def _send():
             return sent
@@ -949,9 +953,19 @@ class TestNcclWeightSyncRefs(TestCasePlus):
             return received
 
         async def _run():
-            with patch("arctic_platform.debug.weight_sync.enabled", return_value=True):
+            with (
+                patch("arctic_platform.debug.weight_sync.enabled", return_value=True),
+                patch.object(ArcticRLRayServer, "_await_weight_sync_refs", _collect),
+            ):
                 server, result = await self._sync([_send], _receive)
-            self.assertEqual(result["targets"], [{"send": [sent], "recv": received}])
+            self.assertEqual(completed, [(received, [sent])])
+            self.assertIs(completed[0][0], received)
+            self.assertIs(completed[0][1][0], sent)
+            self.assertEqual(result["status"], "ok")
+            self.assertTrue(result["checksum_match"])
+            self.assertEqual(result["sent_l2_sq"], 32.5)
+            self.assertEqual(result["recv_l2_sq"], {"sampling replica 0 rank 0": 32.5})
+            self.assertNotIn("targets", result)
             self.assertFalse(server._training_failed)
 
         asyncio.run(_run())
