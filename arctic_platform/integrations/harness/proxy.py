@@ -14,7 +14,7 @@
 # limitations under the License.
 """OpenAI chat server in front of Cortex ``generate``.
 
-Any harness that already speaks chat completions points its client at
+Any harness that already speaks chat completions (or, without streaming, Responses) points its client at
 ``url_for(rollout_id)`` with the key from ``issue``. Each call is stored as an
 episode. A request that continues the same messages is sent to ``generate``
 with the previous sampled token ids still in the prompt. OpenHands, OpenCode,
@@ -39,6 +39,8 @@ from arctic_platform.integrations.harness.episodes import Session
 from arctic_platform.integrations.harness.episodes import normalize_messages
 from arctic_platform.integrations.harness.episodes import plan_prompt
 from arctic_platform.integrations.harness.episodes import remember
+from arctic_platform.integrations.harness.responses import chat_body_from_responses
+from arctic_platform.integrations.harness.responses import responses_from_chat
 from arctic_platform.integrations.harness.tool_parser import parse_tool_calls as _parse_tool_calls
 
 GenerateFn = Callable[[list[int], dict[str, Any], str | None], Awaitable[dict[str, Any]]]
@@ -136,6 +138,8 @@ class ChatCompletionsProxy:
         app = web.Application(client_max_size=256 * 1024 * 1024)
         app.router.add_post("/v1/chat/completions", self._chat_completions)
         app.router.add_post("/r/{routing_key}/v1/chat/completions", self._chat_completions)
+        app.router.add_post("/v1/responses", self._responses)
+        app.router.add_post("/r/{routing_key}/v1/responses", self._responses)
         app.router.add_get("/health", self._health)
         app.router.add_get("/v1/models", self._models)
         app.router.add_get("/r/{routing_key}/v1/models", self._models)
@@ -226,6 +230,21 @@ class ChatCompletionsProxy:
             body = await request.json()
         except json.JSONDecodeError:
             return _error(400, "request body is not valid JSON")
+        return await self._complete(request, body)
+
+    async def _responses(self, request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+            chat_body = chat_body_from_responses(body)
+        except json.JSONDecodeError:
+            return _error(400, "request body is not valid JSON")
+        except (KeyError, TypeError, ValueError) as exc:
+            return _error(400, f"unsupported Responses request: {exc}")
+        return await self._complete(request, chat_body, responses_request=body)
+
+    async def _complete(
+        self, request: web.Request, body: dict[str, Any], responses_request: dict[str, Any] | None = None
+    ) -> web.Response:
         if body.get("stream"):
             return _error(400, "streaming is not supported")
         if body.get("n", 1) != 1:
@@ -257,6 +276,8 @@ class ChatCompletionsProxy:
                 result = await self._generate_fn(prompt_ids, params, routing_key)
             except Exception as exc:
                 return _error(500, f"Cortex generate failed: {exc}")
+            if responses_request is not None and result.get("finish_reason") == "abort":
+                return _error(502, "Cortex generation was aborted")
 
             response_ids = [int(token) for token in result.get("token_ids") or []]
             text = self._tokenizer.decode(response_ids, skip_special_tokens=True)
@@ -277,26 +298,27 @@ class ChatCompletionsProxy:
         finish_reason = result.get("finish_reason") or "stop"
         if len(tool_calls) > 0 and finish_reason == "stop":
             finish_reason = "tool_calls"
-        return web.json_response(
-            dict(
-                id=f"chatcmpl-{uuid.uuid4().hex}",
-                object="chat.completion",
-                created=int(time.time()),
-                model=body.get("model", self._model_name),
-                choices=[
-                    dict(
-                        index=0,
-                        message=assistant_message,
-                        logprobs=None,
-                        finish_reason=finish_reason,
-                        token_ids=response_ids,
-                    )
-                ],
-                usage=dict(
-                    prompt_tokens=len(prompt_ids),
-                    completion_tokens=len(response_ids),
-                    total_tokens=len(prompt_ids) + len(response_ids),
-                ),
-                prompt_token_ids=prompt_ids,
-            )
+        completion = dict(
+            id=f"chatcmpl-{uuid.uuid4().hex}",
+            object="chat.completion",
+            created=int(time.time()),
+            model=body.get("model", self._model_name),
+            choices=[
+                dict(
+                    index=0,
+                    message=assistant_message,
+                    logprobs=None,
+                    finish_reason=finish_reason,
+                    token_ids=response_ids,
+                )
+            ],
+            usage=dict(
+                prompt_tokens=len(prompt_ids),
+                completion_tokens=len(response_ids),
+                total_tokens=len(prompt_ids) + len(response_ids),
+            ),
+            prompt_token_ids=prompt_ids,
         )
+        if responses_request is not None:
+            return web.json_response(responses_from_chat(completion, responses_request, result))
+        return web.json_response(completion)
