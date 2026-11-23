@@ -580,6 +580,55 @@ def _replayed_sparse_indices(
     return torch.where((pools >= 0).any(-1)[None, :, None], replayed[None], own)
 
 
+def _selection_agreement(
+    pools: torch.Tensor,
+    own: torch.Tensor,
+    global_cu_seqlens: torch.Tensor,
+    query_offset: int,
+    kpool: int,
+    topk: int,
+) -> torch.Tensor:
+    """Compare the trainer's own pool choice with the sampler's captured one, query by query.
+
+    Returns int64 ``[captured queries, queries whose pool sets differ, pools only the trainer chose, pools only the
+    sampler chose]`` on the device, without a host sync. A query with no captured pool is not counted.
+    """
+    positions = query_offset + torch.arange(pools.shape[1], dtype=global_cu_seqlens.dtype, device=own.device)
+    start = global_cu_seqlens[torch.searchsorted(global_cu_seqlens, positions, right=True) - 1].to(torch.int64)
+    sampler = pools[0].to(device=own.device, dtype=torch.int64) - 1
+    # Each selected pool is kpool consecutive token ids; its last one names the pool, as the sampler's capture does.
+    last = own[0, :, kpool - 1 : topk : kpool].to(torch.int64)
+    trainer = torch.where(last >= 0, torch.div(last - start[:, None], kpool, rounding_mode="floor"), -1)
+    ordered = torch.where(sampler >= 0, sampler, torch.iinfo(torch.int64).max).sort(-1).values
+    found = torch.searchsorted(ordered, trainer.clamp(min=0)).clamp(max=ordered.shape[-1] - 1)
+    common = ((ordered.gather(-1, found) == trainer) & (trainer >= 0)).sum(-1)
+    trainer_only = (trainer >= 0).sum(-1) - common
+    sampler_only = (sampler >= 0).sum(-1) - common
+    captured = (sampler >= 0).any(-1)
+    return torch.stack(
+        [
+            captured.sum(),
+            (captured & (trainer_only + sampler_only > 0)).sum(),
+            trainer_only[captured].sum(),
+            sampler_only[captured].sum(),
+        ]
+    )
+
+
+def pop_indexer_selection_agreement(model: nn.Module) -> dict[str, list[int]]:
+    """Each sparse-attention layer's selection agreement summed since the last call, then cleared.
+
+    Values are ``_selection_agreement``'s four counts. A forward recomputed for activation checkpointing adds its
+    counts again, so compare ratios across calls, not totals.
+    """
+    agreement = {}
+    for name, module in model.named_modules():
+        counts = module.__dict__.pop("_indexer_selection_agreement", None)
+        if counts is not None:
+            agreement[name] = counts.tolist()
+    return agreement
+
+
 def _sparse_attention_forward(
     self,
     hidden_states: torch.Tensor,
@@ -636,6 +685,16 @@ def _sparse_attention_forward(
             cp_rank=self._cp_rank,
         )
         if indexer_pools is not None:
+            agreement = _selection_agreement(
+                indexer_pools,
+                topk_indices,
+                global_cu_seqlens,
+                self._cp_rank * local_length,
+                self.indexer.index_kpool,
+                self.indexer.index_topk,
+            )
+            previous = self.__dict__.get("_indexer_selection_agreement")
+            self._indexer_selection_agreement = agreement if previous is None else previous + agreement
             topk_indices = _replayed_sparse_indices(
                 indexer_pools,
                 topk_indices,

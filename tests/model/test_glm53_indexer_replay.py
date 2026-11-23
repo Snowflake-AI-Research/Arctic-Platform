@@ -139,3 +139,62 @@ def test_trainer_selects_the_samplers_tokens_in_packed_rows():
         assert sum(a != b for a, b in zip(own[layer], expected[layer])) > length // 3
     with pytest.raises(ValueError, match="rows per token"):  # a capture of another width cannot be split
         _attended(model, tokens, positions, boundaries, capture[None, :, :-1].to(torch.int64))
+
+
+def _capture_of(selections, text, boundaries, routes, length):
+    """A capture whose pool rows hold, for every query, the pools of the given per-layer token-id sets."""
+    kpool, top_k, rows = text.index_kpool, text.num_experts_per_tok, pool_rows(text)
+    capture = torch.zeros(length, text.num_hidden_layers + LAYERS * rows, top_k, dtype=torch.int32)
+    capture[:, :LAYERS] = routes[0]
+    for start, n in zip(boundaries[:-1].tolist(), ROWS):
+        for layer in range(LAYERS):
+            buffer = torch.full((n, text.index_topk + kpool - 1), -1, dtype=torch.int32)
+            for t in range(n):
+                visible = (t + 1) // kpool
+                pools = sorted({(token - start) // kpool for token in selections[layer][start + t]} & set(range(visible)))
+                ids = [p * kpool + o for p in pools for o in range(kpool)]
+                buffer[t, : len(ids)] = torch.tensor(ids, dtype=torch.int32)
+
+            def write(row, ids, _start=start, _n=n):
+                capture[_start : _start + _n, row] = ids
+
+            capture_pools(write, text.num_hidden_layers + layer * rows, buffer, text.index_topk, kpool, top_k)
+    return capture.to(torch.uint16).to(torch.int64)[None]
+
+
+def test_trainer_reports_how_far_its_own_selection_is_from_the_samplers():
+    from arctic_platform.model.implementations.glm53.context_parallel import pop_indexer_selection_agreement
+
+    model = _model()
+    _record_routes(model)
+    text = model.config.text_config
+    kpool, select = text.index_kpool, text.index_topk // text.index_kpool
+    length = sum(ROWS)
+    tokens = torch.randint(2, text.vocab_size, (1, length), generator=torch.Generator().manual_seed(0))
+    positions = torch.cat([torch.arange(n) for n in ROWS])[None]
+    boundaries = torch.tensor([0, *torch.tensor(ROWS).cumsum(0).tolist()], dtype=torch.int32)
+    routes = torch.randint(0, text.n_routed_experts, (1, length, LAYERS, text.num_experts_per_tok))
+    own = _attended(model, tokens, positions, boundaries, routes)
+    assert pop_indexer_selection_agreement(model) == {}  # no capture, nothing compared
+
+    _attended(model, tokens, positions, boundaries, _capture_of(own, text, boundaries, routes, length))
+    captured = sum(max(0, n - kpool + 1) for n in ROWS)  # queries that can see a complete pool
+    assert list(pop_indexer_selection_agreement(model).values()) == [[captured, 0, 0, 0]] * LAYERS
+
+    # In the first layer, swap one kept pool for one the trainer left out, on every query that has a spare pool.
+    swapped = [list(layer) for layer in own]
+    changed = 0
+    for start, n in zip(boundaries[:-1].tolist(), ROWS):
+        for t in range(n):
+            visible = (t + 1) // kpool
+            kept = sorted({(token - start) // kpool for token in own[0][start + t]} & set(range(visible)))
+            spare = sorted(set(range(visible)) - set(kept))
+            if len(kept) == select and spare:
+                kept[0] = spare[0]
+                swapped[0][start + t] = {start + p * kpool + o for p in kept for o in range(kpool)}
+                changed += 1
+    assert changed > length // 4
+    _attended(model, tokens, positions, boundaries, _capture_of(swapped, text, boundaries, routes, length))
+    first = next(iter(pop_indexer_selection_agreement(model).values()))
+    assert first == [captured, changed, changed, changed]
+    assert pop_indexer_selection_agreement(model) == {}
