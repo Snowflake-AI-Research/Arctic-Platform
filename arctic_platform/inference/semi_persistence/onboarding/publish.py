@@ -16,24 +16,29 @@
 """Dump and publish semi_p images for a backend image, one job per model config.
 
     python -m arctic_platform.inference.semi_persistence.onboarding.publish \\
-        config=CONN.json image_tag=TAG models=a,b,c [max_gpus=40] [reserve_gpus=8] \\
-        [out_dir=onboarding_reports/publish] [timeout_s=7200]
+        config=CONN.json image_tag=TAG models=a,b,c [catalog=PATH] [max_gpus=40] \\
+        [reserve_gpus=8] [out_dir=onboarding_reports/publish] [timeout_s=7200]
 
-For each model file under onboarding/models/, at its published size:
+``models`` are model catalog entries (``glm-5.3/standard/h200-inference-full``)
+or paths to JSON files; see ``jobs.load_model`` for ``catalog``. For each, at
+its published size:
 
   1. submit the sampling job with semi_p on, SEMIP_DUMP_PUBLISH=1, pinned to
      ``image_tag``;
   2. wait for ``running``; a job that restored from a published image needs
      nothing (the image is already published);
   3. otherwise the engine cold-started, dumped, restored and is publishing in
-     the background: wait for its ``semi_p: published`` line in the sub-job log;
+     the background: wait for its ``semi_p: published`` line in the sub-job log.
+     A job that ends first (an idle timeout can end it while the upload runs
+     on) and leaves no log that says how the publish went is ``unknown``,
+     not failed;
   4. cancel the job.
 
 Jobs start as GPUs allow within ``max_gpus``, always leaving ``reserve_gpus``
 free. Every job is appended to ``<out_dir>/<image_tag>/jobs.jsonl``; SIGINT,
 SIGTERM and SIGHUP cancel every job still held. Results go to
-``<out_dir>/<image_tag>/summary.json``. Afterwards, point each model's entry in
-onboarding/models/backends.json at ``image_tag``.
+``<out_dir>/<image_tag>/summary.json``. Onboard the models with
+``debug_image_tag`` set to the same image.
 """
 
 from __future__ import annotations
@@ -59,16 +64,22 @@ from arctic_platform.inference.semi_persistence.onboarding.jobs import TERMINAL
 from arctic_platform.inference.semi_persistence.onboarding.jobs import ModelSpec
 from arctic_platform.inference.semi_persistence.onboarding.jobs import load_model
 from arctic_platform.inference.semi_persistence.onboarding.jobs import normalize_status
+from arctic_platform.inference.semi_persistence.onboarding.startup import follow_sub_job_log
+from arctic_platform.inference.semi_persistence.onboarding.startup import merge_lines
 from arctic_platform.inference.semi_persistence.onboarding.startup import parse_semi_p
-from arctic_platform.inference.semi_persistence.onboarding.startup import read_sub_job_log
 
 logger = logging.getLogger(__name__)
 
 DUMP_PUBLISH_ENV = {"SEMIP_DUMP_PUBLISH": "1"}
 PUBLISHED = re.compile(r"semi_p: published (\S+) in ([0-9.]+)s")
+PUBLISHING = re.compile(r"semi_p: publishing (\S+) to ")
 NOT_PUBLISHED = re.compile(r"semi_p: (?:publishing \S+ failed|publishing \S+ raised|"
                            r"dumped \S+ but not publishing it|not publishing \S+)")
 SKELETON = re.compile(r"image-cache/([^/\s]+)/skeleton/([0-9a-f]{12}_[0-9a-f]{12}_[0-9a-f]{12})")
+# semip_publish.py's last line, inside the tail the engine logs after "published".
+SUMMARY = re.compile(r"publish summary: (\{.*\})")
+SUMMARY_FIELDS = ("format", "raw_bytes", "stored_bytes", "compressed_files", "zero_frames",
+                  "hash_compress_s", "upload_s")
 POLL_S = 30.0
 
 
@@ -105,8 +116,29 @@ def publish_outcome(lines: list[str]) -> dict | None:
             if skeleton:
                 out.update(slug=skeleton.group(1), skeleton=skeleton.group(2),
                            weight_hash=skeleton.group(2)[-12:])
+            out.update(publish_summary(lines[i:]))
             return out
     return None
+
+
+def publish_summary(lines: list[str]) -> dict:
+    """The publisher's summary fields, plus ``ratio`` (raw / stored); ``{}`` if
+    the line is absent (a publisher older than compression) or unreadable."""
+    for line in lines:
+        found = SUMMARY.search(line)
+        if not found:
+            continue
+        try:
+            doc = json.loads(found.group(1))
+        except ValueError:
+            return {}
+        if not isinstance(doc, dict):
+            return {}
+        out = {k: doc[k] for k in SUMMARY_FIELDS if k in doc}
+        if out.get("stored_bytes") and isinstance(out.get("raw_bytes"), (int, float)):
+            out["ratio"] = round(out["raw_bytes"] / out["stored_bytes"], 2)
+        return out
+    return {}
 
 
 class Publisher:
@@ -115,7 +147,9 @@ class Publisher:
             if not args.get(key):
                 raise SystemExit(f"{key}= is required")
         self.image_tag = args["image_tag"]
-        self.models = [m for m in args["models"].split(",") if m]
+        specs = [load_model(m, args.get("catalog")) for m in args["models"].split(",") if m]
+        self.specs = {spec.name: spec for spec in specs}
+        self.models = list(self.specs)
         self.max_gpus = int(args.get("max_gpus", "40"))
         self.reserve = int(args.get("reserve_gpus", "8"))
         self.timeout_s = float(args.get("timeout_s", "7200"))
@@ -125,6 +159,7 @@ class Publisher:
         self.client = make_client(args["config"])
         self.ledger = self.out / "jobs.jsonl"
         self.live: dict[str, str] = {}
+        self.logs: dict[str, list[str]] = {}
         self.lock = threading.Lock()
         # A re-run of some models keeps the others' entries, which onboard reads.
         summary = self.out / "summary.json"
@@ -168,20 +203,48 @@ class Publisher:
             time.sleep(20)
         raise TimeoutError("not running in time")
 
+    def read_log(self, name: str, job_id: str) -> list[str]:
+        """Every sub-job log line seen so far (see ``follow_sub_job_log``)."""
+        lines = follow_sub_job_log(self.client, job_id, self.logs.get(job_id, []), label=name)
+        self.logs[job_id] = lines
+        return lines
+
     def wait_published(self, name: str, job_id: str, deadline: float) -> dict:
         while time.time() < deadline:
-            lines = read_sub_job_log(self.client, job_id)
-            outcome = publish_outcome(lines)
+            outcome = publish_outcome(self.read_log(name, job_id))
             if outcome:
                 return outcome
-            status = normalize_status(self.client.get_job(job_id).get("status"))
+            job = self.client.get_job(job_id)
+            status = normalize_status(job.get("status"))
             if status in TERMINAL:
-                raise RuntimeError(f"job ended {status} before publishing")
+                return self.ended_outcome(name, job_id, f"{status} ({job.get('reason') or 'no reason given'})")
             time.sleep(POLL_S)
         raise TimeoutError("publish did not finish in time")
 
+    def ended_outcome(self, name: str, job_id: str, ended: str) -> dict:
+        """The outcome of a job that ended before its log showed one. The engine
+        uploads in the background, so the end itself says nothing about the
+        upload: the archived execution logs may, and otherwise it is unknown."""
+        lines = self.read_log(name, job_id)
+        try:
+            for f in self.client.fetch_execution_logs(job_id):
+                lines = merge_lines(lines, (f.get("content") or "").splitlines())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("%s: execution logs unavailable: %s", name, exc)
+        outcome = publish_outcome(lines)
+        if outcome:
+            return outcome
+        started = next((m for m in map(PUBLISHING.search, lines) if m), None)
+        if not started:
+            return {"status": f"unknown: the job ended {ended} and no log it left shows a publish; "
+                              "check its device-manager pod log"}
+        return {"status": f"unknown: the job ended {ended} while the engine was uploading {started.group(1)}, "
+                          "and no log it left says whether the upload finished; check the bucket for its "
+                          "skeleton or the device-manager pod log for 'semi_p: published'",
+                "key_dir": started.group(1)}
+
     def prepare(self, name: str) -> dict:
-        spec = load_model(name)
+        spec = self.specs[name]
         res: dict[str, Any] = {"model": name, "model_name": spec.sub_job["model_name"],
                                "n_gpus": spec.n_gpus, "started_at": utc()}
         job_id = self.client.create_job_from_body(publish_body(spec, self.image_tag))["job_id"]
@@ -200,16 +263,17 @@ class Publisher:
             res["status"] = f"FAILED: {type(exc).__name__}: {exc}"
         finally:
             try:
-                (self.out / f"{name}.log").write_text("\n".join(read_sub_job_log(self.client, job_id)) + "\n")
+                (self.out / f"{name}.log").write_text("\n".join(self.read_log(name, job_id)) + "\n")
             except Exception:  # noqa: BLE001
                 logger.warning("%s: could not save the sub-job log", name, exc_info=True)
+            self.logs.pop(job_id, None)
             self.cancel(job_id)
             res["finished_at"] = utc()
             logger.info("%s: %s", name, res["status"])
         return res
 
     def run(self) -> None:
-        queue = sorted(self.models, key=lambda m: load_model(m).n_gpus, reverse=True)
+        queue = sorted(self.models, key=lambda m: self.specs[m].n_gpus, reverse=True)
         running: dict[threading.Thread, int] = {}
 
         def work(name: str) -> None:
@@ -224,7 +288,7 @@ class Publisher:
             used = sum(running.values())
             started = False
             for name in list(queue):
-                need = load_model(name).n_gpus
+                need = self.specs[name].n_gpus
                 if used + need > self.max_gpus:
                     continue
                 free = int(self.client.get_capacity().get("available_gpus", 0))

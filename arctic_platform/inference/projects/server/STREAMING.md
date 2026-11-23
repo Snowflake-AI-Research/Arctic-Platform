@@ -351,22 +351,21 @@ the end of a stream needs up to 2n + 2 slots. A merge that would exceed the
 per-event byte limit starts a new event instead.
 
 Defaults: 128 queued events, 1 MiB queued serialized payload, 256 KiB per event,
-and 128 sessions per worker. Streaming and legacy
-`generate()` requests share each worker's `active_requests` / `concurrency_limit`
-budget. Each dispatched stream consumes one shared slot and is additionally counted
-against the per-worker `MAX_WORKER_STREAMS` cap (128); this is an extra ceiling,
-not a reserved capacity pool. With the default worker concurrency of 128, all 128
-slots can serve streaming requests. A lower configured worker concurrency still
-limits dispatch. There is no separate scheduler-wide streaming admission cap:
-additional streams wait for worker capacity, like legacy requests. For example,
-two replicas at the default concurrency can run 256 streams, with further
-requests waiting until a slot opens. The waiting request count is not bounded;
+and 128 sessions per worker.
+Streams and `generate()` requests are routed alike, by each worker's
+`active_requests`, and both queue in the engine beyond its `max_num_seqs`.
+`generate()` requests wait in the scheduler once every worker they can go to
+holds a backlog of twice `max_num_seqs` (less above `max_num_seqs` 1792, but
+never less than `max_num_seqs`). Streams are instead capped per worker
+by `MAX_WORKER_STREAMS` (128): a stream goes to the less loaded of two random
+workers with a free stream slot, and waits while none has one, or while its
+routing key's worker has none. For example, two replicas can run 256 streams, with further streams
+waiting until a slot opens. The waiting request count is not bounded;
 deployments that need a bounded backlog must apply a separate admission policy.
 Per-stream buffer limits, deadlines, and stalled-consumer cleanup still apply.
 Neither traffic class has reserved headroom or a fairness guarantee: heavy traffic
-of either kind can delay the other. For example, with a concurrency limit of 4,
-three active streams leave at most one slot for legacy generation. A full worker
-causes queued streams to wait; a definite registration rejection is not an engine
+of either kind can delay the other in the engine. A worker without a free stream
+slot causes queued streams to wait; a definite registration rejection is not an engine
 cleanup failure and does not quarantine the replica. Byte limits measure
 JSON payload, not Python heap/Ray/vLLM RSS. Event count, payload size, token/input
 caps and concurrency bound retained application objects; exact engine/object-store
