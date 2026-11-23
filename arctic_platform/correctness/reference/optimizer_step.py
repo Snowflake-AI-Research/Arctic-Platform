@@ -25,9 +25,9 @@ from typing import Dict
 import torch
 
 from arctic_platform.common.optimizer import OptimizerSettings
+from arctic_platform.common.optimizer import uses_weight_decay
 from arctic_platform.correctness.harness.storage import require_data_fast_path
 
-NO_DECAY_NAMES = ("bias", "layer_norm.weight", "layernorm.weight", "norm.weight", "ln_f.weight")
 ADAMW_NAMES = {"adam", "adamw", "fusedadam", "fused_adam", "torch_adamw", "deepspeed_cpu_adam"}
 
 
@@ -35,11 +35,6 @@ ADAMW_NAMES = {"adam", "adamw", "fusedadam", "fused_adam", "torch_adamw", "deeps
 class OptimizerStepArtifact:
     manifest_path: Path
     gradient_norm_before_clip: float
-
-
-def _uses_weight_decay(name: str) -> bool:
-    lowered = name.lower()
-    return not any(part in lowered for part in NO_DECAY_NAMES)
 
 
 def master_dtype(optimizer_dtype: str):
@@ -61,15 +56,15 @@ def assert_adamw_semantics(optimizer_config: dict) -> None:
 
 
 def build_adamw(named_masters, optimizer_config: dict, *, learning_rate: float):
-    """One AdamW over the config's hyperparameters, with weight decay withheld from biases and norms.
+    """One AdamW over the config's hyperparameters, decaying what the trainer decays (``uses_weight_decay``).
 
     Single-step and trajectory references both use independent PyTorch AdamW with fused and foreach
     implementations disabled. Product optimizer rounding remains a measured difference.
     """
     import torch
 
-    decay = [master for name, master in named_masters if _uses_weight_decay(name)]
-    no_decay = [master for name, master in named_masters if not _uses_weight_decay(name)]
+    decay = [master for name, master in named_masters if uses_weight_decay(name, master)]
+    no_decay = [master for name, master in named_masters if not uses_weight_decay(name, master)]
     settings = OptimizerSettings.model_validate(optimizer_config)
     weight_decay = settings.weight_decay
     groups = []
