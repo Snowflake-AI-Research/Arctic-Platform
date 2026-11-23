@@ -1820,10 +1820,6 @@ class InferenceWorker(StreamingWorkerMixin):
     ) -> dict[str, Any]:
         """Receive + load weights on all TP workers via NCCL broadcast (rank 0 = trainer).
 
-        The result is TP rank 0's, plus ``rank_memory``: every rank's ``mem_*`` and
-        ``device_*`` figures in TP-rank order, since each rank receives and loads
-        the whole model.
-
         When ``envs.ARCTIC_INFERENCE_DUMP_PARAM_L2`` is set (opt-in, default off),
         each TP rank's full-model and loaded-destination L2 maps are gathered
         here (only rank 0's dict escapes ``collective_rpc``). Mapping and skip
@@ -1837,16 +1833,17 @@ class InferenceWorker(StreamingWorkerMixin):
         results = maybe_collect_broadcast_verification(results, engine_only=engine_only, llm=self.llm, rank_offset=rank_offset)
         if not results:
             return {}
-        head = dict(results[0])
         if not engine_only:
-            head["rank_memory"] = [
+            # Every rank receives and loads the whole model: rank 0's reply carries each rank's memory figures.
+            results[0]["rank_memory"] = [
                 {key: value for key, value in r.items() if key.startswith(("mem_", "device_"))} for r in results
             ]
         from arctic_platform.inference import envs
         if not envs.ARCTIC_INFERENCE_DUMP_PARAM_L2:
-            return head
+            return results[0]
         # Verification path only: preserve the original full-model trace and
         # gather the loaded-only trace under a distinct field.
+        head = dict(results[0])
         head["all_rank_param_l2"] = [
             (r.get("param_l2") if isinstance(r, dict) else None) for r in results
         ]
