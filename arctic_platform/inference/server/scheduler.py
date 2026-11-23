@@ -12,7 +12,6 @@ from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Hashable
 
 import ray
-from vllm.v1.engine.exceptions import EngineDeadError
 from arctic_platform.inference.server.chat import ChatPrompt
 from arctic_platform.inference.server.streaming import ClientStream, MAX_WORKER_STREAMS, StreamLimits, validate_request
 from arctic_platform.inference.server.token_prompts import is_token_tensor
@@ -65,6 +64,8 @@ class WorkerState:
 
     def record_death(self, error: BaseException) -> bool:
         """Quarantine this worker if ``error`` shows that its actor or engine died."""
+        from vllm.v1.engine.exceptions import EngineDeadError
+
         death = next((cls for cls in (EngineDeadError, ray.exceptions.ActorDiedError) if isinstance(error, cls)), None)
         if death is not None:
             self.quarantine(death)
