@@ -272,3 +272,20 @@ def test_router_replay_stop_token_sequence_normalization():
         {"token_ids": [1, 2], "include_in_output": False},
         {"token_ids": [3], "include_in_output": True},
     ]
+
+
+def test_compact_logprobs_never_fill_a_missing_sampled_score():
+    def result(logprobs, token_ids=(8,)):
+        choice = SimpleNamespace(text="", token_ids=list(token_ids), finish_reason="stop", logprobs=logprobs)
+        output = SimpleNamespace(
+            prompt_token_ids=[1], num_cached_tokens=0, prompt_logprobs=None, outputs=[choice]
+        )
+        return _result_from_output(output, return_sampled_logprobs_only=True)
+
+    def lp(value):
+        return SimpleNamespace(logprob=value, rank=1)
+
+    assert result([{8: lp(-4.5), 9: lp(-1.25)}])["logprobs"] == [-4.5]
+    for logprobs, token_ids in (([{9: lp(-1.25)}], (8,)), ([{}], (8,)), ([{8: lp(-0.5)}], (8, 9))):
+        with pytest.raises((KeyError, ValueError)):
+            result(logprobs, token_ids)

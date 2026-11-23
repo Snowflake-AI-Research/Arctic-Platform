@@ -613,32 +613,12 @@ def _serialize_logprobs_position(pos_data: dict | None) -> dict[int, dict] | Non
     return out
 
 
-def _sampled_logprob(pos_data: dict | None, token_id: int) -> float:
-    if not pos_data:
-        return 0.0
-    entry = pos_data.get(token_id)
-    if entry is None:
-        entry = pos_data.get(str(token_id))
-    if entry is None and pos_data:
-        entry = next(iter(pos_data.values()))
-    if isinstance(entry, dict):
-        return float(entry.get("logprob", 0.0))
-    if hasattr(entry, "logprob"):
-        return float(entry.logprob)
-    return float(entry or 0.0)
-
-
 def _sampled_logprobs_for_output(choice: Any) -> list[float]:
-    token_ids = list(choice.token_ids)
-    if choice.logprobs is None:
-        return [0.0] * len(token_ids)
-    logprobs = [
-        _sampled_logprob(pos, int(token_id))
-        for pos, token_id in zip(choice.logprobs, token_ids)
+    # vLLM scores the sampled token at every position; a missing score must fail, not read as log p = 0.
+    return [
+        float(pos[int(token_id)].logprob)
+        for pos, token_id in zip(choice.logprobs, choice.token_ids, strict=True)
     ]
-    if len(logprobs) < len(token_ids):
-        logprobs.extend([0.0] * (len(token_ids) - len(logprobs)))
-    return logprobs
 
 
 def _result_from_output(
