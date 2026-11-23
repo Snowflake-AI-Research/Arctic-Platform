@@ -14,6 +14,7 @@ from arctic_platform.inference.server.router_replay.all2all import (
     _compute_plan,
     _PerRankManifest,
 )
+from arctic_platform.inference.server.router_replay.cache import RouterReplayCacheFull
 
 
 def _tensor(seq_len: int = 4, n_layers: int = 2, top_k: int = 2, base: int = 1) -> torch.Tensor:
@@ -77,6 +78,19 @@ def test_tx_cache_allocates_on_its_device_only_within_max_bytes(monkeypatch):
     assert len(footprint_at_copy) == 3
     assert max(footprint_at_copy) <= cache.max_bytes
     assert cache.stats()["n_evicted_lru"] > 0
+
+
+def test_tx_cache_refuses_an_entry_larger_than_max_bytes_before_evicting(monkeypatch):
+    monkeypatch.setenv("ARCTIC_ROUTER_REPLAY_TX_EVICT_MIN_AGE_S", "0")
+    held = _tensor(seq_len=16)
+    cache = RouterReplayCacheTX(device=torch.device("cpu"), max_bytes=held.numel())
+    cache.put("rr1:held", held)
+
+    with pytest.raises(RouterReplayCacheFull):
+        cache.put("rr1:oversized", _tensor(seq_len=1, n_layers=1, top_k=held.numel() + 1))
+
+    assert "rr1:held" in cache
+    assert cache.stats()["n_evicted_lru"] == 0
 
 
 def test_tx_cache_failed_copy_releases_its_reserved_bytes(monkeypatch):
