@@ -40,7 +40,7 @@ import torch.multiprocessing as mp
 import mq_plane
 import semip_logging
 from demuxer import Demuxer
-from worker import worker_loop
+from worker import _TEARDOWN_SWEEP_TIMEOUT_S, worker_loop
 
 _spawn_ctx = mp.get_context("spawn")
 
@@ -248,7 +248,11 @@ class Instance:
     def _reset(self):
         """Reset instance to created state after teardown completes."""
         if self._worker is not None:
-            self._worker.join(timeout=10)
+            # The teardown result arrives before the worker's orphan sweep,
+            # so outlast its bound: killed mid-sweep, the worker hands the
+            # tree's stragglers to a PID 1 that may never reap them.  It
+            # exits as soon as the sweep ends, so this is a bound, not a wait.
+            self._worker.join(timeout=_TEARDOWN_SWEEP_TIMEOUT_S + 10)
             if self._worker.is_alive():
                 self.log.warning("worker still alive after join, force-killing")
                 try:
@@ -477,16 +481,22 @@ class Instance:
         # A follower node holds no executor-side queues; the leader's
         # destroy_nccl reaches its ranks.
         if self.n_gpus > 1 and self.node_rank == 0:
-            # G1: across nodes the graphs cannot survive the teardown and must
-            # go first.  vLLM turns custom all-reduce off when ranks span
-            # machines, so every all-reduce a graph captured is an NCCL kernel,
-            # and NCCL will not release a communicator a live graph captured:
-            # commDestroySync spins on `while (comm->localPersistentRefs != 0)`
-            # until the graphs referencing it are destroyed.  Ordering this
-            # before destroy_nccl is what turns that hang into a 2-3 s drop.
-            # The restore pairs it with recapture_graphs.
+            # G1: graphs holding NCCL kernels cannot survive the teardown and
+            # must go first.  NCCL will not release a communicator a live
+            # graph captured: commDestroySync spins on `while
+            # (comm->localPersistentRefs != 0)` until the graphs referencing
+            # it are destroyed.  Ordering the drop before destroy_nccl is what
+            # turns that hang into a 2-3 s drop; the restore pairs it with
+            # recapture_graphs.  Across nodes vLLM turns custom all-reduce
+            # off, so every graph all-reduce is an NCCL kernel and the drop is
+            # unconditional.  On one node the child counts NCCL kernel nodes
+            # in the kept graphs on every rank and drops only if one holds
+            # any, or if a count is incomplete; graphs whose collectives are
+            # all CustomAllreduce stay for rebind_graphs.
             if self.nnodes > 1:
-                self._send("drop_graphs")
+                self._send("drop_graphs", reason="multinode")
+            else:
+                self._send("drop_graphs_if_nccl")
             self._send("destroy_nccl")
         return self._send("cuda_checkpoint")
 
@@ -544,7 +554,9 @@ class Instance:
         """Tear down NCCL and CustomAllreduce IPC.  No-op at TP=1.
 
         Always the graph-preserving unilateral-abort teardown: the captured
-        graphs go into the image and are rebound after restore.
+        graphs go into the image and are rebound after restore.  Fails if a
+        communicator's abort does not return, which is what a kept graph
+        holding NCCL kernels causes; ``cuda_checkpoint`` drops those first.
         """
         self._log("destroy_nccl")
         return self._send("destroy_nccl")
@@ -608,12 +620,15 @@ class Instance:
         through CRIU intact, so there is nothing to instantiate either.  The
         work is address rewriting and always was, once the image is warm.
 
-        Single-node only.  Across nodes there is nothing to rebind: vLLM turns
-        custom all-reduce off, so the graphs held NCCL kernels, so the dump had
-        to destroy them for ``ncclCommAbort`` to return.  Use
-        ``recapture_graphs``.  Raising rather than quietly doing nothing keeps
-        a mis-ordered restore from reporting success and then wedging on the
-        first replay of a graph that no longer exists.
+        Only for an image that kept its graphs.  Across nodes there is nothing
+        to rebind: vLLM turns custom all-reduce off, so the graphs held NCCL
+        kernels, so the dump had to destroy them for ``ncclCommAbort`` to
+        return.  The same holds for a single-node image whose graphs held NCCL
+        kernels (``graphs_dropped`` in its ``meta.json``), where the child
+        raises instead.  Use ``recapture_graphs``.  Raising rather than
+        quietly doing nothing keeps a mis-ordered restore from reporting
+        success and then wedging on the first replay of a graph that no
+        longer exists.
         """
         if self.nnodes > 1:
             raise RuntimeError(
@@ -623,19 +638,32 @@ class Instance:
         self._log("rebind_graphs")
         return self._send("rebind_graphs")
 
-    def drop_graphs(self):
+    def drop_graphs(self, reason="requested"):
         """Destroy every captured CUDA graph, before ``cuda_checkpoint``.
 
-        Across nodes the graphs hold NCCL kernels, and ``ncclCommAbort`` does
-        not return while they are alive. Pair with ``recapture_graphs`` on
-        the restore side.
+        ``ncclCommAbort`` does not return while a graph holding one of the
+        communicator's NCCL kernels is alive. Pair with ``recapture_graphs``
+        on the restore side. ``reason`` is recorded as
+        ``graphs_dropped_reason`` in the image's ``meta.json``.
         """
         self._log("drop_graphs")
-        return self._send("drop_graphs")
+        return self._send("drop_graphs", reason=reason)
+
+    def drop_graphs_if_nccl(self):
+        """Drop the captured graphs if any rank's hold an NCCL kernel node.
+
+        Single-node half of ``cuda_checkpoint``'s gate. Every rank counts the
+        NCCL kernel nodes in its graphs (child graphs included); a count above
+        zero, or one that could not be completed, drops the graphs and the
+        image records ``graphs_dropped``. No-op at TP=1.
+        """
+        self._log("drop_graphs_if_nccl")
+        return self._send("drop_graphs_if_nccl")
 
     def recapture_graphs(self):
         """Capture the CUDA graphs again after a restore whose dump dropped
-        them. Run after ``reinit_nccl`` and ``wake_up_kv_cache``."""
+        them. Run after ``reinit_nccl`` and ``wake_up_kv_cache``. Single- and
+        multi-node alike."""
         self._log("recapture_graphs")
         return self._send("recapture_graphs")
 
@@ -668,6 +696,10 @@ class Instance:
                 "n_gpus":           self.n_gpus,
                 "max_pinned_bytes_per_worker":
                     self.max_pinned_bytes_per_worker}
+        # The leader's child reports its own drop and the worker records that
+        # over this; a follower node-partition never sees the command.
+        if self.nnodes > 1:
+            meta.update(graphs_dropped=True, graphs_dropped_reason="multinode")
         if meta_extra:
             meta.update(meta_extra)
         return self._send("criu_dump", filename=filename, meta_extra=meta)
@@ -907,6 +939,34 @@ class Instance:
         self._weights_dir = weights_dir
         self._log(f"load_weights({weights_dir})")
         return self._send("load_weights", weights_dir=weights_dir,
+                          io_workers=io_workers)
+
+    def release_host_weights(self):
+        """Drop the host-resident parameters' pages before the checkpoint.
+
+        Call after ``save_weights()``, which wrote their bytes, and before
+        ``cuda_checkpoint()``: each one unchanged since load is unregistered
+        and emptied, so the CRIU image holds an empty mapping at its address.
+        Until ``refill_host_weights()`` the engine refuses to run the model.
+        A no-op for a model without such parameters (see host_weights).
+        """
+        self._log("release_host_weights")
+        return self._send("release_host_weights")
+
+    def refill_host_weights(self, io_workers=None, weights_dir=None):
+        """Read the released host-resident parameters back from the shards.
+
+        Call after ``criu_restore()`` and ``load_weights()``, before anything
+        runs the model; registers each parameter at its own address again and
+        checks its checksum, raising if any of it is missing or wrong.
+        """
+        weights_dir = self._resolve_weights_dir(weights_dir)
+        if weights_dir is None:
+            raise RuntimeError(
+                "refill_host_weights() requires a weights_dir, a model_dir, or "
+                "a prior criu_restore()")
+        self._log(f"refill_host_weights({weights_dir})")
+        return self._send("refill_host_weights", weights_dir=weights_dir,
                           io_workers=io_workers)
 
     def generate(self, prompts, sampling_params, reasoning_ended=None):

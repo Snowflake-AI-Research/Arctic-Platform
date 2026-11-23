@@ -146,10 +146,11 @@ class InklingMoE(MoE):
         self.sync_combine_per_chunk = True
         self.checkpoint_dispatch_chunks = True
 
-    def _run_local_routed_experts(self, hidden_states, counts, scores=None):
+    def _run_local_routed_experts(self, hidden_states, counts, scores=None, experts=None):
+        experts = self.experts if experts is None else experts
         if self.deepep_token_chunk_size is not None and torch.is_grad_enabled():
-            return checkpoint(self.experts, hidden_states, counts, scores, use_reentrant=False)
-        return self.experts(hidden_states, counts, scores)
+            return checkpoint(experts, hidden_states, counts, scores, use_reentrant=False)
+        return experts(hidden_states, counts, scores)
 
     def forward(self, hidden_states):
         shape = hidden_states.shape

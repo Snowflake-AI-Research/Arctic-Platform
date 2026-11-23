@@ -29,6 +29,7 @@ from __future__ import annotations
 import ast
 import importlib.util
 import json
+import logging
 import os
 import re
 import shutil
@@ -42,25 +43,36 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _PKG = os.path.dirname(_HERE)                      # .../semi_persistence
 _INFERENCE = os.path.dirname(_PKG)                 # .../arctic_platform/inference
 _ENGINE = os.path.join(_INFERENCE, "server", "semip_engine.py")
+_MATERIALIZE = os.path.join(_INFERENCE, "semi_persistence", "materialize.py")
+_MATERIALIZE_NAME = "arctic_platform.inference.semi_persistence.materialize"
+
+
+def _load(name: str, path: str):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _load_semip_engine():
-    """Import semip_engine.py without executing the arctic_platform packages."""
+    """Import semip_engine.py without executing the arctic_platform packages.
+
+    Materializing imports materialize by name, so it is registered under that
+    name from its file too.
+    """
     pkg = types.ModuleType("arctic_platform.inference")
     pkg.__path__ = []
     semip = types.ModuleType("arctic_platform.inference.semi_persistence")
     semip.Instance = object  # only referenced at call time, never here
     sys.modules.setdefault("arctic_platform.inference", pkg)
     sys.modules.setdefault("arctic_platform.inference.semi_persistence", semip)
-
-    spec = importlib.util.spec_from_file_location("semip_engine_under_test",
-                                                  _ENGINE)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    if _MATERIALIZE_NAME not in sys.modules:
+        sys.modules[_MATERIALIZE_NAME] = _load(_MATERIALIZE_NAME, _MATERIALIZE)
+    return _load("semip_engine_under_test", _ENGINE)
 
 
 se = _load_semip_engine()
+mat = sys.modules[_MATERIALIZE_NAME]
 
 
 BASE_CONFIG = {
@@ -1025,6 +1037,38 @@ def test_check_env_files_treats_a_missing_mapping_as_advisory():
                                under_model_dir=False) == []
 
 
+def test_check_env_files_reports_absences_outside_dev_shm_first():
+    """The report is truncated, and /dev/shm ghosts used to fill it.
+
+    A DeepSeek-V4.1-Flash restore listed five /dev/shm/psm_* absences and never
+    named the ~/.humming cubin that actually failed criu_restore.
+    """
+    shm = [[f"/dev/shm/psm_{i:08x}", 10, None]
+           for i in range(se._ENV_FILES_REPORT + 2)]
+    cubin = "/home/neutrino/.humming/cache/37e7/kernel.cubin"
+    meta = {"env_files": shm + [[cubin, 10, None]]}
+    records = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = _Capture(level=logging.INFO)
+    se.logger.addHandler(handler)
+    level = se.logger.level
+    se.logger.setLevel(logging.INFO)
+    try:
+        assert se._check_env_files(meta, "/cache/" + KEY,
+                                   under_model_dir=False) == []
+    finally:
+        se.logger.removeHandler(handler)
+        se.logger.setLevel(level)
+    absent = next(m for m in records if "are absent" in m)
+    assert absent.index(cubin) < absent.index("/dev/shm/"), absent
+    assert any("0 mapping(s) outside" in m and "match the image" in m
+               for m in records), records
+
+
 def test_check_env_files_scopes_on_the_model_dir():
     """The environment is checkable before the copy, the copy only after it."""
     def body(tmp):
@@ -1428,6 +1472,7 @@ if __name__ == "__main__":
         test_meta_json_is_not_confused_by_a_path_that_looks_like_structure,
         test_check_env_files_reports_a_size_mismatch,
         test_check_env_files_treats_a_missing_mapping_as_advisory,
+        test_check_env_files_reports_absences_outside_dev_shm_first,
         test_check_env_files_scopes_on_the_model_dir,
         test_check_env_files_accepts_an_image_that_recorded_none,
         test_has_weights_accepts_both_layouts,

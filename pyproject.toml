@@ -52,7 +52,7 @@ Issues = "https://github.com/Snowflake-AI-Research/Arctic-Platform/issues"
 
 [project]
 name = "arctic_platform"
-version = "0.2.1.dev0"
+version = "0.2.2.dev0"
 description = "Snowflake LLM training library w/ RL"
 authors = [
     {name = "Tunji Ruwase", email = "tunji.ruwase@snowflake.com"},
@@ -92,6 +92,7 @@ arctic_inference = "arctic_platform.inference.vllm.plugin:arctic_inference_plugi
 all = [
     "arctic_platform[dev]",
     "arctic_platform[testing]",
+    "arctic_platform[correctness]",
     "arctic_platform[cortex]",
     "arctic_platform[onprem]",
     "arctic_platform[tinker]",
@@ -132,6 +133,16 @@ testing = [
 formatting = [
     "pre-commit",
     "autoflake",
+]
+
+# Correctness onboarding, HF references and CPU selftests; GPU kernels remain separately installed.
+correctness = [
+    "arctic_platform[cortex]",
+    "arctic_platform[sft]",
+    "huggingface-hub",
+    "pytest",
+    "pytest-instafail",
+    "tqdm",
 ]
 
 # qwen3.5 and other models that use GDN attention layers need this for much better perf
