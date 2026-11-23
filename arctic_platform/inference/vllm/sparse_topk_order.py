@@ -31,10 +31,10 @@ _PATCHED = False
 
 
 def sort_topk_ids(ids: torch.Tensor) -> torch.Tensor:
-    """Each row's ids ascending, with the -1 padding last."""
-    pad = torch.iinfo(ids.dtype).max
-    ordered = torch.where(ids < 0, pad, ids).sort(dim=-1).values
-    return ordered.masked_fill_(ordered == pad, -1)
+    """Sort the int32 pool or block ids as unsigned, placing -1 last."""
+    sign_bit = torch.iinfo(torch.int32).min
+    keys = ids.to(torch.int32).bitwise_xor(sign_bit)
+    return keys.sort(dim=-1).values.bitwise_xor_(sign_bit)
 
 
 def apply_sparse_topk_order_fix() -> None:
