@@ -20,8 +20,8 @@ def is_token_tensor(value: Any) -> bool:
     return is_tensor is not None and is_tensor(value)
 
 
-def check_token_tensor(prompt: Any) -> Any:
-    """Raise unless *prompt* is a non-empty 1-D integer CPU tensor."""
+def check_token_tensor(prompt: Any, *, allow_empty: bool = False) -> Any:
+    """Check a 1-D integer CPU tensor. Only a delta may be empty."""
     import torch
 
     if prompt.dim() != 1:
@@ -30,7 +30,7 @@ def check_token_tensor(prompt: Any) -> Any:
         raise TypeError(f"A token-id tensor prompt must have an integer dtype, got {prompt.dtype}")
     if prompt.device.type != "cpu":
         raise ValueError(f"A token-id tensor prompt must be on the CPU, got {prompt.device}")
-    if prompt.numel() == 0:
+    if not allow_empty and prompt.numel() == 0:
         raise ValueError("A token-id tensor prompt must not be empty")
     return prompt
 

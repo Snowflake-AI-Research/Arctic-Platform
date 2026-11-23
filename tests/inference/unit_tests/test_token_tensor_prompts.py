@@ -122,7 +122,7 @@ class _RecordingScheduler:
     def __init__(self):
         self.prompts = []
 
-    def submit(self, prompt, sampling_params, routing_key=None, strict=False):
+    def submit(self, prompt, sampling_params, routing_key=None, strict=False, conversation=None):
         self.prompts.append(prompt)
         return object()
 

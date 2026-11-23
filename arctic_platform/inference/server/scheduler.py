@@ -9,12 +9,13 @@ import random
 import time
 from collections import OrderedDict, deque
 from dataclasses import asdict, dataclass, field, replace
-from typing import Any, Hashable
+from typing import Any, Hashable, Iterable
 
+import torch
 import ray
 from arctic_platform.inference.server.chat import ChatPrompt
 from arctic_platform.inference.server.streaming import ClientStream, MAX_WORKER_STREAMS, StreamLimits, validate_request
-from arctic_platform.inference.server.token_prompts import is_token_tensor
+from arctic_platform.inference.server.token_prompts import check_token_tensor, is_token_tensor
 
 from arctic_platform.inference.server.metrics import RequestRecord, _BoundedDeque
 
@@ -22,6 +23,8 @@ logger = logging.getLogger("arctic_platform.inference.server")
 
 _LOG_AFFINITY = os.environ.get("ARCTIC_LOG_AFFINITY", "") == "1"
 _MAX_KEYS = 500_000
+# Token ids kept across all conversations (int32, 256 MiB); the least recently used conversation goes first.
+_MAX_CONVERSATION_TOKENS = 1 << 26
 # Requests a worker may hold, as a multiple of capacity, before the rest wait here for whichever worker frees first.
 _BACKLOG = 2
 # Ray max_concurrency of each worker actor. Every call it serves takes a slot, generate or control alike.
@@ -40,6 +43,8 @@ class _Request:
     key: Hashable | None = None
     # Never spills from its key's worker: set by a routing key or strict.
     sticky: bool = False
+    # Routing key under which the completed turn (prompt + sampled ids) is kept, for ``conversation``.
+    conversation_key: str | None = None
     worker_idx: int | None = None
     created_at: float = field(default_factory=time.time)
 
@@ -84,6 +89,10 @@ def _compute_prefix_hash(prompt: Any) -> int:
     return hash(tuple(prompt))
 
 
+class ConversationNotFound(LookupError):
+    """No conversation is kept for the routing key (never started, or evicted): send the full prompt."""
+
+
 class Scheduler:
     """Routes each request to a worker, letting each engine queue a backlog of its own.
 
@@ -112,6 +121,9 @@ class Scheduler:
         self._backlog = max(capacity, min(_BACKLOG * capacity, WORKER_MAX_CONCURRENCY - _CONTROL_SLOTS))
         self._prefix_routing = prefix_routing
         self._keys: OrderedDict[Hashable, int] = OrderedDict()
+        self._conversations: OrderedDict[str, torch.Tensor] = OrderedDict()
+        self._conversation_tokens = 0
+        self._pending_turns: dict[str, asyncio.Future] = {}
         # Requests no worker could take yet, dispatched in order by `_drain`.
         self._waiting: deque[_Request] = deque()
         self._next_id = 0
@@ -136,6 +148,9 @@ class Scheduler:
         state = self.__dict__.copy()
         state["_wake"] = None
         state["_waiting"] = deque()
+        state["_conversations"] = OrderedDict()
+        state["_conversation_tokens"] = 0
+        state["_pending_turns"] = {}
         state["_workers"] = [replace(ws, inflight=set(), waiting=deque()) for ws in self._workers]
         return state
 
@@ -153,25 +168,105 @@ class Scheduler:
         sampling_params: dict[str, Any],
         routing_key: str | None = None,
         strict: bool = False,
+        conversation: str | None = None,
     ) -> asyncio.Future:
         """Submit a single prompt for generation.
 
         Args:
-            prompt: Text, ``list[int]``, or a 1-D integer CPU tensor of token
-                ids; a tensor is sent to the worker as is.
+            prompt: Text, ``list[int]``, or a 1-D integer CPU tensor of token ids.
             routing_key: Optional opaque string used as the affinity key. The
                 first request for a key goes to the least-loaded worker and
                 later ones stay on that worker, so turn N+1 of a multi-turn
                 rollout reuses turn N's KV cache and router-replay capture.
             strict: Keep a prompt-hash keyed request on its worker under load
                 too; a routing key already does.
+            conversation: ``"start"`` keeps this token-id prompt plus its sampled ids under ``routing_key`` once
+                it completes; ``"append"`` sends only the ids after the kept ones, and keeps the result in turn.
+                ``"append"`` raises ``ConversationNotFound`` when nothing is kept for the key.
+                Await each turn before submitting another on its key. Send reasoning-prefill ids explicitly
+                and use cumulative or final-only output so the scheduler receives every sampled id.
         """
+        if conversation is not None:
+            return self.submit_turns([(prompt, sampling_params, routing_key)], conversation, strict)[0]
         if self._stopped:
             raise RuntimeError("Scheduler is stopped")
         future = asyncio.get_running_loop().create_future()
-        self._waiting.append(self._request(prompt, sampling_params, future, routing_key, strict))
+        req = self._request(prompt, sampling_params, future, routing_key, strict)
+        self._waiting.append(req)
         self._drain()
         return future
+
+    def submit_turns(
+        self, rows: Iterable[tuple[Any, dict[str, Any], str | None]], conversation: str, strict: bool,
+    ) -> list[asyncio.Future]:
+        """Submit ``(prompt, sampling_params, routing_key)`` rows as conversation turns (see ``submit``), all or none."""
+        if self._stopped:
+            raise RuntimeError("Scheduler is stopped")
+        if conversation not in ("start", "append"):
+            raise ValueError(f"conversation must be 'start' or 'append', got {conversation!r}")
+        append = conversation == "append"
+        turns: dict[str, _Request] = {}
+        for prompt, params, key in rows:
+            if key is None or params.get("n", 1) != 1:
+                raise ValueError("a conversation needs a routing_key, a token-id prompt and one sample")
+            pending = self._pending_turns.get(key)
+            if key in turns or (pending is not None and not pending.done()):
+                raise ValueError(f"an unfinished conversation turn already uses routing key {key!r}")
+            if params.get("enable_thinking"):
+                raise ValueError("include reasoning-prefill ids in the conversation prompt explicitly")
+            if "output_kind" in params:
+                from vllm.sampling_params import RequestOutputKind
+
+                if RequestOutputKind(params["output_kind"]) is RequestOutputKind.DELTA:
+                    raise ValueError("a conversation needs the full sampled output")
+            ids = self._conversation_ids(prompt, append)
+            if append:
+                kept = self._conversations.get(key)
+                if kept is None:
+                    raise ConversationNotFound(f"no conversation is kept for routing key {key!r}; send the full prompt")
+                ids = torch.cat((kept, ids))
+            future = asyncio.get_running_loop().create_future()
+            req = self._request(ids, params.copy(), future, key, strict)
+            req.conversation_key = key
+            turns[key] = req
+
+        # A bad row must not dispatch or reserve any earlier row in the batch.
+        for key, req in turns.items():
+            self._pending_turns[key] = req.future
+            req.future.add_done_callback(functools.partial(self._release_turn, key))
+            if append:
+                self._conversations.move_to_end(key)
+        self._waiting.extend(turns.values())
+        self._drain()
+        return [req.future for req in turns.values()]
+
+    def _release_turn(self, key: str, future: asyncio.Future) -> None:
+        if self._pending_turns.get(key) is future:
+            del self._pending_turns[key]
+
+    @staticmethod
+    def _conversation_ids(prompt: Any, append: bool) -> torch.Tensor:
+        if isinstance(prompt, list):
+            if (not append and not prompt) or any(type(i) is not int or not 0 <= i < 2**31 for i in prompt):
+                raise ValueError("expected a list of nonnegative int32 token ids")
+            return torch.tensor(prompt, dtype=torch.int32, device="cpu")
+        if not is_token_tensor(prompt):
+            raise ValueError("a conversation needs a token-id list or tensor")
+        check_token_tensor(prompt, allow_empty=append)
+        # A caller can reuse its input buffer as soon as submit returns.
+        ids = prompt.to(dtype=torch.int32, copy=not append, memory_format=torch.contiguous_format)
+        if (ids < 0).any() or (prompt.element_size() > 4 and not torch.equal(ids.to(prompt.dtype), prompt)):
+            raise ValueError("expected nonnegative int32 token ids")
+        return ids
+
+    def _keep_conversation(self, key: str, prompt: torch.Tensor, token_ids: list[int]) -> None:
+        kept = torch.cat((prompt, prompt.new_tensor(token_ids)))
+        previous = self._conversations.pop(key, None)
+        self._conversation_tokens += kept.numel() - (0 if previous is None else previous.numel())
+        self._conversations[key] = kept
+        while self._conversation_tokens > _MAX_CONVERSATION_TOKENS:
+            _, evicted = self._conversations.popitem(last=False)
+            self._conversation_tokens -= evicted.numel()
 
     def stream_generate(self, request_id, prompt, sampling_params=None, *, limits=None, routing_key=None, strict=False):
         if self._stopped:
@@ -225,10 +320,11 @@ class Scheduler:
 
     async def submit_batch(
         self,
-        prompts: list[str | list[int]],
+        prompts: list[str | list[int] | torch.Tensor],
         sampling_params: dict[str, Any] | list[dict[str, Any] | None],
         routing_key: str | list[str | None] | None = None,
         strict: bool = False,
+        conversation: str | None = None,
     ) -> list[dict[str, Any]]:
         if isinstance(routing_key, list):
             if len(routing_key) != len(prompts):
@@ -248,10 +344,11 @@ class Scheduler:
             params_list = [params or {} for params in sampling_params]
         else:
             params_list = [sampling_params] * len(prompts)
-        futures = [
-            self.submit(prompt, params, routing_key=key, strict=strict)
-            for prompt, params, key in zip(prompts, params_list, keys)
-        ]
+        rows = zip(prompts, params_list, keys)
+        if conversation is not None:
+            futures = self.submit_turns(rows, conversation, strict)
+        else:
+            futures = [self.submit(prompt, params, routing_key=key, strict=strict) for prompt, params, key in rows]
         return list(await asyncio.gather(*futures))
 
     async def drain(self) -> None:
@@ -510,12 +607,20 @@ class Scheduler:
             if not req.future.done():
                 req.future.set_exception(error)
         else:
-            self._finish(req, submitted_time, future.result())
+            try:
+                self._finish(req, submitted_time, future.result())
+            except Exception as exc:
+                if not req.future.done():
+                    req.future.set_exception(exc)
+                else:
+                    logger.exception("Finishing request %d failed", req.id)
         self._drain_worker(ws)
         self._drain()
 
     def _finish(self, req: _Request, submitted_time: float, result: Any) -> None:
         if not req.future.done():
+            if req.conversation_key is not None and result["finish_reason"] not in ("abort", "error"):
+                self._keep_conversation(req.conversation_key, req.prompt, result["token_ids"])
             req.future.set_result(result)
         if isinstance(result, dict):
             completion_time = time.time()

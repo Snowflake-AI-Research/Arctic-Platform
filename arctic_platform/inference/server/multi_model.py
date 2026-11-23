@@ -216,6 +216,7 @@ class Driver:
         model_id: str | None = None,
         routing_key: str | list[str | None] | None = None,
         strict: bool = False,
+        conversation: str | None = None,
     ) -> list[dict[str, Any]]:
         """Route a /generate to the pool for *model_id*.
 
@@ -226,7 +227,7 @@ class Driver:
         """
         return await self._get_pool(model_id).generate(
             prompts, sampling_params,
-            routing_key=routing_key, strict=strict,
+            routing_key=routing_key, strict=strict, conversation=conversation,
         )
 
     def submit_generate_futures(
@@ -236,10 +237,11 @@ class Driver:
         model_id: str | None = None,
         routing_key: str | list[str | None] | None = None,
         strict: bool = False,
+        conversation: str | None = None,
     ) -> list[asyncio.Future]:
         return self._get_pool(model_id).submit_generate_futures(
             prompts, sampling_params,
-            routing_key=routing_key, strict=strict,
+            routing_key=routing_key, strict=strict, conversation=conversation,
         )
 
     # ------------------------------------------------------------------
