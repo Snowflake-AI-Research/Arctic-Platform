@@ -21,7 +21,7 @@ The reference norms run every step as separate FP32 elementwise passes. On CUDA 
   norm kernels. Without it, ``llama`` mode: FP32 statistics, the normalized value cast to the input
   dtype, then the weight -- the reference's own order.
 - ``Glm5NextTextRMSNormGated`` (the KDA output norm, ``weight * norm(x) * sigmoid(gate)`` in FP32)
-  runs FLA's fused gated norm.
+  runs FLA's fused gated norm. Importing this module pins it and the q/k norm in ``chunk_kda`` before either runs.
 
 CPU inputs run the same arithmetic in torch (the reference forward, for the gated norm and without
 ``fp32_parity``).
@@ -34,6 +34,8 @@ import types
 import torch
 from torch import Tensor
 from torch import nn
+
+from arctic_platform.model.implementations.gpu import vllm_rounding  # noqa: F401 - pin both FLA norms before chunk_kda
 
 
 def _rms_norm_forward(self, hidden_states: Tensor) -> Tensor:
