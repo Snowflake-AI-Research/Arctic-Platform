@@ -1,3 +1,4 @@
+import importlib.util
 import json
 
 import pytest
@@ -15,8 +16,12 @@ OVERFLOW = (
 def _grammar(monkeypatch, *, overflow_after=None, overflow_in_fill=False, overflow_in_rollback=False):
     from vllm.v1.structured_output.backend_xgrammar import XgrammarGrammar
 
+    # Start from vLLM's own methods even if an earlier test in this process installed every required patch.
+    spec = importlib.util.find_spec("vllm.v1.structured_output.backend_xgrammar")
+    native = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(native)
     for name in ("accept_tokens", "validate_tokens", "rollback", "fill_bitmask"):
-        monkeypatch.setattr(XgrammarGrammar, name, getattr(XgrammarGrammar, name))
+        monkeypatch.setattr(XgrammarGrammar, name, getattr(native.XgrammarGrammar, name))
     from arctic_platform.inference.vllm.xgrammar_stop_mask import ensure_xgrammar_stop_mask_fix
 
     ensure_xgrammar_stop_mask_fix()
