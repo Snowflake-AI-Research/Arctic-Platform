@@ -11,7 +11,9 @@ def test_routed_expert_capture_with_decode_context_parallelism(tmp_path, monkeyp
     arctic_inference_plugin()
     model = Qwen3MoeConfig(architectures=["Qwen3MoeForCausalLM"], num_attention_heads=8, num_key_value_heads=1)
     model.save_pretrained(tmp_path)
-    parallel = ParallelConfig(tensor_parallel_size=8, decode_context_parallel_size=8, distributed_executor_backend="mp")
+    parallel = ParallelConfig(
+        tensor_parallel_size=8, decode_context_parallel_size=8, distributed_executor_backend="mp"
+    )
     config = VllmConfig(
         model_config=ModelConfig(model=str(tmp_path), dtype="float32", enforce_eager=True),
         device_config=DeviceConfig("cpu"),

@@ -127,13 +127,14 @@ def test_continuation_reuses_the_last_computed_boundary(prompt_len, output_len):
         follow_up = _request("follow_up", list(first.all_token_ids) + [20_000])
         blocks, hit, _ = manager.get_computed_blocks(follow_up)
         assert hit == boundary
-        assert manager.allocate_slots(follow_up, 1, new_computed_blocks=blocks, num_new_computed_tokens=hit) is not None
+        allocated = manager.allocate_slots(follow_up, 1, new_computed_blocks=blocks, num_new_computed_tokens=hit)
+        assert allocated is not None
         if hit % (BLOCK * dcp):
             source = blocks.blocks[0][-1]
             destination = manager.get_blocks(follow_up.request_id).blocks[0][-1]
             copies, retained = manager.take_kv_cache_block_copies()
             assert destination is not source
-            assert (source.block_id, destination.block_id) in [(copy.src_block_id, copy.dst_block_id) for copy in copies]
+            assert (source.block_id, destination.block_id) in [(c.src_block_id, c.dst_block_id) for c in copies]
             manager.block_pool.free_blocks(retained)
 
 
