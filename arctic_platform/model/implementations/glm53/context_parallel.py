@@ -719,9 +719,8 @@ def _chunk_kda(self, query, key, value, decay, beta, cu_seqlens):
 
     fp32 = getattr(self, "_fp32_kda", False)
     if fp32:
-        # vLLM's KDA decode keeps the L2-normalized q and k in fp32 (x / sqrt(sum(x * x) + 1e-6)); FLA would store its
-        # in-kernel normalization in the input dtype, and its kernels take one dtype for q, k and v.
-        query, key = (x.float() / torch.sqrt(x.float().square().sum(-1, keepdim=True) + 1e-6) for x in (query, key))
+        # Share each fp32 cast so autograd sums both normalization terms before rounding the gradient.
+        query, key = (x / torch.sqrt(x.square().sum(-1, keepdim=True) + 1e-6) for x in (query.float(), key.float()))
     output, final_state = chunk_kda(
         query,
         key,
@@ -733,7 +732,9 @@ def _chunk_kda(self, query, key, value, decay, beta, cu_seqlens):
         use_qk_l2norm_in_kernel=not fp32,
         cu_seqlens=cu_seqlens,
     )
-    return output.to(value.dtype), final_state
+    if final_state is not None:
+        raise RuntimeError("GLM-5.3 KDA unexpectedly returned recurrent state")
+    return output.to(value.dtype)
 
 
 def _linear_attention_forward(
@@ -830,9 +831,7 @@ def _linear_attention_forward(
     key = key.view(batch_size, global_length, local_heads, self.head_dim)
     value = value.view(batch_size, global_length, local_heads, self.head_dim)
 
-    output, final_state = _chunk_kda(self, query, key, value, exchanged["decay"], exchanged["beta"], global_cu_seqlens)
-    if final_state is not None:
-        raise RuntimeError("GLM-5.3 KDA unexpectedly returned recurrent state")
+    output = _chunk_kda(self, query, key, value, exchanged["decay"], exchanged["beta"], global_cu_seqlens)
     output = sequence_head_all_to_all(
         self._cp_group,
         output,
@@ -892,9 +891,7 @@ def _local_linear_attention_forward(
     decay = self.forget_gate(hidden_states)
     beta = _kda_beta(self, hidden_states)
 
-    output, final_state = _chunk_kda(self, query, key, value, decay, beta, global_cu_seqlens)
-    if final_state is not None:
-        raise RuntimeError("GLM-5.3 KDA unexpectedly returned recurrent state")
+    output = _chunk_kda(self, query, key, value, decay, beta, global_cu_seqlens)
     gate = self.g_b_proj(self.g_a_proj(hidden_states)).view(shape)
     output = self.o_norm(output, gate).reshape(batch_size, sequence_length, -1)
     return self.o_proj(output)

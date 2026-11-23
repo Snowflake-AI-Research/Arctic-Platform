@@ -203,8 +203,9 @@ def _kda_decode(query, key, value, g, beta, cu_seqlens):
     return out
 
 
-def _l2_normalize(x):  # vLLM's in-register normalization: x / sqrt(sum(x * x) + 1e-6), in fp32
-    return x.float() / torch.sqrt(x.float().square().sum(-1, keepdim=True) + 1e-6)
+def _l2_normalize(x):
+    x = x.float()
+    return x / torch.sqrt(x.square().sum(-1, keepdim=True) + 1e-6)
 
 
 def _fla_chunk_kda(captured):
@@ -228,16 +229,16 @@ def _fla_chunk_kda(captured):
 def test_glm53_kda_keeps_normalized_qk_in_fp32_like_the_sampler_decode(
     tiny_glm_sparse_model, single_rank_group, fp32_kda
 ):
-    """With ``fp32_kda`` the KDA core output at both SP paths is vLLM's decode arithmetic on the same post-convolution
-    q, k and v: L2-normalized q and k kept in fp32 through the recurrence, the output rounded once. Without it FLA
-    stores the normalized q and k in BF16 first."""
+    """At both SP paths, with FLA replaced by its dtype contract around vLLM's decode recurrence: with ``fp32_kda``
+    the KDA output and the post-convolution q/k/v gradient are the decode arithmetic (q and k normalized in fp32,
+    one rounding each); without it, FLA's BF16 store of the normalized q and k."""
     from arctic_platform.model.implementations.glm53 import context_parallel as cp
     from tests.model.test_glm53_packed_rows import _unfused_causal_conv1d_module
 
     set_seed(0)
     attention = tiny_glm_sparse_model(with_linear_attention=True).model.layers[1].self_attn
-    hidden_states = torch.randn(1, 40, attention.b_proj.in_features).to(torch.bfloat16)
-    cu_seqlens = torch.tensor([0, 17, 40], dtype=torch.int32)
+    hidden_states = torch.randn(1, 6, attention.b_proj.in_features).to(torch.bfloat16)
+    cu_seqlens = torch.tensor([0, 2, 6], dtype=torch.int32)
     setattr(attention, cp._GLOBAL_CU_SEQLENS, cu_seqlens)
     attention._cp_group, attention._cp_world_size, attention._fp32_kda = single_rank_group, 1, fp32_kda
     gated_inputs, convolved, outputs = [], [], []
@@ -247,31 +248,41 @@ def test_glm53_kda_keeps_normalized_qk_in_fp32_like_the_sampler_decode(
     attention.o_norm.register_forward_pre_hook(lambda module, args: outputs.append(args[0]))
     modules = {**_fla_chunk_kda(gated_inputs), "causal_conv1d": convolution}
 
-    with patch.dict(sys.modules, modules), torch.no_grad():
+    with patch.dict(sys.modules, modules):
         cp._local_linear_attention_forward(attention, hidden_states)
         cp._linear_attention_forward(attention, hidden_states)
 
     assert len(outputs) == 2
-    for mixed, (g, beta), output in zip(convolved, gated_inputs, outputs):
-        query, key, value = mixed.transpose(1, 2).view(1, 40, 3, 2, 128).unbind(2)
-        expected = _kda_decode(_l2_normalize(query), _l2_normalize(key), value, g, beta, cu_seqlens).bfloat16()
-        assert torch.equal(output, expected) is fp32_kda
+    for mixed, (g, beta), output in zip(convolved, gated_inputs, outputs, strict=True):
+        reference = mixed.detach().to(torch.float32 if fp32_kda else mixed.dtype).requires_grad_(fp32_kda)
+        qkv = reference.transpose(1, 2).unflatten(-1, (3, attention.num_heads, attention.head_dim))
+        query, key, value = qkv.unbind(2)
+        query, key = (_l2_normalize(x).to(reference.dtype) for x in (query, key))
+        expected = _kda_decode(query, key, value, g.detach(), beta.detach(), cu_seqlens).to(mixed.dtype)
+        torch_assert_equal(output, expected)
+        if fp32_kda:
+            grad = torch.randn_like(output)
+            (actual_grad,) = torch.autograd.grad(output, mixed, grad)
+            (reference_grad,) = torch.autograd.grad(expected, reference, grad)
+            torch_assert_equal(actual_grad, reference_grad.to(mixed.dtype))
 
 
-def test_glm53_loader_passes_fp32_kda_to_the_model_config():
-    from arctic_platform.model import loader as loader_mod
-    from arctic_platform.model.implementations.qwen35.deepspeed_integration import _build_model_config
-    from arctic_platform.model.loaders import flash_moe
+def test_glm53_loader_passes_fp32_kda_to_attention(tmp_path):
+    from arctic_platform.model import ModelSpec
+    from arctic_platform.model.implementations.glm53.deepspeed_integration import _adapter
+    from arctic_platform.model.loaders.flash_moe import _FlashLoadOptions
 
-    options = loader_mod._LOADERS["glm5_next"].options
-    assert options().fp32_kda is False
-    for enabled in (True, False):
-        load_options = flash_moe._FlashLoadOptions.model_validate(
-            options.model_validate({"fp32_kda": enabled}).model_dump(exclude_unset=True)
-        )
-        assert _build_model_config("glm5_next", 1, 1, "bfloat16", "sdpa", options=load_options).fp32_kda is enabled
-    with pytest.raises(ValueError, match="fp32_kda"):  # Qwen3.8-Flash-Next has no KDA layers
-        loader_mod._LOADERS["qwen4_exp"].options.model_validate({"fp32_kda": True})
+    _tiny_config().save_pretrained(tmp_path)
+    adapter = _adapter()
+    for loader_options in ({}, {"fp32_kda": True}):
+        spec = ModelSpec(model_path_or_name=str(tmp_path), loader="glm5_next", loader_options=loader_options)
+        options = _FlashLoadOptions.model_validate(spec.loader_options)
+        config = adapter.build_model_config(str(tmp_path), 1, 1, "bfloat16", spec.attn_implementation, options)
+        model = adapter.get_model(config, torch.device("meta"), torch.bfloat16)
+        adapter.apply_sequence_parallelism(model, 1, None)
+        assert model.model.language_model.layers[0].self_attn._fp32_kda is bool(loader_options)
+    with pytest.raises(ValueError, match="fp32_kda"):
+        ModelSpec(model_path_or_name=str(tmp_path), loader="qwen4_exp", loader_options={"fp32_kda": True})
 
 
 @pytest.mark.parametrize("autocast", [False, True])

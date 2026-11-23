@@ -64,10 +64,8 @@ class Glm5NextOptions(FlashMoeOptions):
     fp32_kda: bool = Field(
         False,
         description=(
-            "KDA layers keep the L2-normalized q and k in fp32 through the chunked recurrence, as vLLM's KDA decode "
-            "does, instead of FLA storing them in BF16 first. q, k and v enter FLA in fp32, so the KDA tensors it "
-            "saves for backward and its chunk intermediates take twice the bytes and its products run at the TF32 "
-            "rate."
+            "Normalize KDA q and k in fp32 as in vLLM's decode, run FLA with fp32 q, k and v, and cast the output "
+            "back to v's dtype. For BF16 inputs this doubles the storage for the saved q, k, v and chunk matrices."
         ),
     )
 

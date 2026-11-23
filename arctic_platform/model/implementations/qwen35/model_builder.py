@@ -384,7 +384,6 @@ def get_model(
     if getattr(model_config, "text_config", None) is not None:
         model_config.text_config.fp32_parity = config.fp32_parity
         model_config.text_config.fp32_routed_weighting = config.fp32_routed_weighting
-        model_config.text_config.fp32_kda = config.fp32_kda
 
     # Ensure pad_token_id is set (some models like Qwen3MoE don't have it).
     # In transformers v5, token IDs moved from PretrainedConfig to GenerationConfig.
