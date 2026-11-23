@@ -27,7 +27,7 @@ from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, MambaSpec, MLAAttentionSpec
 from vllm.v1.request import Request, RequestStatus
 
-from arctic_platform.inference.vllm.plugin import arctic_inference_plugin
+from arctic_platform.inference.vllm.required_patches import apply_required_vllm_patches
 
 BLOCK = 16
 
@@ -70,9 +70,8 @@ def _cache(dcp, retention=None):
 
 
 @pytest.fixture(autouse=True)
-def _apply_patches(monkeypatch):
-    monkeypatch.setenv("ARCTIC_INFERENCE_ENABLED", "0")
-    arctic_inference_plugin()
+def _apply_patches():
+    apply_required_vllm_patches()
     init_none_hash(sha256)
 
 

@@ -30,7 +30,7 @@ from vllm.v1.kv_cache_interface import MLAAttentionSpec
 from vllm.v1.worker.utils import AttentionGroup
 from vllm.v1.worker.workspace import init_workspace_manager, reset_workspace_manager
 
-from arctic_platform.inference.vllm.plugin import arctic_inference_plugin
+from arctic_platform.inference.vllm.required_patches import apply_required_vllm_patches
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() and os.environ.get("TRITON_INTERPRET") != "1",
@@ -174,8 +174,7 @@ def workspace():
 def test_bf16_sparse_mla_dcp_ranks_merge_to_the_single_rank_output(
     monkeypatch, workspace, heads, dcp_size, width, cache_dtype
 ):
-    monkeypatch.setenv("ARCTIC_INFERENCE_ENABLED", "0")
-    arctic_inference_plugin()
+    apply_required_vllm_patches()
     if DEVICE == "cpu":
         monkeypatch.setattr(flashmla_sparse, "num_compute_units", lambda _: 1)
         monkeypatch.setattr(sparse_mla_attention, "PIN_MEMORY", False)
