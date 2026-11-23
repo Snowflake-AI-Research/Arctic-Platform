@@ -36,6 +36,7 @@ def apply_required_vllm_patches() -> None:
     ensure_dense_prompt_logprobs_patch()
     ensure_spec_decode_grammar_fix()
     apply_hybrid_state_fixes()
+    ensure_dispatch_log()
     ensure_tp_spec_decode_sync()
     ensure_glm5next_lora()
     ensure_kv_group_size_patch()
@@ -43,4 +44,3 @@ def apply_required_vllm_patches() -> None:
     ensure_mrope_yarn_fix()
     ensure_mamba_completion_refresh()
     ensure_deepseek_v41_lora()
-    ensure_dispatch_log()
