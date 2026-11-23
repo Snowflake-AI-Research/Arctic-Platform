@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from typing import Any, Literal
 
 from arctic_platform.inference.server.replica_pool import ReplicaPool
+from arctic_platform.inference.server.scheduler import ConversationNotFound
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, model_validator
 
@@ -27,6 +28,7 @@ class GenerateRequest(BaseModel):
     sampling_params: dict[str, Any] | list[dict[str, Any] | None] | None = None
     routing_key: str | list[str | None] | None = None
     strict: bool = False
+    conversation: Literal["start", "append"] | None = None
 
 
 class GroupConfig(BaseModel):
@@ -102,6 +104,8 @@ async def generate_endpoint(request: GenerateRequest):
     try:
         results = await backend.generate(**request.model_dump())
         return {"results": results}
+    except ConversationNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except RuntimeError as e:
         msg = str(e).lower()
         if "paused" in msg or "cancelled" in msg:

@@ -11,8 +11,8 @@ from collections import OrderedDict, deque
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Hashable, Iterable
 
-import ray
 import torch
+import ray
 from arctic_platform.inference.server.chat import ChatPrompt
 from arctic_platform.inference.server.streaming import ClientStream, MAX_WORKER_STREAMS, StreamLimits, validate_request
 from arctic_platform.inference.server.token_prompts import check_token_tensor, is_token_tensor
@@ -43,14 +43,10 @@ class _Request:
     key: Hashable | None = None
     # Never spills from its key's worker: set by a routing key or strict.
     sticky: bool = False
-    worker_idx: int | None = None
-    created_at: float = field(default_factory=time.time)
     # Routing key under which the completed turn (prompt + sampled ids) is kept, for ``conversation``.
     conversation_key: str | None = None
-
-
-class ConversationNotFound(LookupError):
-    """No conversation is kept for the routing key (never started, or evicted): send the full prompt."""
+    worker_idx: int | None = None
+    created_at: float = field(default_factory=time.time)
 
 
 @dataclass
@@ -91,6 +87,10 @@ def _compute_prefix_hash(prompt: Any) -> int:
 
         return hash(prompt.to(torch.int32).contiguous().numpy().tobytes())
     return hash(tuple(prompt))
+
+
+class ConversationNotFound(LookupError):
+    """No conversation is kept for the routing key (never started, or evicted): send the full prompt."""
 
 
 class Scheduler:
@@ -187,7 +187,7 @@ class Scheduler:
                 and use cumulative or final-only output so the scheduler receives every sampled id.
         """
         if conversation is not None:
-            return self._submit_turns([(prompt, sampling_params, routing_key)], conversation, strict)[0]
+            return self.submit_turns([(prompt, sampling_params, routing_key)], conversation, strict)[0]
         if self._stopped:
             raise RuntimeError("Scheduler is stopped")
         future = asyncio.get_running_loop().create_future()
@@ -196,9 +196,10 @@ class Scheduler:
         self._drain()
         return future
 
-    def _submit_turns(
+    def submit_turns(
         self, rows: Iterable[tuple[Any, dict[str, Any], str | None]], conversation: str, strict: bool,
     ) -> list[asyncio.Future]:
+        """Submit ``(prompt, sampling_params, routing_key)`` rows as conversation turns (see ``submit``), all or none."""
         if self._stopped:
             raise RuntimeError("Scheduler is stopped")
         if conversation not in ("start", "append"):
@@ -345,7 +346,7 @@ class Scheduler:
             params_list = [sampling_params] * len(prompts)
         rows = zip(prompts, params_list, keys)
         if conversation is not None:
-            futures = self._submit_turns(rows, conversation, strict)
+            futures = self.submit_turns(rows, conversation, strict)
         else:
             futures = [self.submit(prompt, params, routing_key=key, strict=strict) for prompt, params, key in rows]
         return list(await asyncio.gather(*futures))

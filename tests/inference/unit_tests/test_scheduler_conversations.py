@@ -195,3 +195,31 @@ def test_failed_cache_write_reaches_caller_and_dispatches_queued_request(monkeyp
         assert worker.prompts[-1] == [1, 101, 201, 5]
 
     asyncio.run(run())
+
+
+def test_generate_api_and_pool_carry_the_conversation_to_the_scheduler():
+    from fastapi import HTTPException
+
+    from arctic_platform.inference.server import api
+    from arctic_platform.inference.server.replica_pool import ReplicaPool
+
+    async def run():
+        worker = _Worker()
+        pool = ReplicaPool.__new__(ReplicaPool)
+        pool._scheduler = Scheduler([worker], capacity=4)
+        pool._sleeping = False
+        pool._model_id = None
+        api.backend = pool
+
+        async def generate(**fields):
+            return await api.generate_endpoint(api.GenerateRequest(**fields))
+
+        await generate(prompts=[[1, 2], [5]], routing_key=["a", "b"], conversation="start")
+        reply = await generate(prompts=[[3], [6]], routing_key=["a", "b"], conversation="append")
+        assert len(reply["results"]) == 2
+        assert worker.prompts[-2:] == [[1, 2, 101, 201, 3], [5, 102, 202, 6]]
+        with pytest.raises(HTTPException) as missing:
+            await generate(prompts=[[4]], routing_key="never-started", conversation="append")
+        assert missing.value.status_code == 404
+
+    asyncio.run(run())

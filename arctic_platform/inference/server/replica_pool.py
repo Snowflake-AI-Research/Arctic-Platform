@@ -957,6 +957,7 @@ class ReplicaPool:
         model_id: str | None = None,
         routing_key: str | list[str | None] | None = None,
         strict: bool = False,
+        conversation: str | None = None,
     ) -> list[dict[str, Any]]:
         """Generate completions for one or more prompts.
 
@@ -974,11 +975,13 @@ class ReplicaPool:
                 same worker (e.g. all turns of one multi-turn rollout).
             strict: When True, enforce hard pinning to the keyed worker even
                 under load, instead of ringing to the next worker on overload.
+            conversation: ``"start"`` or ``"append"``: each prompt is a turn of
+                the conversation kept under its routing key (``Scheduler.submit``).
         """
         self._check_model_id(model_id)
         futures = self.submit_generate_futures(
             prompts, sampling_params,
-            routing_key=routing_key, strict=strict,
+            routing_key=routing_key, strict=strict, conversation=conversation,
         )
         return list(await asyncio.gather(*futures))
 
@@ -988,6 +991,7 @@ class ReplicaPool:
         sampling_params: dict[str, Any] | list[dict[str, Any] | None] | None = None,
         routing_key: str | list[str | None] | None = None,
         strict: bool = False,
+        conversation: str | None = None,
     ) -> list[asyncio.Future]:
         """Submit generation requests and return one future per prompt."""
         if self._scheduler is None:
@@ -1018,7 +1022,7 @@ class ReplicaPool:
             if prompts.dim() == 1:
                 return [self._scheduler.submit(
                     compact_token_tensor(prompts), _single_params(),
-                    routing_key=_single_key(), strict=strict,
+                    routing_key=_single_key(), strict=strict, conversation=conversation,
                 )]
             if prompts.dim() != 2:
                 raise ValueError(
@@ -1028,11 +1032,11 @@ class ReplicaPool:
             prompts = list(prompts)
         if isinstance(prompts, str):
             return [self._scheduler.submit(
-                prompts, _single_params(), routing_key=_single_key(), strict=strict,
+                prompts, _single_params(), routing_key=_single_key(), strict=strict, conversation=conversation,
             )]
         if prompts and isinstance(prompts[0], int):
             return [self._scheduler.submit(
-                prompts, _single_params(), routing_key=_single_key(), strict=strict,
+                prompts, _single_params(), routing_key=_single_key(), strict=strict, conversation=conversation,
             )]
         prompts = [compact_token_tensor(p) if is_token_tensor(p) else p for p in prompts]
         if isinstance(routing_key, list):
@@ -1053,6 +1057,8 @@ class ReplicaPool:
             params_list = [p or {} for p in params]
         else:
             params_list = [params] * len(prompts)
+        if conversation is not None:
+            return self._scheduler.submit_turns(zip(prompts, params_list, keys), conversation, strict)
         return [
             self._scheduler.submit(prompt, param, routing_key=key, strict=strict)
             for prompt, param, key in zip(prompts, params_list, keys)
