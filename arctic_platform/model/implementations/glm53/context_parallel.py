@@ -714,6 +714,28 @@ def _kda_beta(self, hidden_states: torch.Tensor) -> torch.Tensor:
     return torch.sigmoid(logits.float() if getattr(self, "_fp32_parity", True) else logits)
 
 
+def _chunk_kda(self, query, key, value, decay, beta, cu_seqlens):
+    from fla.ops.kda import chunk_kda
+
+    fp32 = getattr(self, "_fp32_kda", False)
+    if fp32:
+        # vLLM's KDA decode keeps the L2-normalized q and k in fp32 (x / sqrt(sum(x * x) + 1e-6)); FLA would store its
+        # in-kernel normalization in the input dtype, and its kernels take one dtype for q, k and v.
+        query, key = (x.float() / torch.sqrt(x.float().square().sum(-1, keepdim=True) + 1e-6) for x in (query, key))
+    output, final_state = chunk_kda(
+        query,
+        key,
+        value.float() if fp32 else value,
+        g=decay,
+        beta=beta,
+        initial_state=None,
+        output_final_state=False,
+        use_qk_l2norm_in_kernel=not fp32,
+        cu_seqlens=cu_seqlens,
+    )
+    return output.to(value.dtype), final_state
+
+
 def _linear_attention_forward(
     self,
     hidden_states: torch.Tensor,
@@ -808,19 +830,7 @@ def _linear_attention_forward(
     key = key.view(batch_size, global_length, local_heads, self.head_dim)
     value = value.view(batch_size, global_length, local_heads, self.head_dim)
 
-    from fla.ops.kda import chunk_kda
-
-    output, final_state = chunk_kda(
-        query,
-        key,
-        value,
-        g=exchanged["decay"],
-        beta=exchanged["beta"],
-        initial_state=None,
-        output_final_state=False,
-        use_qk_l2norm_in_kernel=True,
-        cu_seqlens=global_cu_seqlens,
-    )
+    output, final_state = _chunk_kda(self, query, key, value, exchanged["decay"], exchanged["beta"], global_cu_seqlens)
     if final_state is not None:
         raise RuntimeError("GLM-5.3 KDA unexpectedly returned recurrent state")
     output = sequence_head_all_to_all(
@@ -882,19 +892,7 @@ def _local_linear_attention_forward(
     decay = self.forget_gate(hidden_states)
     beta = _kda_beta(self, hidden_states)
 
-    from fla.ops.kda import chunk_kda
-
-    output, final_state = chunk_kda(
-        query,
-        key,
-        value,
-        g=decay,
-        beta=beta,
-        initial_state=None,
-        output_final_state=False,
-        use_qk_l2norm_in_kernel=True,
-        cu_seqlens=global_cu_seqlens,
-    )
+    output, final_state = _chunk_kda(self, query, key, value, decay, beta, global_cu_seqlens)
     if final_state is not None:
         raise RuntimeError("GLM-5.3 KDA unexpectedly returned recurrent state")
     gate = self.g_b_proj(self.g_a_proj(hidden_states)).view(shape)
@@ -984,6 +982,7 @@ def apply_context_parallelism(
             sparse_layers += 1
         elif layer.block_type == "linear_attention":
             attention._fp32_parity = getattr(model.config, "fp32_parity", True)
+            attention._fp32_kda = getattr(model.config, "fp32_kda", False)
             if attention.num_heads % cp_world_size:
                 raise ValueError(
                     f"GLM-5.3 KDA heads ({attention.num_heads}) must be divisible by CP size ({cp_world_size})"

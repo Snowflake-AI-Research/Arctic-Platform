@@ -58,8 +58,23 @@ class FlashMoeOptions(GenericMoeOptions):
     )
 
 
+class Glm5NextOptions(FlashMoeOptions):
+    """Validated ``loader_options`` for GLM-5.3-Flash."""
+
+    fp32_kda: bool = Field(
+        False,
+        description=(
+            "KDA layers keep the L2-normalized q and k in fp32 through the chunked recurrence, as vLLM's KDA decode "
+            "does, instead of FLA storing them in BF16 first. q, k and v enter FLA in fp32, so the KDA tensors it "
+            "saves for backward and its chunk intermediates take twice the bytes and its products run at the TF32 "
+            "rate."
+        ),
+    )
+
+
 class _FlashLoadOptions(Qwen3_5MoeOptions):
     fp32_routed_weighting: bool = False
+    fp32_kda: bool = False
 
 
 def _matches(family: str):
@@ -157,7 +172,7 @@ def _load(ctx: LoaderContext, load_model) -> LoadedModel:
 @register_loader(
     "glm5_next",
     matches=_matches("glm5_next"),
-    options=FlashMoeOptions,
+    options=Glm5NextOptions,
     validate_spec=_validate_glm5_next,
 )
 def load_glm5_next(ctx: LoaderContext) -> LoadedModel:

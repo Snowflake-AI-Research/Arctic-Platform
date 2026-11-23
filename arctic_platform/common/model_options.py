@@ -227,6 +227,22 @@ def register(registry: Registry) -> None:
         registry=registry,
     )
     register_option(
+        "numerics.fp32_kda",
+        runs_in="trainer",
+        goal="parity",
+        why=(
+            "GLM-5.3-Flash's KDA layers keep the L2-normalized q and k in fp32 through the chunked recurrence, as vLLM's"
+            " KDA decode recurrence does, instead of FLA's in-kernel normalization storing them in BF16 first. FLA's"
+            " chunk kernels take one dtype for q, k and v, so all three enter in fp32 and every chunk intermediate"
+            " stays fp32 (TF32 tensor-core products on CUDA); the output is rounded once. Off by default: the KDA"
+            " tensors FLA saves for backward and its chunk intermediates take twice the bytes, and its fp32 products"
+            " run at the TF32 rate."
+        ),
+        remove_when="GPU runs show it does not bring training closer to vLLM, or it is cheap enough for fp32_parity",
+        source="`loader_options.fp32_kda`",
+        registry=registry,
+    )
+    register_option(
         "numerics.optimization_dtype",
         runs_in="trainer",
         goal="parity",
