@@ -19,6 +19,12 @@ once, so its activation memory grows with the number of tokens. DeepSpeed's ``Ti
 shard-by-shard over the token dim (recomputing in backward) for a ``~1/shards`` intermediate, and defers ZeRO
 grad reduction to the last shard via ``ds_grad_is_ready`` (ZeRO stage 1/2) so gradients stay correct.
 
+Autograd adds each shard's weight gradient into ``param.grad`` in the weight's dtype, so a BF16 weight would
+round once per shard (a BF16 running sum stops moving once the sum outgrows the increments). Outside ZeRO-3 the
+shards therefore go through ``_TiledMLPFp32Grads``, which sums the shards' weight gradients in FP32 and hands
+autograd one gradient per weight, rounded once. ``compute_params`` has to list every trainable weight the FFN reads.
+ZeRO-3 keeps DeepSpeed's ``TiledMLP``: its per-shard gather and reduction schedule is not reproduced here.
+
 Model-agnostic: the caller supplies ``is_target`` (which submodules to tile), ``mlp_forward`` (un-tiled FFN
 on a shard) and ``compute_params`` (weights in the reduction). Shard count is derived per forward as
 ``ceil(n_tokens / token_chunk_size)``. Callers omit the wrap when tiling is unset; a non-positive chunk
@@ -131,6 +137,93 @@ def _shard_forward_replaying_rng(mlp_forward: MlpForward) -> MlpForward:
     return shard_forward
 
 
+def _unlisted_trainable_leaves(output: torch.Tensor, listed: set[int]) -> list[torch.Tensor]:
+    """Trainable leaves the graph of ``output`` reaches that are not in ``listed`` (by ``id``)."""
+    found: list[torch.Tensor] = []
+    seen = set()
+    stack = [output.grad_fn]
+    while stack:
+        node = stack.pop()
+        if node is None or node in seen:
+            continue
+        seen.add(node)
+        variable = getattr(node, "variable", None)
+        if variable is not None and id(variable) not in listed:
+            found.append(variable)
+        stack.extend(next_node for next_node, _ in node.next_functions)
+    return found
+
+
+class _TiledMLPFp32Grads(torch.autograd.Function):
+    """``deepspeed``'s ``TiledMLP`` with the weight gradients summed over shards in FP32.
+
+    ``params`` are the weights the shards read. They are inputs of the function so that autograd delivers
+    each one's gradient, rounded to the weight dtype once, after the last shard, which also makes the ZeRO
+    post-accumulate hook fire once per weight without ``ds_grad_is_ready`` bookkeeping.
+    """
+
+    @staticmethod
+    def forward(ctx, fn, module, x, shards, *params):
+        ctx.fn = fn
+        ctx.module = module
+        ctx.shards = shards
+        ctx.params = params
+        ctx.save_for_backward(x)
+        with torch.no_grad():
+            outputs = [fn(module, shard) for shard in torch.chunk(x, chunks=shards, dim=-2)]
+        return torch.cat(outputs, dim=-2)
+
+    @staticmethod
+    def backward(ctx, *grads):
+        (x,) = ctx.saved_tensors
+        x_requires_grad = ctx.needs_input_grad[2]
+        trainable = [index for index, param in enumerate(ctx.params) if ctx.needs_input_grad[4 + index]]
+        params = [ctx.params[index] for index in trainable]
+
+        x_shape = x.shape
+        x = x.detach().reshape(-1, x_shape[-1])
+        incoming = grads[0].reshape(-1, x_shape[-1])
+        x_grad = torch.zeros_like(x) if x_requires_grad else None
+        sums: list[torch.Tensor | None] = [None] * len(params)
+        offset = 0
+        for index, shard in enumerate(torch.chunk(x, chunks=ctx.shards, dim=0)):
+            rows = shard.shape[0]
+            shard.requires_grad_(x_requires_grad)
+            with torch.enable_grad():
+                output = ctx.fn(ctx.module, shard)
+                inputs = ([shard] if x_requires_grad else []) + params
+                if index == 0:
+                    stray = _unlisted_trainable_leaves(output, {id(t) for t in inputs})
+                    if stray:
+                        raise RuntimeError(
+                            f"tiled MLP reads {len(stray)} trainable tensor(s) that compute_params does not list, "
+                            f"whose gradients would be dropped (shapes {[tuple(t.shape) for t in stray[:4]]})"
+                        )
+                computed = (
+                    torch.autograd.grad(output, inputs, incoming.narrow(0, offset, rows), allow_unused=True)
+                    if inputs
+                    else ()
+                )
+            if x_requires_grad:
+                x_grad.narrow(0, offset, rows).copy_(computed[0])
+                computed = computed[1:]
+            for slot, (param, grad) in enumerate(zip(params, computed)):
+                if grad is None:
+                    continue
+                if sums[slot] is None:
+                    sums[slot] = grad.to(torch.promote_types(param.dtype, torch.float32))
+                else:
+                    sums[slot].add_(grad)
+            offset += rows
+
+        param_grads: list[torch.Tensor | None] = [None] * len(ctx.params)
+        for slot, index in enumerate(trainable):
+            if sums[slot] is not None:
+                param_grads[index] = sums[slot].to(ctx.params[index].dtype)
+        x_grad = x_grad.view(x_shape) if x_requires_grad else None
+        return (None, None, x_grad, None, *param_grads)
+
+
 def make_tiled_forward(
     mlp_forward: MlpForward,
     compute_params: ComputeParams,
@@ -170,7 +263,11 @@ def make_tiled_forward(
             padding = hidden_states.new_zeros((padded_tokens - num_tokens, hidden_size))
             hidden_states = torch.cat((hidden_states, padding), dim=0)
         shard_forward = _shard_forward_replaying_rng(call_mlp)
-        output = TiledMLP.apply(shard_forward, self, hidden_states, num_shards, compute_params(self))
+        if uses_zero3:
+            output = TiledMLP.apply(shard_forward, self, hidden_states, num_shards, compute_params(self))
+        else:
+            weights = [weight for weight in compute_params(self) if weight.requires_grad]
+            output = _TiledMLPFp32Grads.apply(shard_forward, self, hidden_states, num_shards, *weights)
         output = output[:num_tokens]
         return output.view(*original_shape[:-1], output.shape[-1])
 
