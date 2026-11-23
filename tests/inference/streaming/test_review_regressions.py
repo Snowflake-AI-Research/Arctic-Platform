@@ -99,10 +99,10 @@ def test_client_clock_skew_and_queue_time_budget(monkeypatch, clock_offset):
 
         actor = FakeEngineWorker.remote()
         await actor.stats.remote()
-        scheduler = Scheduler([actor])
+        scheduler = Scheduler([actor], capacity=1024)
         reader = None
         try:
-            scheduler._paused = True
+            scheduler.pause()
             stream = scheduler.stream_generate(
                 "clock", "blocked", limits=StreamLimits(timeout_s=5)
             )
@@ -112,7 +112,7 @@ def test_client_clock_skew_and_queue_time_budget(monkeypatch, clock_offset):
             reader = asyncio.create_task(anext(stream))
             await asyncio.sleep(0.1)
             assert not reader.done()
-            scheduler._paused = False
+            scheduler.resume()
             assert (await asyncio.wait_for(reader, 5))["type"] == "delta"
             assert 0 < (await actor.stats.remote())["remaining_s"] < 4.95
             await stream.aclose()
@@ -129,7 +129,7 @@ def test_failed_single_abort_quarantines_scheduler_replica():
     async def scenario():
         actor = FakeEngineWorker.remote()
         await actor.fail_first_abort.remote()
-        scheduler = Scheduler([actor])
+        scheduler = Scheduler([actor], capacity=1024)
         try:
             stream = scheduler.stream_generate("failed-abort", "blocked")
             await anext(stream)
@@ -194,47 +194,15 @@ def test_driver_shutdown_collects_multiple_failures(cancelled):
     asyncio.run(scenario())
 
 
-def test_streams_wait_for_configured_worker_capacity():
-    async def scenario():
-        shared_slots = 4
-        actor = FakeEngineWorker.options(max_concurrency=128).remote()
-        await actor.stats.remote()
-        scheduler = Scheduler([actor], initial_concurrency=shared_slots)
-        reader = None
-        try:
-            streams = [
-                scheduler.stream_generate(f"stream-{index}", "blocked")
-                for index in range(shared_slots + 1)
-            ]
-            await asyncio.gather(*(anext(stream) for stream in streams[:shared_slots]))
-            reader = asyncio.create_task(anext(streams[shared_slots]))
-            await asyncio.sleep(0.1)
-            assert not reader.done(), "Streaming must respect the configured shared limit"
-            assert scheduler._workers[0].available
-            assert (await actor.stats.remote())["sessions"] == shared_slots
-            await streams[0].aclose()
-            assert (await asyncio.wait_for(reader, 5))["type"] == "delta"
-            assert scheduler._workers[0].available
-        finally:
-            if reader is not None:
-                await asyncio.gather(reader, return_exceptions=True)
-            await scheduler.shutdown()
-            ray.kill(actor)
-
-    asyncio.run(asyncio.wait_for(scenario(), 25))
-
-
 @pytest.mark.parametrize("choices", [1, 8])
 @pytest.mark.parametrize("replicas", [1, 2])
-def test_stream_capacity_scales_with_replicas_and_queues_overflow(monkeypatch, choices, replicas):
-    monkeypatch.delenv("ARCTIC_WORKER_CONCURRENCY_LIMIT", raising=False)
-
+def test_stream_capacity_scales_with_replicas_and_queues_overflow(choices, replicas):
     async def scenario():
         assert MAX_WORKER_STREAMS == 128
         actors = [FakeEngineWorker.options(max_concurrency=256).remote() for _ in range(replicas)]
         await asyncio.gather(*(actor.stats.remote() for actor in actors))
         pool = ReplicaPool()
-        pool._scheduler = pool._make_scheduler(actors)
+        pool._scheduler = pool._make_scheduler(actors, 1024)
         scheduler = pool._scheduler
         reader = None
         try:
@@ -275,112 +243,11 @@ def test_stream_capacity_scales_with_replicas_and_queues_overflow(monkeypatch, c
     asyncio.run(asyncio.wait_for(scenario(), 45))
 
 
-@pytest.mark.parametrize("shared_slots", [1, 3])
-def test_streams_consume_legacy_capacity_until_closed(shared_slots):
-    async def scenario():
-        actor = FakeEngineWorker.remote()
-        await actor.stats.remote()
-        scheduler = Scheduler(
-            [actor], initial_concurrency=shared_slots, dynamic_concurrency=False
-        )
-        legacy = None
-        try:
-            streams = [
-                scheduler.stream_generate(f"shared-{index}", "blocked")
-                for index in range(shared_slots)
-            ]
-            await asyncio.gather(*(anext(stream) for stream in streams))
-            worker = scheduler._workers[0]
-            assert worker.active_requests == shared_slots
-            assert worker.streaming_requests == shared_slots
-            routed = asyncio.Event()
-            original_routing = scheduler._routing_fn
-
-            def observed_routing(request, workers):
-                routed.set()
-                return original_routing(request, workers)
-
-            scheduler._routing_fn = observed_routing
-            legacy = scheduler.submit("legacy", {"max_tokens": 1})
-            await asyncio.wait_for(routed.wait(), 5)
-            assert not legacy.done()
-            assert (await actor.stats.remote())["legacy_calls"] == 0
-            await streams[0].aclose()
-            for attempt in range(100):
-                if (await actor.stats.remote())["legacy_calls"] == 1:
-                    break
-                await asyncio.sleep(0.01)
-            else:
-                pytest.fail("Legacy generation did not acquire the released slot")
-            assert worker.active_requests == shared_slots
-            assert worker.streaming_requests == shared_slots - 1
-            await actor.release_legacy.remote()
-            assert (await asyncio.wait_for(legacy, 5))["text"] == "legacy result"
-            assert worker.active_requests == shared_slots - 1
-            await scheduler.abort_streams()
-            assert worker.active_requests == worker.streaming_requests == 0
-        finally:
-            await actor.release_legacy.remote()
-            await scheduler.shutdown()
-            if legacy is not None:
-                await asyncio.wait_for(asyncio.gather(legacy, return_exceptions=True), 5)
-            ray.kill(actor)
-
-    asyncio.run(asyncio.wait_for(scenario(), 25))
-
-
-def test_legacy_generation_consumes_stream_capacity_until_finished():
-    async def scenario():
-        actor = FakeEngineWorker.remote()
-        await actor.stats.remote()
-        scheduler = Scheduler([actor], initial_concurrency=1, dynamic_concurrency=False)
-        legacy = None
-        reader = None
-        try:
-            legacy = scheduler.submit("legacy", {"max_tokens": 1})
-            for attempt in range(100):
-                if (await actor.stats.remote())["legacy_calls"] == 1:
-                    break
-                await asyncio.sleep(0.01)
-            else:
-                pytest.fail("Legacy generation did not start")
-            stream = scheduler.stream_generate("waiting-stream", "blocked")
-            routed = asyncio.Event()
-            original_routing = scheduler._routing_fn
-
-            def observed_routing(request, workers):
-                routed.set()
-                return original_routing(request, workers)
-
-            scheduler._routing_fn = observed_routing
-            reader = asyncio.create_task(anext(stream))
-            await asyncio.wait_for(routed.wait(), 5)
-            assert not reader.done()
-            worker = scheduler._workers[0]
-            assert worker.active_requests == 1
-            assert worker.streaming_requests == 0
-            assert (await actor.stats.remote())["sessions"] == 0
-            await actor.release_legacy.remote()
-            await asyncio.wait_for(legacy, 5)
-            assert (await asyncio.wait_for(reader, 5))["type"] == "delta"
-            assert worker.active_requests == worker.streaming_requests == 1
-            await stream.aclose()
-            assert worker.active_requests == worker.streaming_requests == 0
-        finally:
-            await actor.release_legacy.remote()
-            await scheduler.shutdown()
-            pending = [future for future in (legacy, reader) if future is not None]
-            await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), 5)
-            ray.kill(actor)
-
-    asyncio.run(asyncio.wait_for(scenario(), 25))
-
-
 def test_review_capacity_rejection_does_not_quarantine():
     async def scenario():
         actor = FakeEngineWorker.options(max_concurrency=128).remote()
         await actor.stats.remote()
-        scheduler = Scheduler([actor], initial_concurrency=128)
+        scheduler = Scheduler([actor], capacity=1024)
         try:
             for index in range(MAX_WORKER_STREAMS):
                 await actor.start_stream.remote(
@@ -408,21 +275,17 @@ def test_review_shutdown_kills_workers_after_cleanup_failure(monkeypatch):
         worker.shutdown.remote.side_effect = RuntimeError("graceful worker failure")
         pool = ReplicaPool()
         pool._workers = [worker]
-        scheduler = Scheduler([worker])
+        scheduler = Scheduler([worker], capacity=1024)
         pool._scheduler = scheduler
         stream = SimpleNamespace(
             abort=AsyncMock(return_value={"status": "cleanup_unconfirmed"})
         )
         scheduler._streams["stuck"] = stream
-        scheduler._poll_task = asyncio.create_task(asyncio.sleep(60))
-        scheduler._adjust_task = asyncio.create_task(asyncio.sleep(60))
         killed = []
         monkeypatch.setattr(ray, "kill", killed.append)
         with pytest.raises(RuntimeError, match="cleanup"):
             await pool.shutdown()
         assert killed == [worker]
-        assert scheduler._poll_task.done()
-        assert scheduler._adjust_task.done()
         assert pool._scheduler is None
         assert pool._workers == []
 
@@ -431,7 +294,7 @@ def test_review_shutdown_kills_workers_after_cleanup_failure(monkeypatch):
 
 def test_review_retired_cache_evicts_instead_of_blocking_admission():
     async def scenario():
-        scheduler = Scheduler([MagicMock()])
+        scheduler = Scheduler([MagicMock()], capacity=1024)
         now = time.monotonic()
         scheduler._stream_retired.update(
             (f"old-{index}", now) for index in range(100000)
@@ -451,7 +314,7 @@ def test_review_retired_cache_evicts_instead_of_blocking_admission():
 
 def test_retired_ids_expire_without_changing_active_admission():
     async def scenario():
-        scheduler = Scheduler([MagicMock()])
+        scheduler = Scheduler([MagicMock()], capacity=1024)
         scheduler._stream_retired["expired"] = time.monotonic() - 3601
         scheduler._stream_retired["recent"] = time.monotonic()
         try:
@@ -471,7 +334,7 @@ def test_registration_validation_error_keeps_worker_available():
     async def scenario():
         actor = FakeEngineWorker.remote()
         await actor.stats.remote()
-        scheduler = Scheduler([actor])
+        scheduler = Scheduler([actor], capacity=1024)
         try:
             stream = scheduler.stream_generate("invalid-deadline", "prompt")
             stream.expires_at += 3600
@@ -573,7 +436,7 @@ def test_scale_down_force_removes_target_after_cleanup_failure(monkeypatch, fail
         actors = [MagicMock(), MagicMock()]
         pool = ReplicaPool()
         pool._workers = list(actors)
-        scheduler = Scheduler(actors)
+        scheduler = Scheduler(actors, capacity=1024)
         pool._scheduler = scheduler
         retained = SimpleNamespace(worker=scheduler._workers[0], abort=AsyncMock())
         removed = SimpleNamespace(
@@ -656,19 +519,18 @@ def test_review_scale_down_preserves_retained_replica_streams():
         await asyncio.gather(*(actor.stats.remote() for actor in actors))
         pool = ReplicaPool()
         pool._workers = list(actors)
-        scheduler = Scheduler(actors)
+        scheduler = Scheduler(actors, capacity=1024)
         pool._scheduler = scheduler
         driver = Driver()
         driver._pools["model"] = pool
         try:
-            retained = driver.stream_generate(
-                "model", "retained", "blocked", {"max_tokens": 2}
-            )
-            removed = driver.stream_generate(
-                "model", "removed", "blocked", {"max_tokens": 2}
-            )
-            await anext(retained)
-            await anext(removed)
+            streams = [
+                driver.stream_generate("model", request_id, "blocked", {"max_tokens": 2})
+                for request_id in ("first", "second")
+            ]
+            for stream in streams:
+                await anext(stream)
+            retained, removed = sorted(streams, key=lambda stream: stream.request.worker_idx)
             assert retained.request.worker_idx == 0
             assert removed.request.worker_idx == 1
             await pool.scale_down(1)
