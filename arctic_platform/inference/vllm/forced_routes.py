@@ -24,11 +24,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from arctic_platform.inference.vllm.router_replay import FORCED_ROUTES_KEY
+
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.input_batch import InputBatch
-
-# Bytes survive the msgpack round trip through SamplingParams.extra_args.
-FORCED_ROUTES_KEY = "dss_router_replay_forced_routes"
 
 # The trainer's score functions (TokenChoiceTopKRouter.forward), applied to float32 logits.
 _SCORES = {
