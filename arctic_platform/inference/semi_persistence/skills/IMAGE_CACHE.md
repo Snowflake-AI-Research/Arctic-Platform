@@ -13,8 +13,8 @@ cache has to meet.
 
 Sections 1-8 are requirements and measurements. **Section 9 is built and in
 use**: an image published to the mirror is materialized into the derived
-`model_dir` by copying the two path-bound directories and reading the weights
-in place. Section 10 is the publish-side measurement that decided its shape.
+`model_dir` by copying the two path-bound directories (decoding compressed
+pages on the way) and reading the weights in place. Section 10 is the publish-side measurement that decided its shape.
 **Section 11 is the multi-replica roll** (several replicas per pod, one
 single-node dump serving `n_gpus=16`), measured end to end on 2026-10-03.
 
@@ -149,7 +149,27 @@ job `2469a638-2290-44eb-897e-16075046c00a`:
 layout: dtype-converted, fused, quantized, and TP-sharded per rank. Producing it
 requires loading the model, which is the cost the cache exists to avoid. So the
 73 GB is the price of a durable cache, not an artifact that can be trimmed by
-pointing at `/mnt/neutrino/base-models`.
+pointing at `/mnt/neutrino/base-models`. Host-resident parameters (DeepSeek's
+Engram tables) are not in the buffer but are written straight from their own
+mappings at their place in the layout, so the shards, the manifest and the hash
+are what they would be without them; see `instance_DESIGN.md` *Host-Resident
+Parameters*.
+
+**The layout records canonical names.** With LoRA enabled vLLM wraps each
+layer it can adapt in a `BaseLayerWithLoRA` that holds the original as
+`base_layer`, so parameter names gain a segment
+(`main:p:language_model.model.embed_tokens.base_layer.weight`) while the bytes,
+offsets, dtypes and shapes stay the full config's. `weights_meta.json` is
+hashed with the shards, so recording those names forked every LoRA config's
+`wt12` and uploaded a second copy of the same weights. `_semip_save_weights`
+now drops a `base_layer` segment only where it follows the path of a module
+that is a LoRA wrapper (nested ones included), so a module merely named that
+keeps it, and fails before clearing the old shards if two parameters would
+collide. `_semip_load_weights` canonicalizes both sides with the engine's own
+wrappers and compares names, offsets, sizes and now dtypes, so a LoRA engine
+loads its full config's weight set, the other way round, and a LoRA weight set
+written before the change. Without LoRA nothing is renamed and the manifest is
+byte-identical to before.
 
 The one real lever is that `compilation/` is **reused and never cleared** on
 re-dump (see `semi-p_DESIGN.md` §2), so it is the cheapest thing to make durable
@@ -297,7 +317,7 @@ differing compiled extension aborts from inside CRIU with no up-front check.
 Inside a container these mappings come from two places, and the distinction
 decides how portable an image is: the **container image** (deterministic given
 the digest — the successful run was
-`dss-backend:dev_20260916_235834_7af90823e27 @sha256:9af620dc…`) and
+`dss-backend:<image-tag> @sha256:<digest>`) and
 **host-injected driver libraries**, which follow the node. So the container
 image digest is certainly part of the cache key; whether the node's driver
 version must be too is *not yet measured*. `scripts/imgdiff.py <image_dir>`
@@ -379,8 +399,8 @@ the image does *not* ship (see §5 constraint 2).
 
 **The digest term also partitions by GPU architecture, for free.** The gateway
 resolves a job's `image_tag` to a hardware-specific variant — `-h` for Hopper,
-so `dev_20260917_184643_435d85eab89` runs as
-`dev_20260917_184643_435d85eab89-h` — and that variant has its own digest. So
+so `<image-tag>` runs as
+`<image-tag>-h` — and that variant has its own digest. So
 the same config on an H200 and on a B200 lands on different `env12` values and
 cannot share a directory, which is what you want: different compiled kernels,
 and `cuCheckpointProcessRestore` could not migrate between them regardless. No
@@ -663,6 +683,7 @@ SEMIP_IMAGE_SOURCE  /mnt/neutrino/base-models/image-cache  readOnly mirror, outl
 
 <cfg12>_<env12>/
   image/         6.4 GB   COPY   CRIU's -D dir; a restore writes into it
+                                 (pages-<N>.img decompressed on the way)
   compilation/   306 MB   COPY   the child's live compile cache
   weight/       ~66 GB    READ IN PLACE
 ```
@@ -680,7 +701,8 @@ the A/B switch -- which is distinct from leaving it unset.
 
 `env_files` from the first successful dump has **0 of 416** mappings under
 `weight/`, so no absolute path is baked into the shards. The dump order is
-why: `save_weights` → `detach` → `sleep` → `cuda_checkpoint` → `criu_dump`, so
+why: `save_weights` → `release_host_weights` → `detach` → `sleep` →
+`cuda_checkpoint` → `criu_dump`, so
 the files are outputs and the writer has detached before CRIU runs. The seam
 already existed too — the restore calls `inst.attach().load_weights()`, and
 `load_weights(weights_dir=...)` takes the override; `_semip_load_weights` is
@@ -713,6 +735,12 @@ per-rank shard padding and replicated parameters. Those are four distinct weight
 hashes by construction, and `tensor_parallel_size` is in `cfg12` anyway, so they
 were never candidates for sharing.
 
+The **LoRA** dimension collapses since the manifest records canonical names
+(§1): a LoRA config now writes its full config's weight set. Qwen3.8's LoRA
+config hashes to the full config's `64e76626e58c` (was `970d92031a24`), and
+GLM-5.3-Flash long LoRA to `f858d7580d72` (was `dda747885ca6`). Non-LoRA
+manifests and hashes are unchanged.
+
 **The hazard the split introduces is the dangling reference**, and it is silent.
 Weights are shared, so retiring a hash can orphan a skeleton that still names it;
 the restore then declines and cold-starts with nothing above WARNING. Hence
@@ -725,6 +753,95 @@ paths CRIU baked as mmaps, and CRIU records mount and device for file-backed
 mappings. `image/` cannot either: it is CRIU's `-D` dir, and the restore writes
 `restore.log` and a pidfile into it. Read-only would need `--work-dir` plumbing
 for 6.4 GB of savings.
+
+### How the two are copied
+
+One path, `semi_persistence/materialize.py`: a parallel local copy from this node's
+mirror into `<model_dir>/.incoming/`. The files of `compilation/` and `image/`
+are planned from the daemon's `_neutrino_manifest.json` (a source with no
+manifest, one placed by hand, is listed by walking it), every file is
+preallocated at its full size with `posix_fallocate`, and the work is cut into
+ranges copied by 32 threads with O_DIRECT writes wherever offset and length
+are block-aligned. On p5en that moved GLM-5.3's 79 GB in ~4.2 s against
+`shutil.copytree`'s ~20. Every node mirrors every file and the destination
+disk, not the source, is the bound, so no knob chooses another path.
+
+The same workers handle both skeleton formats. A compressed page file
+(`pages-<N>.img.zst`, below) is decoded into the raw `pages-<N>.img` CRIU
+reads; every other file, and every file of a raw skeleton, is copied as raw
+ranges, so skeletons published before compression still restore. A
+compressed file's ranges are its runs of non-zero frames: the all-zero frames
+the frame table lists are never read, decoded or written, and stay
+preallocated ranges that read back as zeros. The checks:
+
+- every frame must be a checksummed, dictionary-free zstd frame, and decode
+  (checksum verified) to exactly its share of the raw file;
+- the bytes copied, decoded and left as zero frames must add up to the
+  planned total, and every file must end at its manifest size (the default,
+  `SEMIP_GATHER_VERIFY=size`);
+- `SEMIP_GATHER_VERIFY=sha256` also hashes every result against the manifest,
+  `raw_sha256` for a decoded file.
+
+The plan also refuses a frame table that disagrees with the manifest (format,
+codec, frame size, rows, frame sizes against the stored size, zero runs), and
+compressed pages without a manifest. Any failure raises out of the copy before
+the flip, so before CRIU sees anything, and `.incoming` is removed: a miss, or
+a failed job with several replicas, as for any failed copy. A manifest whose
+`compression.format` is newer than this engine reads is a miss decided before
+anything is copied.
+
+The `materialized` line reports `N range(s) over F flow(s)[, O_DIRECT]` and,
+for a compressed skeleton, `; pages: X GiB stored -> R GiB raw in N file(s),
+Z GiB zero frames left unwritten, W GiB written, decode C core-s`.
+
+### Compressed skeletons (format 1)
+
+`semip_publish.py` publishes each **non-empty `pages-<N>.img` directly under
+an image directory** (flat `image/`, `replica<K>/image/` or `node<k>/image/`)
+as `pages-<N>.img.zst`: zstd level 1, one independent frame per 1 MiB of raw
+bytes (the last one shorter), each carrying its checksum and content size.
+About a third of the frames are all zeros; they are stored too, as tiny
+frames, and flagged. Every other file stays raw: `compilation/`, every other
+image file, zero-byte pages files and the weights. The weight hash is
+unchanged.
+
+- **`compression.json`**, one per image directory with compressed pages and
+  published as an ordinary raw row: `{format, frame_bytes, files}`, where each
+  `.zst` maps to its `raw_size_bytes`, `frame_stored_bytes` (the stored size of
+  every frame) and `zero_runs` (all-zero frames as `[start, count]` runs).
+- **Manifest rows** of a compressed file keep `path`/`size_bytes`/`sha256` for
+  the stored `.zst` -- all the daemon verifies and digests -- and add
+  `raw_path`/`raw_size_bytes`/`raw_sha256`, which the materialize rebuilds.
+- **A top-level `compression` block** marks the format: `{format: 1, codec,
+  level, frame_bytes, index, raw_total_bytes, stored_total_bytes,
+  zstd_version}`. A manifest without it is a raw skeleton.
+
+**Publish.** One pass per pages file, in the dump pod, hashes the raw bytes,
+compresses each frame, decodes it back and compares it with its input, hashes
+the stored bytes, and writes them under `<key_dir>/.semip-publish/` (removed
+at the start and end of every publish). A frame that does not decode back
+fails the publish before anything is uploaded. The engine runs the publisher
+with `--nice 10` beside the job it serves, and compression uses
+`min(--hash-workers, 32, the cgroup's CPU quota)` threads. libzstd is reached
+through ctypes (`libzstd.so.1`, shipped in the backend image). The image
+directory uploads with the compressed pages' raw names excluded, then the
+staged `.zst` files and frame table, and the sentinel still goes last.
+
+Pages are published raw, with the reason printed, when
+`SEMIP_PUBLISH_COMPRESS=0` or `--no-compress`, on a dry run, when libzstd
+cannot be loaded, or when the staging disk has less free space than the raw
+pages. A key is published in one format only: republishing it in the other
+is refused until it is unpublished, since the old format's files would stay in
+the bucket beside the new sentinel. A pod-spanning publish compresses each
+pod's own pages, and node 0 derives the `compression` block from the union of
+the rows.
+
+The publisher logs `- image/ hashed+compressed: ... GiB raw -> ... GiB stored
+(...x), N pages file(s), Z zero frame(s), ...` per image directory, and its
+last line is `publish summary: {...}` with `format` (`zstd1` or `raw`),
+`raw_bytes`, `stored_bytes`, `compressed_files`, `zero_frames`,
+`hash_compress_s` and `upload_s`. Onboarding's `publish.py` records those
+fields, plus `ratio` (raw / stored), in its `summary.json`.
 
 ### Every way it declines, and why none of them is an error
 
@@ -752,7 +869,8 @@ failing, its post-copy size check -- raises and fails the job (all-or-none).
 | the `weight/<wt12>/` the skeleton names holds no `weights_meta.json` (nor `rank0/`), or carries no `.neutrino_verified` | We never copy weights, so the skeleton is unrestorable. Either the hash was unpublished while this skeleton still referenced it, or it has not finished syncing |
 | more than one `skeleton/<cfg12>_<env12>_*` | Two weight versions for one config and backend. Which one a job should serve is an operator's decision, so this declines and names the candidates rather than tie-breaking |
 | an `env_files` size mismatch outside `model_dir` | This node is not the environment the image was dumped in, despite `env12` agreeing. Run `imgdiff.py` |
-| the copy raises | Any I/O failure, disk-full included |
+| the manifest's compression `format` is newer than this engine reads | Decided before any copy, so even several replicas are a miss rather than a failed job |
+| the copy raises | Any I/O failure, disk-full included. For compressed pages also a frame that fails its checksum or length, a frame table that disagrees with the manifest, compressed pages without a manifest, or no libzstd. `.incoming` is removed either way |
 | an `env_files` size mismatch under `model_dir`, after the copy | The copied compile cache is short or wrong; the flipped `compilation/` is removed too, so the cold start does not inherit it |
 
 ### The four properties the copy depends on
@@ -765,8 +883,9 @@ failing, its post-copy size check -- raises and fails the job (all-or-none).
    and `os.replace`d in the order `compilation`, `image`. `image/meta.json` is
    the hit predicate, so a materialize interrupted anywhere leaves a directory
    that reads as a miss. Same discipline as the DaemonSet's manifest.
-3. **Preserve mode, then repair it.** `shutil.copytree` defaults to `copy2`,
-   which preserves mode -- necessary, because CRIU re-validates the recorded
+3. **Preserve mode, then repair it.** The copy keeps each file's mode and
+   times from the mirror, as `shutil.copy2` would (`_copy_stats`) --
+   necessary, because CRIU re-validates the recorded
    mode of every path it re-maps, but not sufficient, because the source is
    downstream of S3 and its modes are already flattened. `_apply_recorded_modes`
    puts them back from `env_files` after each `os.replace`; see "The second
@@ -990,7 +1109,7 @@ the hash); deletion propagates to every node within 300 s via
 
 ## 11. Several replicas per pod: measured end to end, 2026-10-03
 
-Image `dev_20261003_191750_7f806d170f8-h` (`env12` = `1d9e2753e70c`; pod
+Image `<image-tag>-h` (`env12` = `1d9e2753e70c`; pod
 digest `sha256:ec0a643973c4…`, driver 580.159.03). Each model was dumped by an
 `n_gpus=8` job whose spec set only `semi_p: true`, published from its dump pod
 with `semip_publish.py /data-fast/image-cache_neutrino/<cfg12>_<env12>`, and

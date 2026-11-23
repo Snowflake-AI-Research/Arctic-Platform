@@ -12,6 +12,10 @@ def uses_dispatch_ep(backend: str) -> bool:
 
 
 def get_ep_comm_module(backend: str) -> ModuleType:
+    if backend == "nccl":
+        from . import ncclep
+
+        return ncclep
     if backend == "uccl":
         from . import ucclep
 
