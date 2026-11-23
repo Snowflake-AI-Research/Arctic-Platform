@@ -192,8 +192,9 @@ class _SemiPAsyncLLMMixin:
     weights into it.
     """
 
-    def _init_semi_p(self, inst: Any, agents: list[Any] | None = None) -> None:
+    def _init_semi_p(self, inst: Any, agents: list[Any] | None, *, forced_route_support_rpc: bool) -> None:
         self._inst = inst
+        self._forced_route_support_rpc = forced_route_support_rpc
         # The other node-partitions of a pod-spanning engine. They hold GPUs and a
         # restored process tree, so they have to come down with this engine;
         # nothing else owns them.
@@ -211,6 +212,8 @@ class _SemiPAsyncLLMMixin:
         if method == "wake_up":
             await self.wake_up()
             return [None]
+        if method == "forced_route_support" and not self._forced_route_support_rpc:
+            return ["the restored snapshot does not advertise forced_route_support"]
         try:
             return await super().collective_rpc(
                 method, timeout=timeout, args=args, kwargs=kwargs)
@@ -464,7 +467,8 @@ async def attach(handle: Any, vllm_config: Any, renderer: Any = None,
     except BaseException:
         _teardown(handle.inst, handle.agents)
         raise
-    llm._init_semi_p(handle.inst, handle.agents)
+    llm._init_semi_p(handle.inst, handle.agents,
+                     forced_route_support_rpc=summary.get("forced_route_support_rpc", False))
     llm._start_death_watch(llm._on_child_death)
     logger.info("semi_p: front end attached in %.2fs (serve_core %.2fs, "
                 "AsyncLLM %.2fs, %s)", time.perf_counter() - t0, t_serve, t_llm,

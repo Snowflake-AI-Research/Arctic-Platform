@@ -220,7 +220,7 @@ def test_serve_core_swaps_class_and_sets_proc_state(child, fake_vllm):
     assert core.reject_new_requests is False
     assert core.addresses == _ZmqAddresses(inputs=["ipc:///tmp/in"],
                                            outputs=["ipc:///tmp/out"])
-    assert summary == child["_semip_core_summary"](core.vllm_config)
+    assert summary == dict(child["_semip_core_summary"](core.vllm_config), forced_route_support_rpc=True)
 
     core.output_thread.join(timeout=5)
     assert sorted(core.socket_calls) == [
