@@ -2198,6 +2198,7 @@ class ReplicaPool:
                 try:
                     healthy = await asyncio.wait_for(w.is_healthy.remote(), timeout=30)
                 except Exception as exc:
+                    self._scheduler.record_worker_error(w, exc)
                     logger.warning(
                         "Worker %d health check failed; %s: %s",
                         i,

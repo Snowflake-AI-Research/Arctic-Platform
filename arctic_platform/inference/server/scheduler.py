@@ -63,7 +63,15 @@ class WorkerState:
     def schedulable(self) -> bool:
         return self.available and not self.quarantined
 
-    def quarantine(self) -> None:
+    def record_death(self, error: BaseException) -> bool:
+        """Quarantine this worker if ``error`` shows that its actor or engine died."""
+        death = next((cls for cls in (EngineDeadError, ray.exceptions.ActorDiedError) if isinstance(error, cls)), None)
+        if death is not None:
+            self.quarantine(death)
+        return death is not None
+
+    def quarantine(self, death: type[Exception] | None = None) -> None:
+        self.death = self.death or death
         self.quarantined = True
         self.available = False
 
@@ -307,6 +315,12 @@ class Scheduler:
                 pass
         raise RuntimeError("Scheduler stopped")
 
+    def record_worker_error(self, handle: ray.actor.ActorHandle, error: Exception) -> None:
+        """Record a control call's failure against the worker still on ``handle``."""
+        for ws in self._workers:
+            if ws.handle is handle and ws.record_death(error):
+                self._notify()
+
     def mark_worker_unavailable(self, idx: int) -> None:
         self._check_idx(idx)
         self._workers[idx].available = False
@@ -318,9 +332,11 @@ class Scheduler:
 
     def update_worker_handle(self, idx: int, new_handle: ray.actor.ActorHandle) -> None:
         self._check_idx(idx)
-        self._workers[idx].handle = new_handle
-        self._workers[idx].quarantined = False
-        self._workers[idx].death = None
+        old = self._workers[idx]
+        self._waiting.extendleft(reversed(old.waiting))
+        old.waiting.clear()
+        # In-flight calls and streams keep their original actor and its counters.
+        self._workers[idx] = WorkerState(new_handle, available=old.available)
         try:
             new_handle.set_replica_id.remote(idx)
         except Exception:
@@ -350,8 +366,7 @@ class Scheduler:
         ws = self._workers.pop()
         self._waiting.extendleft(reversed(ws.waiting))
         ws.waiting.clear()
-        if self._waiting and self._pool_error() is not None:
-            self._drain()
+        self._notify()
 
     async def shutdown(self) -> None:
         self._stopped = True
@@ -488,8 +503,8 @@ class Scheduler:
         return min(candidates, key=lambda k: self._workers[k].active_requests, default=None)
 
     def _pool_error(self) -> type[Exception] | None:
-        """A confirmed generate death to report when quarantine covers the whole pool."""
-        if any(not w.quarantined for w in self._workers):
+        """A recorded death when every replica is quarantined and admission is active."""
+        if self._paused or any(not w.quarantined for w in self._workers):
             return None
         return next((w.death for w in self._workers if w.death is not None), None)
 
@@ -497,7 +512,7 @@ class Scheduler:
         """Send ``req`` to a worker, failing it if the send raises, or False while none can take it."""
         ws = self._take(req)
         if ws is None:
-            if not self._paused and (death := self._pool_error()) is not None:
+            if (death := self._pool_error()) is not None:
                 req.future.set_exception(death())
                 return True
             return False
@@ -508,16 +523,13 @@ class Scheduler:
             req.future.set_exception(exc)
             return True
         ws.inflight.add(future)
-        future.add_done_callback(functools.partial(self._done, req, ws, ws.handle, time.time()))
+        future.add_done_callback(functools.partial(self._done, req, ws, time.time()))
         return True
 
-    def _done(
-        self, req: _Request, ws: WorkerState, handle: ray.actor.ActorHandle, submitted_time: float,
-        future: asyncio.Future,
-    ) -> None:
+    def _done(self, req: _Request, ws: WorkerState, submitted_time: float, future: asyncio.Future) -> None:
         ws.inflight.discard(future)
         ws.active_requests -= 1
-        death = None
+        died = False
         if future.cancelled():
             error: BaseException | None = RuntimeError("Request cancelled for weight update")
         elif (error := future.exception()) is not None:
@@ -525,15 +537,9 @@ class Scheduler:
                 "Worker %d generate failed for request %d: %s: %s",
                 req.worker_idx, req.id, type(error).__name__, error, exc_info=error,
             )
-            if not self._stopped:
-                death_types = (EngineDeadError, ray.exceptions.ActorDiedError)
-                death = next((cls for cls in death_types if isinstance(error, cls)), None)
-        # A late failure from an old actor must not quarantine its replacement.
-        if death and ws.handle is handle:
-            ws.death = death
-            ws.quarantine()
+            died = not self._stopped and ws.record_death(error)
         # Re-route once: a request that itself kills engines must not walk through every replica.
-        if death and not req.rerouted and any(not w.quarantined for w in self._workers):
+        if died and not req.rerouted and any(not w.quarantined for w in self._workers):
             req.rerouted = True
             self._waiting.appendleft(req)
         elif error is not None:

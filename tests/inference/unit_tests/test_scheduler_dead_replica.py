@@ -17,14 +17,16 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import ray
 from vllm.v1.engine.exceptions import EngineDeadError
 
+from arctic_platform.inference.server.replica_pool import ReplicaPool
 from arctic_platform.inference.server.scheduler import Scheduler
 from arctic_platform.inference.server.testing import RemoteMock
+from arctic_platform.inference.server.worker import InferenceWorker, WorkerLifecycleState
 
 DEATHS = [ray.exceptions.ActorDiedError, EngineDeadError]
 pytestmark = pytest.mark.asyncio
@@ -84,3 +86,29 @@ async def test_late_death_does_not_quarantine_a_replacement():
     scheduler.mark_worker_available(0)
     assert await asyncio.wait_for(future, timeout=1) == {"text": "p"}
     assert scheduler.is_worker_available(0)
+
+
+async def test_health_monitor_removes_a_dead_engine_before_generate(monkeypatch):
+    replica = InferenceWorker.__ray_metadata__.modified_class()
+    replica.state = WorkerLifecycleState.READY
+    replica.llm = MagicMock()
+    replica.llm.check_health = AsyncMock(side_effect=EngineDeadError)
+    dead, live = _worker(), _worker()
+    pool = ReplicaPool()
+    pool._workers = [dead, live]
+    pool._scheduler = Scheduler(pool._workers, capacity=1)
+
+    def finish_poll():
+        pool._stop_monitoring = True
+        return True
+
+    dead.is_healthy.remote = RemoteMock(side_effect=replica.is_healthy)
+    live.is_healthy.remote = RemoteMock(side_effect=finish_poll)
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+    await asyncio.wait_for(pool._monitor_health(), 1)
+    pool._scheduler._keys["group"] = 0
+    assert await pool.generate([1], {}, routing_key="group") == [{"text": [1]}]
+    dead.generate.remote.assert_not_called()
+    pool._scheduler.remove_last_worker()
+    with pytest.raises(EngineDeadError):
+        await asyncio.wait_for(pool.generate([1], {}), 1)
