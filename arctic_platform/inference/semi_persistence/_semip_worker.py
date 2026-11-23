@@ -24,6 +24,18 @@ the withdrawal stays in the warmup ``finally``.
 registration for that earlier capture alone, as the fallback if the copy path
 turns out not to cover every pointer it records. Off by default.
 
+``init_device`` also installs ``spin_clock`` for good, so a rank restored on a
+host that booted later than the dump host is idle rather than spinning.
+
+It also routes TP all-gathers through CustomAllreduce (``ca_all_gather``) for
+good, so the captured graphs hold no NCCL all-gather and the dump keeps them
+for rebind instead of dropping them for a recapture.
+
+``load_model`` moves large pinned host parameters into mappings semi_p can
+empty at the dump (``host_weights``), before anything captures their address.
+Before the model is built it refuses Inkling2's multicast all-reduce workspace
+(``SEMIP_SUPPRESS_INKLING2_AR_WORKSPACE``, defaulted on by ``vllm_child``).
+
 Both hooks return whatever the base class returns, so this stays agnostic to
 the ``compile_or_warm_up_model`` return type (a float on older vLLM, a
 ``CompilationTimes`` on newer).
@@ -82,8 +94,100 @@ class SemipGPUWorker(Worker):
         # nothing for Python to catch. Install here so both captures record
         # only the pre-registered staging buffer.
         self._semip_install_force_copy("init_device")
+        self._semip_install_custom_all_gather("init_device")
         self._semip_arm_profile_register_guard()
+        self._semip_install_spin_clock()
         return result
+
+    def load_model(self, *args, **kwargs):
+        refusing = self._semip_refuse_inkling2_ar()
+        result = super().load_model(*args, **kwargs)
+        if refusing:
+            import ca_graph_rebind
+            state = ca_graph_rebind.inkling2_ar_refusal_state()
+            print(f"[inkling2-ar] rank={self.rank} refused={state['refused']}",
+                  flush=True)
+        self._semip_thin_pinned_params()
+        return result
+
+    def _semip_refuse_inkling2_ar(self):
+        """Keep Inkling2's model-owned multicast all-reduce workspace out of
+        the image (``ca_graph_rebind.install_inkling2_ar_refusal``). Before
+        ``super().load_model``, which is where the model builds it. True when
+        the refusal is in place."""
+        try:
+            import ca_graph_rebind
+        except Exception as exc:  # noqa: BLE001
+            print(f"[inkling2-ar] ca_graph_rebind unavailable: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
+            return False
+        info = ca_graph_rebind.install_inkling2_ar_refusal()
+        print(f"[inkling2-ar] rank={self.rank} active={info['active']} "
+              f"suppress={info['suppress']} err={info['err']}", flush=True)
+        return info["active"]
+
+    def _semip_thin_pinned_params(self):
+        """Rehome the large pinned host parameters (``host_weights``) and say
+        what moved.  Before ``determine_available_memory``'s profiling
+        capture, the first thing to bake a parameter's address into a graph.
+        A failure costs the thinning, not the load: whatever moved before it
+        stays tracked in ``_semip_host``."""
+        try:
+            import host_weights
+        except Exception as exc:  # noqa: BLE001
+            print(f"[semip-host] rank={self.rank} host_weights unavailable: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
+            return
+        if not host_weights.enabled():
+            print(f"[semip-host] rank={self.rank} off ({host_weights.FLAG_ENV}=0)",
+                  flush=True)
+            return
+        self._semip_host = host_weights.HostWeights()
+        try:
+            host_weights.rehome(self, self._semip_host)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[semip-host] rank={self.rank} rehome failed after "
+                  f"{len(self._semip_host)} param(s): {type(exc).__name__}: {exc}",
+                  flush=True)
+        print(f"[semip-host] rank={self.rank} "
+              f"{host_weights.describe(self._semip_host)}", flush=True)
+
+    def _semip_install_custom_all_gather(self, where):
+        """Route TP all-gathers through CustomAllreduce and say what stuck.
+
+        Never withdrawn: the restore's ``reinit_nccl`` builds a fresh
+        CustomAllreduce whose all-gather limit the patch has to widen, and a
+        recapture after a dropped dump has to capture the kernels the cold
+        start did. Idempotent, so a later call re-states the counts; a
+        non-empty ``capture_fallback`` after the warmup capture is an NCCL
+        all-gather in a kept graph, which the dump-time census will count."""
+        try:
+            import ca_all_gather
+        except Exception as exc:  # noqa: BLE001
+            print(f"[custom-ag] install({where}): ca_all_gather unavailable: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
+            return
+        info = ca_all_gather.install()
+        print(f"[custom-ag] install({where}): active={info['active']} "
+              f"err={info['err']} widened={info['widened']} "
+              f"multicast_present={info['multicast_present']} "
+              f"custom={info['custom']} fallback={info['fallback']} "
+              f"capture_fallback={info['capture_fallback']} "
+              f"max_custom_bytes={info['max_custom_bytes']}", flush=True)
+
+    def _semip_install_spin_clock(self):
+        """Time the shm_broadcast idle spin on the wall clock (see
+        `spin_clock`). Never withdrawn: it has to ride into the CRIU image,
+        so that a restored rank is idle when `cuda_restore` waits for it."""
+        try:
+            import spin_clock
+        except Exception as exc:  # noqa: BLE001
+            print(f"[spin-clock] unavailable: {type(exc).__name__}: {exc}",
+                  flush=True)
+            return
+        info = spin_clock.install()
+        print(f"[spin-clock] install: active={info['active']} err={info['err']}",
+              flush=True)
 
     def _semip_install_fi_ar_probe(self, where):
         """Install the workspace probe and say what stuck. Idempotent: the
@@ -97,7 +201,7 @@ class SemipGPUWorker(Worker):
         info = ca_graph_rebind.install_fi_ar_workspace_probe()
         print(f"[fi-ar-probe] install({where}): patched={info['patched']} "
               f"missing={info['missing']} suppress={info['suppress']} "
-              f"err={info['err']}", flush=True)
+              f"latched={info.get('latched')} err={info['err']}", flush=True)
 
     def _semip_install_force_copy(self, where):
         """Install the CustomAllreduce copy-path patch and say what stuck.
@@ -202,6 +306,7 @@ class SemipGPUWorker(Worker):
             if keep_graphs:
                 ca_graph_rebind.restore_keepgraph_patch()
             ca_graph_rebind.restore_fi_ar_workspace_probe()
+        self._semip_install_custom_all_gather("warmup")
         if not keep_graphs:
             print("[semip] multi-node: keep-graph patch, instantiate pass and "
                   "census skipped; graphs are dropped at dump and recaptured "
