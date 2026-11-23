@@ -76,13 +76,18 @@ def _equal_element_bytes(left, right):
 
 def tensor_manifest(value) -> dict:
     """Hash exact logical tensor bytes without a tensor-sized staging allocation."""
+    return _manifest_from_parts(value, (value,))
+
+
+def _manifest_from_parts(value, parts) -> dict:
     import torch
 
     if value.layout != torch.strided or value.device.type == "meta":
         raise ValueError("weight-sync manifest requires materialized strided tensors")
     digest = hashlib.sha256()
     elements = max(1, _MANIFEST_CHUNK_BYTES // value.element_size())
-    for part in _manifest_chunks(value.detach(), elements):
+    chunks = (chunk for part in parts for chunk in _manifest_chunks(part.detach(), elements))
+    for part in chunks:
         flat = part.contiguous().reshape(-1)
         # A singleton can be contiguous with a nonunit stride, which a dtype view rejects.
         if flat.stride(0) != 1:
@@ -725,6 +730,19 @@ class ShadowVerifier:
         self.received[name] = entry
         self.touched.update(live.written | live_pending)
         self._offload_pending(replay_staging())
+
+    @contextmanager
+    def observe_cutlass_swap(self, name):
+        """Derive the expected [up, gate] digest from the verified [gate, up] bytes."""
+        digests = self.completed.get(self.storage_keys[name], {})
+        if name in digests:
+            value = self.registered[name]
+            if tensor_manifest(value) != digests[name]:
+                self.changed.add(name)
+            # Hash each expert in swapped order without allocating another expert weight.
+            parts = (half for expert in value for half in reversed(expert.chunk(2, dim=-2)))
+            digests[name] = _manifest_from_parts(value, parts)
+        yield
 
     def load(self, name, value, *, loader=None):
         """Debug-only convenience for a live load and its private shadow replay."""
@@ -1446,6 +1464,26 @@ def maybe_observe_fp8_tensor(verifier, updater, replay, name, value):
         return
     staging = (_fp8_staging(verifier, updater), _fp8_staging(verifier, replay))
     with verifier.observe_load(name, value, loader=replay.feed, staging=staging):
+        yield
+
+
+@contextmanager
+def maybe_scope_broadcast_verifier(verifier):
+    """Make a finished load's verifier current again for the receiver's own writes after that load."""
+    token = _BROADCAST_LOAD_VERIFIER.set(verifier)
+    try:
+        yield
+    finally:
+        _BROADCAST_LOAD_VERIFIER.reset(token)
+
+
+@contextmanager
+def maybe_observe_cutlass_swap(name):
+    verifier = _BROADCAST_LOAD_VERIFIER.get()
+    if verifier is None:
+        yield
+        return
+    with verifier.observe_cutlass_swap(name):
         yield
 
 
