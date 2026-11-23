@@ -85,6 +85,10 @@ if "vllm" not in sys.modules:
     structured_output.__path__ = []
     sys.modules["vllm.v1.structured_output"] = structured_output
     sys.modules["vllm.v1.structured_output.backend_xgrammar"] = xgrammar_mod
+    # The forced-routes patch wraps Model Runner V2 classes this stand-in vLLM does not provide.
+    forced_routes_module = types.ModuleType("arctic_platform.inference.vllm.forced_routes")
+    forced_routes_module.ensure_forced_routes_patch = lambda: None
+    sys.modules[forced_routes_module.__name__] = forced_routes_module
     for name in ("vllm.v1", "vllm.v1.core", "vllm.v1.core.sched", "vllm.v1.metrics"):
         sys.modules[name].__path__ = []
 
