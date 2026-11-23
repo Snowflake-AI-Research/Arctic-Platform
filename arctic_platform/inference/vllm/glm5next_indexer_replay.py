@@ -20,10 +20,11 @@ With ``additional_config={"arctic_router_replay_indexer": True}`` (for the Arcti
 layout of ``arctic_platform.common.glm5next_indexer_replay``.
 """
 
-import re
 import sys
+from copy import copy
 
-from arctic_platform.common.glm5next_indexer_replay import capture_pools
+import torch
+
 from arctic_platform.common.glm5next_indexer_replay import pool_rows
 from arctic_platform.common.glm5next_indexer_replay import sparse_layers
 
@@ -47,6 +48,7 @@ def _layout(vllm_config) -> tuple[int, int] | None:
 
 def ensure_glm5next_indexer_replay() -> None:
     from vllm.model_executor.layers.fused_moe import routed_experts_capturer
+    from vllm.model_executor.models.utils import extract_layer_index
 
     if getattr(routed_experts_capturer.bind_routed_experts_capturer, "_arctic_indexer_replay", False):
         return
@@ -70,7 +72,7 @@ def ensure_glm5next_indexer_replay() -> None:
             layout = _layout(vllm_config)
             if layout is None:
                 continue
-            layer = int(re.search(r"layers\.(\d+)\.", module.prefix).group(1))
+            layer = extract_layer_index(module.prefix)
             num_layers = vllm_config.model_config.get_total_num_hidden_layers()
             if layer >= num_layers:  # MTP layers sit past the capture
                 continue
@@ -78,16 +80,18 @@ def ensure_glm5next_indexer_replay() -> None:
             rows, _ = layout
             first_row = num_layers + sparse_layers(module.config).index(layer) * rows
 
-            def forward(hidden_states, *args, _row=first_row, _forward=op._forward_method, _module=module, **kwargs):
-                topk_indices = _forward(hidden_states, *args, **kwargs)
-                capture_pools(
-                    capturer.capture,
-                    _row,
-                    topk_indices[: hidden_states.shape[0]],
-                    _module.topk_tokens,
-                    _module.index_kpool,
-                    _module.config.num_experts_per_tok,
-                )
+            # The same vLLM capture operation restores DP/TP rows and offsets microbatches for the whole pool list.
+            pool_capture = copy(capturer)
+            width = rows * module.config.num_experts_per_tok
+            pool_capture.shape_per_token = (1, width)
+            pool_capture.device_buffer = capturer.device_buffer[:, first_row : first_row + rows].view(-1, 1, width)
+
+            def forward(hidden_states, *args, _op=op._forward_method, _capture=pool_capture, _module=module, **kwargs):
+                topk_indices = _op(hidden_states, *args, **kwargs)
+                k = _module.index_kpool
+                # The last token distinguishes complete pools from a short prefill's partial tail.
+                last = topk_indices[: hidden_states.shape[0], k - 1 : _module.topk_tokens : k]
+                _capture.capture(0, torch.div(last, k, rounding_mode="floor") + 1)
                 return topk_indices
 
             op._forward_method = forward  # CustomOp dispatches through the method it bound at construction

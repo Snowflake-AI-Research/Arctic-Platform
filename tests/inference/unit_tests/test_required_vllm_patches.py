@@ -1,7 +1,6 @@
 from arctic_platform.inference.vllm import config
 from arctic_platform.inference.vllm import deepseek_v41_lora
 from arctic_platform.inference.vllm import dense_prompt_logprobs
-from arctic_platform.inference.vllm import glm5next_indexer_replay
 from arctic_platform.inference.vllm import glm5next_lora
 from arctic_platform.inference.vllm import hybrid_state_fixes
 from arctic_platform.inference.vllm import kv_group_size
@@ -53,11 +52,6 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
     )
     monkeypatch.setattr(glm5next_lora, "ensure_glm5next_lora", lambda: calls.append("glm5next_lora"))
     monkeypatch.setattr(
-        glm5next_indexer_replay,
-        "ensure_glm5next_indexer_replay",
-        lambda: calls.append("glm5next_indexer_replay"),
-    )
-    monkeypatch.setattr(
         kv_group_size,
         "ensure_kv_group_size_patch",
         lambda: calls.append("kv_group_size"),
@@ -89,7 +83,6 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "hybrid_state",
         "tp_spec_decode_sync",
         "glm5next_lora",
-        "glm5next_indexer_replay",
         "kv_group_size",
         "dflash_max_position",
         "mrope_yarn",

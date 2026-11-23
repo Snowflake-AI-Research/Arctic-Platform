@@ -140,7 +140,7 @@ def _check_model_parity(device, tiny_glm_sparse_model):
         gradients = {name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None}
         return output.detach(), loss.detach(), gradients
 
-    def eager(indexer, hidden, residual, mask, boundaries, *, cp_group, cp_rank):
+    def eager(indexer, hidden, residual, mask, boundaries, *, cp_group, cp_rank, **kwargs):
         key = indexer.k_norm(indexer.wk(hidden))
         gates = F.linear(hidden, indexer.index_kpool_compress_gate)
         packed = torch.cat((key, gates, mask[..., None].to(key.dtype)), dim=-1)

@@ -15,8 +15,6 @@
 
 """Layout of the GLM-5.3 pool selections appended to routed-expert records."""
 
-import torch
-
 SPARSE_LAYER_TYPES = ("deepseek_sparse_attention", "indexed_attention")
 
 
@@ -29,11 +27,3 @@ def pool_rows(text_config) -> int | None:
 
 def sparse_layers(text_config) -> list[int]:
     return [i for i, kind in enumerate(text_config.layer_types) if kind in SPARSE_LAYER_TYPES]
-
-
-def capture_pools(capture, first_row: int, topk_indices: torch.Tensor, topk_tokens: int, kpool: int, top_k: int):
-    """Read each complete pool's last token. One-based pool IDs reserve zero for missing capture rows."""
-    last_tokens = topk_indices[:, kpool - 1 : topk_tokens : kpool]
-    pools = torch.div(last_tokens, kpool, rounding_mode="floor") + 1
-    for row, ids in enumerate(pools.split(top_k, dim=1)):
-        capture(first_row + row, ids)

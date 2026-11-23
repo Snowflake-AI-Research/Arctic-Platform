@@ -96,6 +96,14 @@ def _normalize_cu_seqlens(
     return cu_seqlens
 
 
+def _replay_pools(own: torch.Tensor, own_valid: torch.Tensor, sampler: torch.Tensor) -> torch.Tensor:
+    """The sampler's complete, visible pool IDs for each query that captured any, else the trainer's own; -1 unused.
+
+    The chosen IDs then expand through the ordinary indexer path, with its boundaries, visibility and partial tail."""
+    own = own.to(torch.int32).masked_fill(~own_valid, -1)
+    return torch.where((sampler >= 0).any(-1, keepdim=True), sampler, own)
+
+
 def _unpadded_segment_indices(
     indexer: nn.Module,
     query: torch.Tensor,
@@ -103,6 +111,7 @@ def _unpadded_segment_indices(
     segment_states: torch.Tensor,
     query_positions: torch.Tensor,
     output_width: int,
+    replay: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``_select_sparse_indices`` for one segment without padding, minus its dense intermediates.
 
@@ -142,8 +151,13 @@ def _unpadded_segment_indices(
             width,
         )
         chosen = fp8_indexer.topk_indices(scores, min(select_k, width))
+        valid = chosen < visible[:, None]
+        if replay is not None:
+            sampler = replay[start:stop, : chosen.shape[-1]]
+            chosen = _replay_pools(chosen, valid, sampler.masked_fill(sampler >= visible[:, None], -1))
+            valid = chosen >= 0
         tokens = chosen[..., None] * kpool + pool_offsets
-        tokens = tokens.masked_fill((chosen >= visible[:, None])[..., None], -1).flatten(1)
+        tokens = tokens.masked_fill(~valid[..., None], -1).flatten(1)
         pieces = [F.pad(tokens, (0, select_k * kpool - tokens.shape[1]), value=-1)]
         if indexer.index_kpool_always_select_tail:
             seen = query_positions[start:stop] + 1
@@ -165,6 +179,7 @@ def _select_sparse_indices(
     *,
     cp_group,
     cp_rank: int,
+    replay: torch.Tensor | None = None,
 ) -> torch.Tensor:
     batch_size, local_length = hidden_states.shape[:2]
     hidden_shape = (batch_size, local_length, -1, indexer.head_dim)
@@ -217,6 +232,7 @@ def _select_sparse_indices(
                 segment_states,
                 torch.arange(local_start - start, local_end - start, device=hidden_states.device),
                 output_width,
+                replay[segment_queries] if replay is not None else None,
             )
             topk_indices[0, segment_queries] = torch.where(segment_topk >= 0, segment_topk + start, segment_topk)
             continue
@@ -249,6 +265,14 @@ def _select_sparse_indices(
             select_k = min(indexer.index_topk // indexer.index_kpool, index_scores.shape[-1])
             selected = index_scores.topk(select_k, dim=-1).indices
             selected_valid = valid_candidates.gather(-1, selected)
+            if replay is not None:
+                sampler = replay[query_slice, :select_k]
+                safe = sampler.clamp(0, valid_candidates.shape[-1] - 1).long()
+                usable = (sampler < valid_candidates.shape[-1]) & valid_candidates[0].gather(-1, safe)
+                usable &= attention_mask[0, query_slice, None]
+                selected = _replay_pools(selected[0], selected_valid[0], sampler.masked_fill(~usable, -1))
+                selected_valid = (selected >= 0)[None]
+                selected = selected.clamp_min(0)[None]
             selected_indices = pool_indices[batch_idx, selected]
             selected_indices.masked_fill_(
                 ~selected_valid[..., None].expand_as(selected_indices),
@@ -555,80 +579,6 @@ def _pad_sparse_indices(indices: torch.Tensor, multiple: int = 128) -> torch.Ten
     return F.pad(indices, (0, padded_width - width), value=-1)
 
 
-def _replayed_sparse_indices(
-    pools: torch.Tensor,
-    own: torch.Tensor,
-    global_cu_seqlens: torch.Tensor,
-    query_offset: int,
-    kpool: int,
-) -> torch.Tensor:
-    """Expand one-based pool IDs within each packed row. Zero-filled and fresh (-1) queries keep their own selection."""
-    # Token indices are int32 like ``own`` and ``global_cu_seqlens``: pool ids stay below 2**16, packed rows below 2**31.
-    positions = query_offset + torch.arange(pools.shape[1], dtype=own.dtype, device=own.device)
-    start = global_cu_seqlens[torch.searchsorted(global_cu_seqlens, positions, right=True) - 1]
-    seen = positions - start + 1
-    pools = pools[0].to(device=own.device, dtype=own.dtype) - 1
-    # A pool counts only once its last token is visible, so a replayed selection stays causal by construction.
-    pools = pools.masked_fill(pools >= torch.div(seen, kpool, rounding_mode="floor")[:, None], -1)
-    offsets = torch.arange(kpool, dtype=own.dtype, device=own.device)
-    tokens = torch.where(pools[..., None] >= 0, (start[:, None] + pools * kpool)[..., None] + offsets, -1)
-    tail_count = seen % kpool
-    tail = ((seen - tail_count + start)[:, None] + offsets[:-1]).masked_fill(offsets[:-1] >= tail_count[:, None], -1)
-    replayed = torch.cat([tokens.flatten(1), tail], dim=1)
-    if replayed.shape[-1] != own.shape[-1]:
-        replayed = F.pad(replayed, (0, own.shape[-1] - replayed.shape[-1]), value=-1)
-    return torch.where((pools >= 0).any(-1)[None, :, None], replayed[None], own)
-
-
-def _selection_agreement(
-    pools: torch.Tensor,
-    own: torch.Tensor,
-    global_cu_seqlens: torch.Tensor,
-    query_offset: int,
-    kpool: int,
-    topk: int,
-) -> torch.Tensor:
-    """Compare the trainer's own pool choice with the sampler's captured one, query by query.
-
-    Returns int64 ``[captured queries, queries whose pool sets differ, pools only the trainer chose, pools only the
-    sampler chose]`` on the device, without a host sync. A query with no captured pool is not counted.
-    """
-    positions = query_offset + torch.arange(pools.shape[1], dtype=global_cu_seqlens.dtype, device=own.device)
-    start = global_cu_seqlens[torch.searchsorted(global_cu_seqlens, positions, right=True) - 1].to(torch.int64)
-    sampler = pools[0].to(device=own.device, dtype=torch.int64) - 1
-    # Each selected pool is kpool consecutive token ids; its last one names the pool, as the sampler's capture does.
-    last = own[0, :, kpool - 1 : topk : kpool].to(torch.int64)
-    trainer = torch.where(last >= 0, torch.div(last - start[:, None], kpool, rounding_mode="floor"), -1)
-    ordered = torch.where(sampler >= 0, sampler, torch.iinfo(torch.int64).max).sort(-1).values
-    found = torch.searchsorted(ordered, trainer.clamp(min=0)).clamp(max=ordered.shape[-1] - 1)
-    common = ((ordered.gather(-1, found) == trainer) & (trainer >= 0)).sum(-1)
-    trainer_only = (trainer >= 0).sum(-1) - common
-    sampler_only = (sampler >= 0).sum(-1) - common
-    captured = (sampler >= 0).any(-1)
-    return torch.stack(
-        [
-            captured.sum(),
-            (captured & (trainer_only + sampler_only > 0)).sum(),
-            (trainer_only * captured).sum(),
-            (sampler_only * captured).sum(),
-        ]
-    )
-
-
-def pop_indexer_selection_agreement(model: nn.Module) -> dict[str, list[int]]:
-    """Each replaying indexer's selection agreement summed since the last call, then cleared.
-
-    Values are ``_selection_agreement``'s four counts. A forward recomputed for activation checkpointing adds its
-    counts again. Repeating all contributions equally preserves the per-layer ratios.
-    """
-    agreement = {}
-    for name, module in model.named_modules():
-        counts = module.__dict__.pop("_indexer_selection_agreement", None)
-        if counts is not None:
-            agreement[name] = counts.tolist()
-    return agreement
-
-
 def _sparse_attention_forward(
     self,
     hidden_states: torch.Tensor,
@@ -675,6 +625,9 @@ def _sparse_attention_forward(
                 dtype=torch.int32,
                 device=hidden_states.device,
             )
+        replay = None
+        if indexer_pools is not None:  # one-based pool IDs; zero marks an empty slot
+            replay = indexer_pools[0].to(device=hidden_states.device, dtype=torch.int32) - 1
         topk_indices = _select_sparse_indices(
             self.indexer,
             hidden_states,
@@ -683,25 +636,8 @@ def _sparse_attention_forward(
             global_cu_seqlens,
             cp_group=self._cp_group,
             cp_rank=self._cp_rank,
+            replay=replay,
         )
-        if indexer_pools is not None:
-            agreement = _selection_agreement(
-                indexer_pools,
-                topk_indices,
-                global_cu_seqlens,
-                self._cp_rank * local_length,
-                self.indexer.index_kpool,
-                self.indexer.index_topk,
-            )
-            previous = getattr(self, "_indexer_selection_agreement", None)
-            self._indexer_selection_agreement = agreement if previous is None else previous + agreement
-            topk_indices = _replayed_sparse_indices(
-                indexer_pools,
-                topk_indices,
-                global_cu_seqlens,
-                self._cp_rank * local_length,
-                self.indexer.index_kpool,
-            )
     elif prev_topk_indices is None:
         raise ValueError("Shared DSA layers require top-k indices from a previous full indexer layer.")
     else:
