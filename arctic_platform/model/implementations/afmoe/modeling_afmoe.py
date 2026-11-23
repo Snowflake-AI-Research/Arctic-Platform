@@ -21,6 +21,7 @@ from transformers.utils import TransformersKwargs
 from arctic_platform.common.packing.layout import get_stashed_layout
 from arctic_platform.common.packing.layout import prefix_varlen_args
 from arctic_platform.common.packing.layout import register_native_prefix_attention
+from arctic_platform.common.packing.layout import require_dense_attention_layout
 from arctic_platform.model.implementations.moe.base import PreTrainedModelPrimeRL
 from arctic_platform.model.implementations.layers.attn import flash_attn_3_varlen_func
 from arctic_platform.model.implementations.layers.attn import flash_attn_4_varlen_func
@@ -147,9 +148,7 @@ class AfmoeSDPAAttention(AfmoeAttentionBase):
         attention_mask: torch.Tensor | None = None,
         dropout_p: float = 0.0,
     ) -> torch.Tensor:
-        layout = get_stashed_layout(self)
-        if layout is not None and layout.has_sharing:
-            raise ValueError("prefix sharing requires FlashAttention; SDPA has no prefix-continuation path in this PR")
+        require_dense_attention_layout(type(self).__name__, get_stashed_layout(self))
         return F.scaled_dot_product_attention(
             query_states,
             key_states,

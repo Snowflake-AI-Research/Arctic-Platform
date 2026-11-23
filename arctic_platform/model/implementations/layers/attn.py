@@ -1,5 +1,4 @@
 import functools
-import inspect
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
@@ -11,6 +10,7 @@ from torch import nn
 from arctic_platform.common.packing.layout import get_stashed_layout
 from arctic_platform.common.packing.layout import prefix_varlen_args
 from arctic_platform.common.packing.layout import register_native_prefix_attention
+from arctic_platform.common.packing.layout import require_dense_attention_layout
 
 from .norms import RMSNorm, RMSNormConfig
 from .rotary_emb import apply_rotary_pos_emb
@@ -33,13 +33,6 @@ try:
 except (ImportError, AttributeError):
     flash_attn_4_varlen_func = None  # type: ignore
 
-# The flash_attn 2.8 bundled FA4 has no max_seqlen arguments; flash-attn-4 4.x sizes its work to the packed width
-# without them.
-_FA4_TAKES_MAX_SEQLEN = (
-    flash_attn_4_varlen_func is not None
-    and "max_seqlen_k" in inspect.signature(flash_attn_4_varlen_func).parameters
-)
-
 
 def flash_varlen_call(
     call: Callable,
@@ -60,8 +53,9 @@ def flash_varlen_call(
         # so cu_seqlens must be passed as keyword args to avoid misalignment.
         kwargs["cu_seqlens_q"] = cu_seqlens_q
         kwargs["cu_seqlens_k"] = cu_seqlens_k
-        # max_seqlen is GPU-checked only under prefix sharing; other FA4 calls keep sizing to the packed width.
-        if sharing and _FA4_TAKES_MAX_SEQLEN:
+        # max_seqlen is GPU-checked only under prefix sharing, which using_layout allows only on a flash-attn-4
+        # that takes it; other FA4 calls keep sizing to the packed width.
+        if sharing:
             kwargs["max_seqlen_q"] = max_seqlen_q
             kwargs["max_seqlen_k"] = max_seqlen_k
         out = call(q, k, v, **kwargs)
@@ -308,9 +302,7 @@ class SDPAAttention(nn.Module):
     ) -> torch.Tensor:
         key_states = key_states.repeat_interleave(self.num_key_value_groups, dim=1)
         value_states = value_states.repeat_interleave(self.num_key_value_groups, dim=1)
-        layout = get_stashed_layout(self)
-        if layout is not None and layout.has_sharing:
-            raise ValueError("prefix sharing requires FlashAttention; SDPA has no prefix-continuation path in this PR")
+        require_dense_attention_layout(type(self).__name__, get_stashed_layout(self))
         out = F.scaled_dot_product_attention(query_states, key_states, value_states, is_causal=True)
         out = out.transpose(1, 2).contiguous()
         return out.view(out.shape[0], out.shape[1], -1)

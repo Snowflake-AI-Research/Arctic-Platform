@@ -46,6 +46,7 @@ from arctic_platform.common.packing.layout import unshared_groups
 from arctic_platform.model.implementations.afmoe import modeling_afmoe as afmoe_module
 from arctic_platform.model.implementations.afmoe.modeling_afmoe import AfmoeAttentionConfig
 from arctic_platform.model.implementations.afmoe.modeling_afmoe import AfmoeFlashAttention
+from arctic_platform.model.implementations.afmoe.modeling_afmoe import AfmoeSDPAAttention
 from arctic_platform.model.implementations.layers import attn as attn_module
 from arctic_platform.model.implementations.layers.attn import AttentionConfig
 from arctic_platform.model.implementations.layers.attn import FlashAttention
@@ -74,6 +75,7 @@ def _reference_flash_attn(monkeypatch):
     monkeypatch.setattr(
         layout_module, "_installed_version", {"flash_attn": (2, 8), "flash_attn_3": (3, 0), "flash_attn_4": (4, 0)}.get
     )
+    monkeypatch.setattr(layout_module, "_fa4_varlen_backward_available", lambda: True)
 
 
 def _batch():
@@ -290,14 +292,13 @@ def test_ap_stack_needs_its_own_unnested_context():
         other(packed_off["input_ids"], packed_off["position_ids"])
 
 
-def test_fa4_gets_max_seqlen_only_under_sharing(monkeypatch):
+def test_fa4_gets_max_seqlen_only_under_sharing():
     calls = []
 
     def fa4(q, k, v, **kwargs):
         calls.append(kwargs)
         return q
 
-    monkeypatch.setattr(attn_module, "_FA4_TAKES_MAX_SEQLEN", True)
     q = torch.zeros(4, 1, 8)
     cu_q, cu_k = torch.tensor([0, 1, 4]), torch.tensor([0, 3, 6])
     for sharing in (False, True):
@@ -315,6 +316,34 @@ def test_ap_sdpa_is_rejected_under_sharing():
             pass
     with using_layout(module, unshared):
         pass
+
+
+def test_sdpa_refuses_to_run_on_a_packed_layout():
+    """SDPA masks one causal rectangle per row, so packed segments would attend to each other."""
+    batch, groups, _ = _batch()
+    shared, unshared = _layouts(batch, groups)
+    afmoe = AfmoeSDPAAttention(
+        AfmoeAttentionConfig(
+            hidden_size=32,
+            head_dim=HEAD_DIM,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-6,
+            is_local_attention=False,
+        )
+    )
+    # SDPAAttention repeats its 2 KV heads itself; AFMoE's SDPA core expects them already repeated.
+    cases = ((SDPAAttention(_attention_config(use_qk_norm=False)), 2), (afmoe, 4))
+    for module, kv_heads in cases:
+        q = torch.zeros(1, 4, unshared.num_tokens, HEAD_DIM)
+        k = torch.zeros(1, kv_heads, unshared.num_tokens, HEAD_DIM)
+        module._attention_core(q, k, k)
+        with using_layout(module, unshared):
+            with pytest.raises(ValueError, match="no varlen path"):
+                module._attention_core(q, k, k)
+        with using_layout(_ap_attention(), shared):
+            with pytest.raises(ValueError, match="no PackedLayout stashed"):
+                module._attention_core(q, k, k)
 
 
 def _reference_flash_fn(q, k, v, causal=True, softmax_scale=None, window_size=(-1, -1), **unused):
@@ -515,6 +544,27 @@ def test_hf_sliding_window_fails_closed(hf_flash_reference):
             wrapper(attention, q, k, k, None, sliding_window=4)
         with pytest.raises(ValueError, match="already gathered"):
             wrapper(attention, q, k.index_select(2, shared.kv_index), k, None)
+        # One dropout mask on a shared root would stand in for every row's own.
+        with pytest.raises(ValueError, match="dropout"):
+            wrapper(attention, q, k, k, None, dropout=0.1)
+        with pytest.raises(ValueError, match="needs a flash attention implementation, got 'sdpa'"):
+            _hf_prefix_attention_fn(hf_flash_reference.forward, "sdpa")(attention, q, k, k, None)
+
+
+@pytest.mark.parametrize("impl", ["flash_attention_2", "sdpa"])
+def test_hf_attention_refuses_another_models_sharing_context(hf_flash_reference, impl):
+    """The registry wrapper covers every implementation, not just the ones the sharing model uses."""
+    batch, groups, _ = _batch()
+    shared, unshared = _layouts(batch, groups)
+    hf = _hf_model(Qwen3ForCausalLM, _hf_config(Qwen3Config))
+    hf.config._attn_implementation = impl
+    packed_off = pack_with_layout(batch, unshared)
+    original = ALL_ATTENTION_FUNCTIONS[impl]
+    with using_layout(_ap_stack(), shared):
+        with pytest.raises(ValueError, match="Qwen3Attention ran with no PackedLayout stashed"):
+            _hf_logits(hf, packed_off["input_ids"], packed_off["position_ids"])
+    assert ALL_ATTENTION_FUNCTIONS[impl] is original
+    _hf_logits(hf, packed_off["input_ids"], packed_off["position_ids"])
 
 
 def test_hf_qwen3_moe_needs_router_replay_decision(hf_flash_reference):

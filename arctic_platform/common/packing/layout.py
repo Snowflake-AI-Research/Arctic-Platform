@@ -42,9 +42,11 @@ and the Hugging Face registry override are process globals. Reads are not thread
 autograd runs backward, and checkpoint recompute, on its own device threads.
 
 Every model that runs while a context is active needs its own :func:`using_layout` (an
-unshared layout is fine). Arctic-Platform attention with no stash raises while any context
-is active, because ``cu_seqlens_from_position_ids`` would hand it another call's segments;
-Hugging Face attention with no stash raises while a sharing context is active. With nested
+unshared layout is fine). Arctic-Platform attention (flash or SDPA) with no stash raises while
+any context is active, because ``cu_seqlens_from_position_ids`` would hand it another call's
+segments, and SDPA also raises on a layout with several segments. Hugging Face attention that
+dispatches through ``transformers``' registry (every implementation but eager) raises with no
+stash while a sharing context is active. With nested
 contexts the loss and position-id guards fire if any layout in the stack shares, and
 ``cu_seqlens_from_position_ids`` raises when the stack holds more than one layout, since it
 cannot tell which call it is serving.
@@ -53,7 +55,7 @@ Attention reads the layout stashed on its own module. Arctic-Platform ``FlashAtt
 gathers K/V itself. Hugging Face flash attention gets the gather from a wrapper that
 ``using_layout`` puts on ``transformers``' attention registry for the duration of the
 context only; the wrapper passes modules with an unshared stash through and refuses
-already-gathered K/V.
+already-gathered K/V and attention dropout, which would draw one mask for a shared root.
 
 Only flash-attn 2 (>= 2.1, the ``flash_attn`` package), FA3 (the ``flash_attn_3`` package)
 and FA4 (the ``flash-attn-4`` package, not the copy flash_attn 2.8 bundles, which has no
@@ -81,6 +83,7 @@ ids disagree on the prefix are not shared.
 
 from __future__ import annotations
 
+import inspect
 import re
 import sys
 import threading
@@ -107,8 +110,9 @@ from .walk import DROP
 from .walk import map_batch_values
 
 LAYOUT_ATTR = "_arctic_packed_layout"
-# Per-token loss masks the providers in this stack send; nonzero marks a cell the loss reads.
-LOSS_WEIGHT_KEYS = frozenset({"loss_mask", "response_mask"})
+# Per-token loss masks the providers in this stack send; nonzero marks a cell the loss reads. ECHO's
+# ``sft_mask`` / ``echo_observation_mask`` sit outside ``loss_mask`` but still weight a loss term.
+LOSS_WEIGHT_KEYS = frozenset({"loss_mask", "response_mask", "sft_mask", "echo_observation_mask"})
 _HF_PREFIX_MARK = "_arctic_prefix_attention"
 _MISSING = object()
 _ModuleType = TypeVar("_ModuleType", bound=type)
@@ -512,14 +516,20 @@ def pack_with_layout(data: Dict[str, Any], layout: PackedLayout) -> Dict[str, An
     ``[B, S]`` ``LOSS_WEIGHT_KEYS`` leaves (or ``labels != IGNORE_INDEX`` when none is sent)
     must be zero on shared cells (:meth:`PackedLayout.require_unweighted_shared`). A batch's
     ``routed_experts`` must agree with ``layout.router_replay`` and, when replayed, with the
-    layout's shared cells.
+    layout's shared cells. A ``[B, S]`` ``attention_mask``, ``position_ids`` or ``input_ids``
+    must be the batch the layout was built from: the same valid cells, the layout's positions
+    (which replace the batch's), and tokens that agree on every shared cell.
     """
     batch_size, sequence_length = layout.row_index.shape
     routed: list[Tensor] = []
     weights: list[Tensor] = []
     labels: list[Tensor] = []
+    identity: dict[str, Tensor] = {}
 
     def packed_value(key: str, value: Any) -> Any:
+        if key in ("attention_mask", "position_ids", "input_ids") and torch.is_tensor(value):
+            if tuple(value.shape) == (batch_size, sequence_length):
+                identity[key] = value
         if key == "attention_mask":
             return DROP
         if key == "routed_experts" and torch.is_tensor(value):
@@ -537,12 +547,32 @@ def pack_with_layout(data: Dict[str, Any], layout: PackedLayout) -> Dict[str, An
         return value
 
     packed = map_batch_values(data, packed_value)
+    _require_batch_matches_layout(layout, identity)
     _require_routed_experts_match(layout, routed)
     if layout.has_sharing:
         for value in weights or labels:
             layout.require_unweighted_shared(value)
     packed["position_ids"] = layout.position_ids.unsqueeze(0)
     return packed
+
+
+def _require_batch_matches_layout(layout: PackedLayout, identity: Dict[str, Tensor]) -> None:
+    row_index = layout.row_index
+    valid = row_index >= 0
+    mask = identity.get("attention_mask")
+    if mask is not None and not torch.equal(mask.bool().cpu(), valid.cpu()):
+        raise ValueError("the batch's attention_mask has different valid cells from the layout's")
+    positions = identity.get("position_ids")
+    if positions is not None:
+        index = row_index[valid].to(positions.device)
+        expected = layout.position_ids.to(positions.device, torch.long)[index]
+        if not torch.equal(expected, positions[valid.to(positions.device)].long()):
+            raise ValueError("the batch's position_ids differ from the positions the layout was built with")
+    ids = identity.get("input_ids")
+    if ids is not None and layout.has_sharing:
+        index = row_index[valid].to(ids.device)
+        if not torch.equal(layout.pack(ids)[index], ids[valid.to(ids.device)]):
+            raise ValueError("the batch's input_ids differ across rows on a shared prefix cell")
 
 
 def _require_routed_experts_match(layout: PackedLayout, routed: Sequence[Tensor]) -> None:
@@ -691,6 +721,23 @@ def _unstashed_error(name: str) -> ValueError:
     )
 
 
+def require_dense_attention_layout(name: str, layout: PackedLayout | None) -> None:
+    """Raise unless dense (non-varlen) attention ``name`` can run on a call with stash ``layout``.
+
+    It masks one causal rectangle per batch row, so a layout with several segments would let them
+    attend to each other, and with no stash inside a context it cannot tell whether it got a packed batch.
+    """
+    if layout is None:
+        if any(active is not None for active in _ACTIVE_LAYOUTS):
+            raise _unstashed_error(name)
+        return
+    if layout.num_segments > 1:
+        raise ValueError(
+            f"{name} has no varlen path, so its causal mask would span the layout's {layout.num_segments} "
+            "segments; packed layouts need FlashAttention"
+        )
+
+
 def prefix_varlen_args(
     k: Tensor,
     v: Tensor,
@@ -766,10 +813,29 @@ def require_bottom_right_causal_flash(model: torch.nn.Module) -> None:
                 f"prefix sharing needs {distribution} >= {oldest[0]}.{oldest[1]} (bottom-right causal alignment);"
                 f" found {installed[0]}.{installed[1]}"
             )
+        if kernel == 4 and not _fa4_varlen_backward_available():
+            raise ValueError(
+                "prefix sharing on FA4 needs flash-attn-4's flash_attn.cute, but the importable one is missing or is"
+                " flash_attn 2.8's bundled copy, which has no varlen backward; reinstall flash-attn-4 after flash_attn"
+            )
 
 
-def _hf_prefix_attention_fn(orig: Callable) -> Callable:
-    """Wrap a Hugging Face flash attention function with the prefix K/V gather of the caller's stash."""
+def _fa4_varlen_backward_available() -> bool:
+    """flash-attn-4's ``flash_attn_varlen_func`` takes ``max_seqlen_k``; the copy flash_attn 2.8 bundles does not."""
+    try:
+        from flash_attn.cute import flash_attn_varlen_func
+    # Some flash_attn builds raise AttributeError, not ImportError, while importing ``flash_attn.cute``.
+    except (ImportError, AttributeError):
+        return False
+    return "max_seqlen_k" in inspect.signature(flash_attn_varlen_func).parameters
+
+
+def _hf_prefix_attention_fn(orig: Callable, impl: str = "flash_attention_2") -> Callable:
+    """Wrap Hugging Face attention function ``impl`` with the prefix K/V gather of the caller's stash.
+
+    Modules with an unshared stash pass through; with no stash they raise while a sharing context
+    is active; only a flash ``impl`` runs a sharing call.
+    """
 
     def prefix_attention(module, query, key, value, attention_mask, *args, **kwargs):
         layout = get_stashed_layout(module)
@@ -778,6 +844,11 @@ def _hf_prefix_attention_fn(orig: Callable) -> Callable:
             raise _unstashed_error(name)
         if layout is None or not layout.has_sharing:
             return orig(module, query, key, value, attention_mask, *args, **kwargs)
+        if impl not in _HF_FLASH_KERNELS:
+            raise ValueError(f"{name}: prefix sharing needs a flash attention implementation, got {impl!r}")
+        if kwargs.get("dropout"):
+            # One mask for a shared root where unshared rows would each draw their own.
+            raise ValueError(f"{name}: attention dropout is not supported under prefix sharing")
         if args:
             raise ValueError(f"{name}: prefix sharing expects keyword arguments after attention_mask")
         if attention_mask is not None:
@@ -807,15 +878,16 @@ def _hf_prefix_attention_fn(orig: Callable) -> Callable:
 
 @contextmanager
 def _hf_prefix_attention(model: torch.nn.Module) -> Iterator[None]:
-    """Point the flash entries of ``transformers``' attention registry at the prefix wrapper, then restore them."""
+    """Point every entry of ``transformers``' attention registry at the prefix wrapper, then restore them.
+
+    Every entry, not just the ones ``model`` uses, so another model's Hugging Face attention with no
+    stash raises instead of reading the packed batch as one sequence. Eager attention skips the registry.
+    """
     hf_modules = [module for module in model.modules() if type(module).__name__ in _HF_PREFIX_ATTENTION]
-    if not hf_modules:
-        yield
-        return
     try:
         from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS as registry
     except ImportError as exc:
-        raise ValueError("prefix sharing on Hugging Face attention needs transformers' AttentionInterface") from exc
+        raise ValueError("prefix sharing needs transformers' AttentionInterface") from exc
     local = getattr(registry, "_local_mapping", None)
     if not isinstance(local, dict):
         raise ValueError(
@@ -829,11 +901,12 @@ def _hf_prefix_attention(model: torch.nn.Module) -> Iterator[None]:
         for impl in sorted({module.config._attn_implementation for module in hf_modules}):
             if impl not in registry:
                 raise ValueError(f"attention implementation {impl!r} is not registered with transformers")
+        for impl in sorted(registry.valid_keys()):
             current = registry[impl]
             if getattr(current, _HF_PREFIX_MARK, False):
                 continue
             saved.append((impl, local.get(impl, _MISSING)))
-            registry[impl] = _hf_prefix_attention_fn(current)
+            registry[impl] = _hf_prefix_attention_fn(current, impl)
         yield
     finally:
         for impl, previous in reversed(saved):

@@ -49,6 +49,7 @@ from arctic_platform.common.packing.layout import get_active_packed_layout
 from arctic_platform.common.packing.layout import get_stashed_layout
 from arctic_platform.common.packing.layout import prefix_varlen_args
 from arctic_platform.common.packing.layout import register_native_prefix_attention
+from arctic_platform.common.packing.layout import require_dense_attention_layout
 from arctic_platform.common.packing.layout import unshared_groups
 from arctic_platform.testing_utils import flash_attn_varlen_reference
 from arctic_platform.testing_utils import set_seed
@@ -65,6 +66,7 @@ def _reference_flash_attn(monkeypatch):
     monkeypatch.setattr(
         layout_module, "_installed_version", {"flash_attn": (2, 8), "flash_attn_3": (3, 0), "flash_attn_4": (4, 0)}.get
     )
+    monkeypatch.setattr(layout_module, "_fa4_varlen_backward_available", lambda: True)
 
 
 @register_native_prefix_attention
@@ -396,7 +398,7 @@ def test_pack_with_layout_refuses_loss_weight_on_shared_cells():
     loss_mask = torch.zeros(2, 5, dtype=torch.long)
     loss_mask[:, 3:] = batch["attention_mask"][:, 3:]
     pack_with_layout({**batch, "loss_mask": loss_mask}, layout)
-    for key in ("loss_mask", "response_mask"):
+    for key in ("loss_mask", "response_mask", "sft_mask", "echo_observation_mask"):
         weighted = loss_mask.clone()
         weighted[1, 0] = 1
         with pytest.raises(ValueError, match="shared prefix"):
@@ -411,6 +413,25 @@ def test_pack_with_layout_refuses_loss_weight_on_shared_cells():
 
     unshared = PackedLayout.build(batch["attention_mask"], *unshared_groups(2), batch["position_ids"])
     pack_with_layout({**batch, "labels": labeled, "loss_mask": torch.ones(2, 5, dtype=torch.long)}, unshared)
+
+
+def test_pack_with_layout_requires_the_batch_it_was_built_from():
+    batch, layout = _shared_layout(lengths=(5, 4))
+    pack_with_layout(batch, layout)
+    mask = batch["attention_mask"].clone()
+    mask[1, 3] = 0
+    with pytest.raises(ValueError, match="attention_mask"):
+        pack_with_layout({**batch, "attention_mask": mask}, layout)
+    with pytest.raises(ValueError, match="position_ids"):
+        pack_with_layout({**batch, "position_ids": batch["position_ids"] + 1}, layout)
+    ids = batch["input_ids"].clone()
+    ids[1, 0] += 1
+    with pytest.raises(ValueError, match="input_ids"):
+        pack_with_layout({**batch, "input_ids": ids}, layout)
+    # Continuation tokens are each row's own.
+    ids = batch["input_ids"].clone()
+    ids[1, 3] += 1
+    pack_with_layout({**batch, "input_ids": ids}, layout)
 
 
 def test_router_replay_must_be_explicit_for_moe():
@@ -522,6 +543,20 @@ def test_unstashed_attention_refuses_to_run_inside_another_context():
             with using_layout(other, unshared):
                 torch_assert_equal(other(hidden, *segments), expected)
     torch_assert_equal(other(hidden, *segments), expected)
+
+
+def test_dense_attention_refuses_packed_layouts():
+    _, layout = _shared_layout()
+    unshared = PackedLayout.build(torch.ones(2, 4, dtype=torch.long), *unshared_groups(2))
+    single = PackedLayout.build(torch.ones(1, 4, dtype=torch.long), *unshared_groups(1))
+    require_dense_attention_layout("SDPAAttention", None)
+    require_dense_attention_layout("SDPAAttention", single)
+    for packed in (layout, unshared):
+        with pytest.raises(ValueError, match="no varlen path"):
+            require_dense_attention_layout("SDPAAttention", packed)
+        with using_layout(FlashAttention(), packed):
+            with pytest.raises(ValueError, match="SDPAAttention ran with no PackedLayout stashed"):
+                require_dense_attention_layout("SDPAAttention", None)
 
 
 def test_using_layout_is_owned_by_one_thread():
@@ -694,6 +729,13 @@ def test_sharing_refuses_top_left_causal_flash_attn(monkeypatch):
             pass
     installed(flash_attn_4=(4, 0))
     with using_layout(fa4, layout):
+        pass
+    # Installing flash_attn after flash-attn-4 puts the bundled flash_attn.cute back over it.
+    monkeypatch.setattr(layout_module, "_fa4_varlen_backward_available", lambda: False)
+    with pytest.raises(ValueError, match="bundled copy"):
+        with using_layout(fa4, layout):
+            pass
+    with using_layout(fa4, unshared):
         pass
 
 
