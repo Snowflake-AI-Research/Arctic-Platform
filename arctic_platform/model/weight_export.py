@@ -631,6 +631,9 @@ def iter_lora_weights(
             import torch.distributed as dist
 
             group = _expert_parallel_group(parameter)
+            # Only the master's EP replica can reach the export; the others would gather for nothing.
+            if 0 not in dist.get_process_group_ranks(group):
+                continue
             assert not is_master or dist.get_rank(group=group) == 0
             shards = [torch.empty_like(local) for _ in range(dist.get_world_size(group=group))]
             dist.all_gather(shards, local, group=group)
@@ -652,6 +655,8 @@ def iter_lora_weights(
             import torch.distributed as dist
 
             group = _expert_parallel_group(parameter)
+            if 0 not in dist.get_process_group_ranks(group):
+                continue
             assert not is_master or dist.get_rank(group=group) == 0
             local = parameter.data.contiguous()
             shards = [torch.empty_like(local) for _ in range(dist.get_world_size(group=group))]

@@ -197,6 +197,21 @@ def test_lora_export_non_master_waits_after_every_ep_all_gather(monkeypatch, eve
     assert [kind for kind, _ in events] == ["all_gather", "wait", "all_gather", "wait"]
 
 
+def test_lora_export_skips_expert_groups_without_the_master(monkeypatch, events):
+    _set_rank(monkeypatch, 1)
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda group: [1, 3])
+    monkeypatch.setattr(torch, "empty_like", lambda tensor: pytest.fail("allocated an unused expert shard"))
+
+    def expert_loras(_model):
+        yield "model.layers.0.mlp.experts", "w1", "A", _ep_sharded((4, 2)), 2
+
+    monkeypatch.setattr(weight_export, "_iter_param_wrapper_expert_loras", expert_loras)
+    model = _LoraModel([("base_model.model.layers.0.q_proj.lora_A.default.weight", _ep_sharded((3, 2)))])
+
+    assert list(iter_lora_weights(model, is_master=False, is_zero3=False)) == []
+    assert events == []
+
+
 def test_gather_ep_shards_waits_for_its_all_gather(events):
     shards = weight_export._gather_ep_shards(_ep_sharded((3, 2)))
 
