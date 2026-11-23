@@ -433,7 +433,8 @@ class WeightSyncExtension:
 
         tp_rank = get_world_group().rank
         my_port = master_port + tp_rank
-        engine_key = (master_addr, my_port)
+        # The engine's buffers and rendezvous role are fixed at creation, so a change in either needs a new one.
+        engine_key = (master_addr, my_port, bucket_size, reverse)
 
         engine = getattr(self, engine_attr, None)
         if engine is None or getattr(self, key_attr, None) != engine_key:
