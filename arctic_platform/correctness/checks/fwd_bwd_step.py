@@ -33,13 +33,7 @@ from .optimizer_state import compare_optimizer_norms
 from .optimizer_state import summarize_optimizer_artifacts
 
 
-@correctness_test(
-    "single-step-optimizer",
-    title="Adam optimizer-state and update-residual norm correctness for one step",
-    criterion=(
-        f"{OPTIMIZER_NORM_CRITERION}: scalar norm differences stay within the explicitly reviewed reference gate"
-    ),
-)
+@correctness_test("single-step-optimizer")
 def run(ctx) -> List[TestResult]:
     return [_run_arm(ctx, arm) for arm in ctx.arms]
 
