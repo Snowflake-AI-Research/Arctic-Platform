@@ -30,8 +30,17 @@ import torch.nn.functional as F
 from torch import nn
 
 try:
+    import triton
     from fla.modules import FusedRMSNormGated
+    from fla.modules.fused_norm_gate import layer_norm_gated_fwd_kernel
     from fla.modules.fused_norm_gate import rms_norm_gated as fla_rms_norm_gated
+    from fla.modules.l2norm import l2norm_fwd_kernel
+
+    # fla times these menus per process and row-count bucket and keeps the fastest; the menu entries sum a row's squares
+    # in different orders, so two processes, or two call lengths, can normalize the same row differently. A single
+    # entry runs without timing. BT 16 with 4 warps is in both menus and sums as most of their entries do.
+    layer_norm_gated_fwd_kernel.fn.configs = [triton.Config({"BT": 16}, num_warps=4)]
+    l2norm_fwd_kernel.configs = [triton.Config({"BT": 16}, num_warps=4)]
 except ImportError:
     FusedRMSNormGated = None  # type: ignore
     fla_rms_norm_gated = None  # type: ignore
