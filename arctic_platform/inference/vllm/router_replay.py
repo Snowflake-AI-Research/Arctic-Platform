@@ -11,6 +11,9 @@ import os
 
 from arctic_platform.inference.utils import require_supported_vllm_version
 
+# The server imports this key, so the module stays torch-free; its bytes survive the msgpack round trip in extra_args.
+FORCED_ROUTES_KEY = "dss_router_replay_forced_routes"
+
 
 def _check_supported_vllm_version() -> None:
     if os.getenv("ARCTIC_INFERENCE_SKIP_VERSION_CHECK", "0") != "1":

@@ -29,7 +29,7 @@ from arctic_platform.inference.vllm.dense_prompt_logprobs import (
     stage_sampling_params as _stage_dense_prompt_logprobs,
     take_dense as _take_dense_prompt_logprobs,
 )
-from arctic_platform.inference.vllm.forced_routes import FORCED_ROUTES_KEY
+from arctic_platform.inference.vllm.router_replay import FORCED_ROUTES_KEY
 from arctic_platform.inference.vllm.spec_decode_grammar import (
     ensure_spec_decode_grammar_fix,
 )
