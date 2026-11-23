@@ -439,6 +439,7 @@ class WeightSyncExtension:
         engine = getattr(self, engine_attr, None)
         if engine is None or getattr(self, key_attr, None) != engine_key:
             if engine is not None:
+                setattr(self, engine_attr, None)
                 engine.destroy()
             logger.info(
                 "Creating %sNCCLEngine rank=1 ws=2 port=%d tp_rank=%d bucket=%dMB",
@@ -761,6 +762,7 @@ class WeightSyncExtension:
         engine = getattr(self, "_ws_bcast_engine", None)
         if engine is None or getattr(self, "_ws_bcast_engine_key", None) != key:
             if engine is not None:
+                self._ws_bcast_engine = None
                 engine.destroy()
             engine = BroadcastNCCLEngine(
                 master_addr=master_addr, master_port=master_port,

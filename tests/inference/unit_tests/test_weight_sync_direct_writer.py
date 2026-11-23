@@ -740,6 +740,8 @@ def test_fp8_updater_requantizes_bf16_and_copies_unquantized_layers(monkeypatch)
 
 class _CachedEngine:
     def __init__(self, **kwargs):
+        if kwargs["bucket_size"] > 128:
+            raise torch.OutOfMemoryError("replacement bucket allocation failed")
         self.kwargs = kwargs
         self.destroyed = False
 
@@ -759,6 +761,9 @@ def test_receiver_rebuilds_for_a_changed_bucket(monkeypatch):
     assert second.kwargs["bucket_size"] == 128
     assert second is not first
     assert first.destroyed
+    with pytest.raises(torch.OutOfMemoryError):
+        extension._get_or_create_broadcast_engine("localhost", 1234, 1, 3, 256)
+    assert not extension._get_or_create_broadcast_engine("localhost", 1234, 1, 3, 128).destroyed
 
 
 @pytest.mark.parametrize("change", [dict(bucket_size=128), dict(reverse=True)])
@@ -784,6 +789,9 @@ def test_point_to_point_receiver_rebuilds_for_a_changed_bucket_or_rendezvous(mon
     second = get(**change)
     assert {key: second.kwargs[key] for key in change} == change
     assert first.destroyed
+    with pytest.raises(torch.OutOfMemoryError):
+        get(bucket_size=256)
+    assert not get(**change).destroyed
 
 
 def test_fused_writer_reports_canonical_moe_destination():
