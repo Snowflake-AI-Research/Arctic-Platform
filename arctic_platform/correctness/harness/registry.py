@@ -20,10 +20,15 @@ from __future__ import annotations
 import enum
 from dataclasses import dataclass
 from dataclasses import field
+from dataclasses import replace
 from typing import Callable
 from typing import Dict
 from typing import List
 from typing import Optional
+
+INFERENCE_DEFAULT_TOLERANCE = 1e-3
+INFERENCE_B200_TOLERANCE = 3e-3
+E2E_TOLERANCE = 3e-2
 
 
 class TestOutcome(enum.Enum):
@@ -84,7 +89,7 @@ class TestSpecEntry:
     test_id: str
     title: str
     criterion: str
-    fn: Callable
+    fn: Optional[Callable] = None
     # A test that compares Arctic Platform against the reduced single-GPU Hugging Face reference. The reference
     # executes one training step and nothing else, so such a test has no baseline for a job whose
     # training step consumes rollouts the job generates itself.
@@ -105,14 +110,78 @@ class TestSpecEntry:
         return getattr(self.fn, "per_arm", None)
 
 
+_TEST_DEFINITIONS = {
+    test.test_id: test
+    for test in (
+        TestSpecEntry(
+            "single-step-grads",
+            "Forward-backward gradient correctness for a single step",
+            "per-tensor gradient L2 norms stay within the config-specific reference-repeatability gate",
+            workload_modes=("sft",),
+        ),
+        TestSpecEntry(
+            "single-step-optimizer",
+            "Adam optimizer-state and update-residual norm correctness for one step",
+            "optimizer-state-l2-norm-v1: scalar norm differences stay within the explicitly reviewed reference gate",
+            workload_modes=("sft",),
+        ),
+        TestSpecEntry(
+            "checkpoint-resume-loss",
+            "Loss agreement between an uninterrupted run and a checkpoint-and-resume run",
+            "the loss at the checkpoint iteration and at the final iteration agree between the two runs "
+            "within the absolute gate onboarding measured for this config",
+            compares_to_reference=False,
+        ),
+        TestSpecEntry(
+            "inference-checkpoint-loss",
+            "Validation loss agreement between the training zone and a sampling zone on its checkpoint",
+            "the answer-token cross entropy of a held-out GSM8K batch agrees between the training zone that "
+            "trained the weights and a sampling zone serving the checkpoint it saved, within 3e-3 on "
+            "B200 and 1e-3 on other GPU families",
+            compares_to_reference=False,
+        ),
+        TestSpecEntry(
+            "e2e-sft-train-validate",
+            "Training and validation loss agreement over a 100-step SFT run replayed in Arctic Platform",
+            "the final training loss and the held-out validation loss of a 100-step SFT run agree between Arctic"
+            " Platform and the single-GPU Hugging Face reference on the same replayed batches; the whole per-step"
+            " trajectory is recorded and reported as a diagnostic",
+            workload_modes=("sft",),
+        ),
+        TestSpecEntry(
+            "rl-weight-sync",
+            "Weight sync delivers every trained element to the sampling zone unchanged",
+            "after one RL step, every tensor the training zone sends reaches every sampling rank with identical "
+            "bytes and element count, the trainer sends every element it holds, and every sampler parameter is "
+            "written, element for element, with what it received, or, for a frozen table the trainer does not send, "
+            "matches the trainer's copy in every checkpoint shard",
+            compares_to_reference=False,
+            workload_modes=("rl",),
+        ),
+        TestSpecEntry(
+            "rl-router-replay",
+            "Router replay: the training zone routes exactly as the sampling zone did",
+            "for every generated sample, the expert indices the sampling zone returns, the indices the training "
+            "zone receives for it, and the indices every MoE router uses on the forward pass and on the "
+            "activation-checkpoint recompute are identical, element for element",
+            compares_to_reference=False,
+            workload_modes=("rl",),
+        ),
+    )
+}
 _REGISTRY: Dict[str, TestSpecEntry] = {}
+
+
+def test_definitions() -> Dict[str, TestSpecEntry]:
+    """Discover test metadata without importing executable checks or their backends."""
+    return {identifier: replace(test, fn=None) for identifier, test in {**_TEST_DEFINITIONS, **_REGISTRY}.items()}
 
 
 def correctness_test(
     test_id: str,
     *,
-    title: str,
-    criterion: str,
+    title: str | None = None,
+    criterion: str | None = None,
     compares_to_reference: bool = True,
     requires_hosted_control_plane: bool = False,
     workload_modes: tuple[str, ...] | None = None,
@@ -122,15 +191,20 @@ def correctness_test(
     def wrap(fn: Callable) -> Callable:
         if test_id in _REGISTRY:
             raise ValueError(f"duplicate correctness test id: {test_id}")
-        _REGISTRY[test_id] = TestSpecEntry(
-            test_id=test_id,
-            title=title,
-            criterion=criterion,
-            fn=fn,
-            compares_to_reference=compares_to_reference,
-            requires_hosted_control_plane=requires_hosted_control_plane,
-            workload_modes=workload_modes or (("sft",) if compares_to_reference else ("sft", "rl")),
-        )
+        if title is None and criterion is None:
+            _REGISTRY[test_id] = replace(_TEST_DEFINITIONS[test_id], fn=fn)
+        else:
+            if title is None or criterion is None:
+                raise ValueError("custom correctness tests require both title and criterion")
+            _REGISTRY[test_id] = TestSpecEntry(
+                test_id=test_id,
+                title=title,
+                criterion=criterion,
+                fn=fn,
+                compares_to_reference=compares_to_reference,
+                requires_hosted_control_plane=requires_hosted_control_plane,
+                workload_modes=workload_modes or (("sft",) if compares_to_reference else ("sft", "rl")),
+            )
         return fn
 
     return wrap
