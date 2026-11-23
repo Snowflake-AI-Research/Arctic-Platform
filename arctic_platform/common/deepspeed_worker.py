@@ -49,6 +49,10 @@ from arctic_platform.common.utils.debug import enable_full_determinism
 from arctic_platform.common.utils.debug import pr0
 from arctic_platform.common.utils.debug import see_memory_usage
 from arctic_platform.common.weight_checksum import tensor_l2_sq
+from arctic_platform.debug.training import maybe_cleanup_router_replay_on_failure
+from arctic_platform.debug.training import maybe_configure_router_replay_trace
+from arctic_platform.debug.training import maybe_finish_router_replay_after_destroy
+from arctic_platform.debug.weight_sync import maybe_configure_broadcast_training
 from arctic_platform.model import ModelSpec
 from arctic_platform.model import build_model
 from arctic_platform.model import ds_worker_dense_model_spec
@@ -122,6 +126,7 @@ class DeepSpeedWorker:
     def get_ip(self) -> str:
         return self.my_addr
 
+    @maybe_cleanup_router_replay_on_failure(runtime=True)
     def initialize(self, master_addr: str, job_config: dict) -> bool:
         self.master_addr = master_addr
         os.environ.update(
@@ -240,6 +245,8 @@ class DeepSpeedWorker:
             if ep_size > 1:
                 preserve_fp8_params_through_ds_cast(model)
             init_kwargs = {"mpu": self.mpu} if self.mpu is not None else {}
+            ds_config = maybe_configure_broadcast_training(ds_config)
+            ds_config = maybe_configure_router_replay_trace(ds_config, model, self.rank)
             self.engine, _, _, _ = deepspeed.initialize(model=model, config=ds_config, **init_kwargs)
         self._device = get_accelerator().device_name(self.engine.local_rank)
 
@@ -1404,6 +1411,7 @@ class DeepSpeedWorker:
         logger.info("Rank %d empty_cache: %.0f MB GPU remaining", self.rank, mem_mb)
         return {"gpu_mb": mem_mb}
 
+    @maybe_finish_router_replay_after_destroy
     def destroy(self) -> bool:
         if self._weight_sender is not None:
             self._weight_sender.destroy()

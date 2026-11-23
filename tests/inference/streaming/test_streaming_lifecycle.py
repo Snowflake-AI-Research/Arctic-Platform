@@ -11,13 +11,9 @@ import pytest
 from test_review_regressions import local_worker
 from arctic_platform.inference.server.config import ModelConfig
 from arctic_platform.inference.server.replica_pool import ReplicaPool
-from arctic_platform.inference.server.scheduler import (
-    Scheduler,
-    least_loaded_routing,
-    prefix_affinity_routing,
-    strict_affinity_routing,
-)
+from arctic_platform.inference.server.scheduler import Scheduler
 from arctic_platform.inference.server.streaming import StreamLimits
+from arctic_platform.inference.server.testing import RemoteMock
 from arctic_platform.inference.server.worker import InferenceWorker
 from arctic_platform.inference.server.worker import WorkerLifecycleState
 
@@ -41,12 +37,11 @@ def make_pool():
     for method in (*WEIGHT_METHODS, "sleep", "wake_up", "pause_generation",
                    "resume_generation", "abort_stream"):
         getattr(handle, method).remote = AsyncMock(return_value={"status": "aborted"})
-    handle.generate.remote = AsyncMock(return_value={"text": "legacy", "token_ids": [1]})
+    handle.generate.remote = RemoteMock(return_value={"text": "legacy", "token_ids": [1]})
     pool = ReplicaPool()
     pool._config = ModelConfig(model="fake")
     pool._workers = [handle]
-    pool._scheduler = Scheduler([handle], dynamic_concurrency=False)
-    pool._scheduler._ensure_background_tasks = lambda: None
+    pool._scheduler = Scheduler([handle], capacity=1024)
     pool._reset_prefix_cache_after_weight_sync = AsyncMock(return_value={"status": "ok"})
     return pool, handle
 
@@ -120,15 +115,14 @@ def test_cancel_during_iterator_close_blocks_mutation(ignore_cancellation):
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("routing", [
-    least_loaded_routing, prefix_affinity_routing, strict_affinity_routing, None,
+@pytest.mark.parametrize("prefix_routing, routing_key, strict", [
+    (False, None, False), (True, None, False), (True, None, True), (False, "key", False),
 ])
-def test_quarantine_blocks_legacy_dispatch_until_worker_replacement(routing):
+def test_quarantine_blocks_legacy_dispatch_until_worker_replacement(prefix_routing, routing_key, strict):
     async def scenario():
         pool, handle = make_pool()
         scheduler = pool._scheduler
-        if routing is not None:
-            scheduler._routing_fn = routing
+        scheduler._prefix_routing = prefix_routing
         stream = scheduler.stream_generate("failed", "prompt")
         stream.worker = scheduler._workers[0]
         stream.worker.active_requests = stream.worker.streaming_requests = 1
@@ -138,12 +132,12 @@ def test_quarantine_blocks_legacy_dispatch_until_worker_replacement(routing):
         try:
             assert not scheduler.is_worker_available(0)
             stream.worker.available = True
-            future = scheduler.submit("prompt", {}, routing_key="key" if routing is None else None)
+            future = scheduler.submit("prompt", {}, routing_key=routing_key, strict=strict)
             with pytest.raises(asyncio.TimeoutError):
                 await asyncio.wait_for(asyncio.shield(future), 0.02)
             handle.generate.remote.assert_not_awaited()
             replacement = MagicMock()
-            replacement.generate.remote = AsyncMock(return_value={"text": "recovered"})
+            replacement.generate.remote = RemoteMock(return_value={"text": "recovered"})
             scheduler.update_worker_handle(0, replacement)
             scheduler.mark_worker_available(0)
             assert (await asyncio.wait_for(future, 1))["text"] == "recovered"
@@ -285,7 +279,7 @@ def test_uncertain_stream_cleanup_prevents_engine_mutation(method, strategy):
         stream.worker.active_requests = stream.worker.streaming_requests = 1
         handle.abort_stream.remote.return_value = {"status": "cleanup_unconfirmed"}
         healthy = MagicMock()
-        healthy.generate.remote = AsyncMock(return_value={"text": "healthy"})
+        healthy.generate.remote = RemoteMock(return_value={"text": "healthy"})
         getattr(healthy, method).remote = AsyncMock()
         healthy.pause_generation.remote = AsyncMock()
         pool._workers.append(healthy)
@@ -344,7 +338,6 @@ def test_lifecycle_preparation_failure_restores_previous_state(
             with pytest.raises(failure, match="preparation failed"):
                 await mutate(pool, method, strategy)
             assert scheduler._paused == initially_paused
-            assert scheduler._pause_event.is_set() == (not initially_paused)
             assert scheduler.is_worker_available(0)
             assert not scheduler.is_worker_available(1)
             assert not pool._stream_admission_blocked
@@ -371,7 +364,6 @@ def test_weight_sync_preparation_failure_does_not_wake_sleeping_pool(method, str
                 await mutate(pool, method, strategy)
             assert pool.sleeping
             assert scheduler.paused
-            assert not scheduler._pause_event.is_set()
             getattr(handle, method).remote.assert_not_awaited()
             handle.pause_generation.remote.assert_not_awaited()
         finally:

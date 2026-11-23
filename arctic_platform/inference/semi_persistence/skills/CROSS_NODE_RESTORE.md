@@ -215,6 +215,10 @@ sudo rsync -aH --info=progress2 \
 Use `rsync -a` or a plain tarball. **Never `tar -h`** — dereferencing symlinks
 changes file sizes and CRIU size-checks every mapping.
 
+This is for a local image. A published skeleton on the mirror stores its
+pages as `pages-<N>.img.zst`, which CRIU cannot read, so do not hand-copy one;
+let `_materialize_from_source` decode it (`IMAGE_CACHE.md` §9).
+
 ### Then verify the environment before spending a restore attempt
 
 CRIU records every file-backed mapping by absolute path and size and
