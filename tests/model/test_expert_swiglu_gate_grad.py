@@ -41,8 +41,13 @@ def test_expert_swiglu_preserves_forward_and_widens_gate_gradient(device, limit)
     sig = clamped_gate.double().sigmoid()
     expected_gate = grad.double() * clamped_up * sig * (1 + clamped_gate * (1 - sig))
     if limit is not None:
-        expected_gate *= gate.detach() <= limit
-        expected_up *= up.detach().abs() <= limit
+        # Whether a clamp passes the gradient at its bound is torch's convention (2.15 stopped passing it).
+        def passes(x, low):
+            probe = x.detach().double().requires_grad_()
+            return torch.autograd.grad(probe.clamp(low, limit).sum(), probe)[0]
+
+        expected_gate *= passes(gate, None)
+        expected_up *= passes(up, -limit).to(expected_up.dtype)
     assert torch.equal(output, silu * clamped_up)
     assert torch.equal(up.grad, expected_up)
     assert torch.equal(gate.grad, expected_gate.bfloat16())
