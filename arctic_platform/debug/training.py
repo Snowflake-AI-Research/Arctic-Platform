@@ -13,14 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Opt-in training fixtures, participation, and router replay."""
+"""Opt-in reduced-fixture authentication and router replay observations."""
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
-import importlib
-import inspect
 import json
 import os
 import re
@@ -28,6 +25,7 @@ import stat
 from contextlib import ExitStack
 from contextlib import contextmanager
 from copy import deepcopy
+from functools import wraps
 from pathlib import Path
 from typing import Any
 from typing import Literal
@@ -37,8 +35,6 @@ from pydantic import ConfigDict
 from pydantic import Field
 from pydantic import field_validator
 from pydantic import model_validator
-
-# Reduced Fixture Mtp
 
 _MODEL_TYPES = {"qwen3_5_moe_text", "qwen4_exp_text", "glm5_next_text"}
 
@@ -183,57 +179,6 @@ def _text_config(config):
     return config.get("text_config", config)
 
 
-def maybe_bind_reduced_fixture_mtp(payload, spec, published_fixture) -> None:
-    """Bind only an existing validated pretrained reduced publication."""
-    training = payload["training_config"]
-    prime = training.get("prime_rl") or {}
-    debug = prime.get("debug") or {}
-    if "reduced_fixture_mtp" in debug:
-        raise ValueError("reduced fixture MTP descriptor must not be supplied or overwritten")
-    if (
-        published_fixture is None
-        or training.get("model_provider") != "prime_rl"
-        or type(spec.model.seed) is not int
-        or spec.model.seed != 0
-    ):
-        return
-    config_row = next(
-        (row for row in published_fixture["files"] if row["path"] == "config.json"),
-        None,
-    )
-    if config_row is None:
-        raise ValueError("published fixture has no config binding")
-    with _held_files(Path(spec.model.cache_path), [FixtureFile.model_validate(config_row)]) as held:
-        config = _json_from_fd(held["config.json"])
-        if _text_config(config).get("model_type") not in _MODEL_TYPES:
-            return
-    if (
-        published_fixture.get("config_id") != spec.config_id
-        or published_fixture.get("reference_path") != spec.model.cache_path
-        or published_fixture.get("reviewed_hash") != spec.model.content_hash
-        or published_fixture.get("model_name") != payload["model_name"]
-    ):
-        raise ValueError("reduced fixture does not match the reviewed spec and native model")
-    request = ReducedFixtureMTP(
-        schema_version=1,
-        config_id=spec.config_id,
-        fixture_locator=payload["model_name"],
-        reference_path=spec.model.cache_path,
-        reviewed_hash=spec.model.content_hash,
-        fixture_sha256=published_fixture["fixture_sha256"],
-        files=published_fixture["files"],
-        source_checkpoint=spec.model.source_checkpoint,
-        num_hidden_layers=spec.model.num_hidden_layers,
-        vision_depth=spec.model.vision_depth,
-        materialization="pretrained-prefix-reduction",
-    )
-    _validate_depths(config, request)
-    updated = deepcopy(prime)
-    updated["debug"] = deepcopy(debug)
-    updated["debug"]["reduced_fixture_mtp"] = request.model_dump()
-    training["prime_rl"] = updated
-
-
 def _validate_depths(config, request: ReducedFixtureMTP) -> None:
     text = _text_config(config)
     vision = config.get("vision_config")
@@ -360,12 +305,9 @@ def maybe_capture_reduced_fixture_mtp(model, source_path: Path, config) -> None:
         auxiliary_weights.capture_auxiliary_weights(model, source_path)
 
 
-# Router Replay Trace
-
 TRAINING_OPTION = "arctic_platform_router_replay_trace"
-TRACE_SCHEMA = "arctic-platform-router-replay-call-v1"
+TRACE_SCHEMA = "arctic-platform-router-replay-call-v2"
 _LAYER_INDEX = re.compile(r"(?:^|\.)layers\.(\d+)\.")
-_LAYER_ATTR = "_dss_router_replay_layer"
 _active: RouterReplayTrace | None = None
 _publication: dict | None = None
 
@@ -379,19 +321,95 @@ def maybe_configure_router_replay_sampling(sampling, *, verify):
     return sampling.model_copy(update={"arctic_inference_config": inference}, deep=True)
 
 
+def router_replay_model_inventory(config: dict) -> dict:
+    """Bind required layers to resolved model config, never to discovered router modules."""
+    if not isinstance(config, dict):
+        raise NotImplementedError("router-replay architectural coverage requires a model config mapping")
+    text = config
+    if "text_config" in config:
+        if config.get("model_type") != "qwen3_5_moe" or not isinstance(config["text_config"], dict):
+            raise NotImplementedError("unverified composite router-replay model config")
+        text = config["text_config"]
+    family = text.get("model_type")
+    depth = text.get("num_hidden_layers")
+    top_k = text.get("num_experts_per_tok")
+    if type(depth) is not int or depth <= 0 or type(top_k) is not int or top_k <= 0:
+        raise ValueError("router-replay config requires positive integer layer count and routing top-k")
+    if family in ("qwen3_moe", "qwen3_5_moe_text"):
+        experts = text.get("num_experts")
+    elif family in ("glm4_moe", "glm_moe_dsa"):
+        experts = text.get("n_routed_experts")
+    else:
+        raise NotImplementedError(f"unverified router-replay layer predicate for model_type={family!r}")
+    if type(experts) is not int or experts <= 0 or top_k > experts:
+        raise ValueError("router-replay config requires a positive expert count at least as large as routing top-k")
+    if family == "qwen3_moe":
+        dense = text.get("mlp_only_layers")
+        step = text.get("decoder_sparse_step")
+        if (
+            not isinstance(dense, list)
+            or any(type(layer) is not int or layer < 0 or layer >= depth for layer in dense)
+            or len(set(dense)) != len(dense)
+            or type(step) is not int
+            or step <= 0
+        ):
+            raise ValueError("invalid Qwen3-MoE dense-layer list or decoder_sparse_step")
+        layers = [layer for layer in range(depth) if layer not in dense and (layer + 1) % step == 0]
+    elif family in ("glm4_moe", "glm_moe_dsa"):
+        prefix = text.get("first_k_dense_replace")
+        if type(prefix) is not int or prefix < 0 or prefix > depth:
+            raise ValueError("invalid GLM MoE dense-layer prefix")
+        layers = list(range(prefix, depth))
+    else:
+        layers = list(range(depth))
+    if not layers:
+        raise NotImplementedError("router-replay config contains no routed decoder layers")
+    resolved = json.dumps(config, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return {
+        "model_type": family,
+        "num_hidden_layers": depth,
+        "num_experts_per_tok": top_k,
+        "num_experts": experts,
+        "expected_layers": layers,
+        "resolved_model_config_sha256": hashlib.sha256(resolved).hexdigest(),
+    }
+
+
 class RouterReplayTrace:
     def __init__(self, model: Any) -> None:
         self.received: dict[str, list] = {}
         self.calls: list[dict] = []
         self.unattributed: list[dict] = []
+        self._call_open = False
         self._hook_handles: list[Any] = []
+        config = getattr(model, "config", None)
+        if config is None:
+            raise NotImplementedError("router-replay execution model has no independently bound config")
+        config = config if isinstance(config, dict) else config.to_dict()
+        self.model_inventory = router_replay_model_inventory(config)
+        inventory = {}
         for name, module in model.named_modules():
             if type(module).__name__ != "TokenChoiceTopKRouter":
                 continue
             match = _LAYER_INDEX.search(name)
-            if match is not None:
-                setattr(module, _LAYER_ATTR, int(match.group(1)))
-            self._hook_handles.append(module.register_forward_hook(self._record_router, with_kwargs=True))
+            if match is None:
+                raise ValueError(f"router-replay inventory has an unknown decoder layer index: {name}")
+            layer = int(match.group(1))
+            if layer in inventory:
+                raise ValueError(f"router-replay inventory has a duplicate decoder layer index: {layer}")
+            inventory[layer] = module
+        if len(inventory) == 0:
+            raise ValueError("router-replay inventory contains no TokenChoiceTopKRouter modules")
+        if sorted(inventory) != self.model_inventory["expected_layers"]:
+            raise ValueError("installed router modules differ from the model-config architectural roster")
+        self.expected_layers = tuple(self.model_inventory["expected_layers"])
+        self._router_layers = {id(module): layer for layer, module in inventory.items()}
+        try:
+            for module in inventory.values():
+                self._hook_handles.append(module.register_forward_hook(self._record_router, with_kwargs=True))
+        except BaseException:
+            self.close()
+            raise
 
     def _record_router(self, router: Any, args: tuple, kwargs: dict, output: Any) -> None:
         routed = kwargs.get("routed_experts")
@@ -402,9 +420,16 @@ class RouterReplayTrace:
         self.record_router(router, output[1], replayed=routed is not None)
 
     def close(self) -> None:
-        for handle in self._hook_handles:
-            handle.remove()
-        self._hook_handles.clear()
+        handles, self._hook_handles = self._hook_handles, []
+        failure = None
+        for handle in handles:
+            try:
+                handle.remove()
+            except Exception as exc:
+                if failure is None:
+                    failure = exc
+        if failure is not None:
+            raise failure
 
     def record_received(self, sample_ids, routed_experts_list) -> None:
         import torch
@@ -432,21 +457,32 @@ class RouterReplayTrace:
                 "router": [],
             }
         )
+        self._call_open = True
 
     def record_router(self, router: Any, indices: Any, *, replayed: bool) -> None:
         import torch
 
+        layer = self._router_layers.get(id(router))
+        if layer is None or layer not in self.expected_layers:
+            raise ValueError("router-replay observation has an unknown inventory layer")
         entry = {
-            "layer": getattr(router, _LAYER_ATTR, None),
+            "layer": layer,
             "phase": "recompute" if torch._C._current_graph_task_id() != -1 else "forward",
             "replayed": bool(replayed),
             "indices": indices.detach().to(device="cpu", dtype=torch.int64).tolist(),
         }
-        (self.calls[-1]["router"] if self.calls else self.unattributed).append(entry)
+        if self._call_open:
+            self.calls[-1]["router"].append(entry)
+        else:
+            self.unattributed.append(entry)
+            if _publication is not None:
+                raise RuntimeError("router-replay router ran outside an open model call")
 
     def export(self, rank: int) -> dict:
         return {
             "rank": int(rank),
+            "expected_layers": list(self.expected_layers),
+            "model_inventory": deepcopy(self.model_inventory),
             "received": self.received,
             "calls": self.calls,
             "unattributed_router_calls": self.unattributed,
@@ -465,14 +501,69 @@ def active() -> RouterReplayTrace | None:
     return _active
 
 
+def maybe_finish_router_replay_trace(rank: int) -> None:
+    """Release only this process's owned trace; never publish an unfinished call."""
+    global _active, _publication
+    if _publication is not None and (type(rank) is not int or _publication["rank"] != rank):
+        raise RuntimeError("router-replay cleanup rank differs from the active publication rank")
+    trace, _active = _active, None
+    _publication = None
+    if trace is not None:
+        trace.close()
+
+
+def maybe_cleanup_router_replay_on_failure(function=None, *, runtime: bool = False):
+    """Select an owned failure boundary without changing the native return or exception.
+
+    The ordinary selector returns the original callable when no publication is active.
+    Import-time decorators must use ``runtime=True``: engine initialization can enable
+    publication only after that decorated callable has already been entered.
+    """
+    if function is None:
+        return lambda native: maybe_cleanup_router_replay_on_failure(native, runtime=runtime)
+    if not runtime and _publication is None:
+        return function
+
+    @wraps(function)
+    def observed(*args, **kwargs):
+        try:
+            return function(*args, **kwargs)
+        except BaseException:
+            publication = _publication
+            if publication is not None:
+                try:
+                    maybe_finish_router_replay_trace(publication["rank"])
+                except BaseException:
+                    pass
+            raise
+
+    return observed
+
+
+def maybe_finish_router_replay_after_destroy(function):
+    """Run native teardown before closing observers; preserve native teardown failures."""
+    native = maybe_cleanup_router_replay_on_failure(function, runtime=True)
+
+    @wraps(function)
+    def observed(*args, **kwargs):
+        result = native(*args, **kwargs)
+        publication = _publication
+        if publication is not None:
+            maybe_finish_router_replay_trace(publication["rank"])
+        return result
+
+    return observed
+
+
 def finish(rank: int) -> dict | None:
     global _active, _publication
     trace, _active = _active, None
     _publication = None
-    if trace is None:
-        return None
-    trace.close()
-    return trace.export(rank)
+    try:
+        return None if trace is None else trace.export(rank)
+    finally:
+        if trace is not None:
+            trace.close()
 
 
 def record_router(router: Any, indices: Any, *, replayed: bool) -> None:
@@ -549,6 +640,8 @@ def maybe_complete_router_replay_call(engine: Any) -> None:
         "request_id": _publication["request_id"],
         "rank": rank,
         "call_index": index,
+        "expected_layers": list(trace.expected_layers),
+        "model_inventory": deepcopy(trace.model_inventory),
         "received": trace.received,
         "calls": [trace.calls[index]],
         "unattributed_router_calls": trace.unattributed,
@@ -557,267 +650,4 @@ def maybe_complete_router_replay_call(engine: Any) -> None:
         json.dump(record, stream, separators=(",", ":"))
         stream.write("\n")
     _publication["completed"] += 1
-
-
-# Correctness Participation
-
-CAPTURE_ENV = "ARCTIC_CORRECTNESS_PARTICIPATION_CAPTURE"
-GATEWAY_MODULE = "arctic_platform.debug.training"
-
-
-@contextmanager
-def maybe_select_participation_coordinator(manager_module, actor_key, original_actor, training):
-    if not participation_capture_enabled():
-        yield
-        return
-    selected = participation_coordinator_class(training)
-    manager_module._ACTOR_CLS[actor_key] = selected
-    try:
-        yield
-    finally:
-        manager_module._ACTOR_CLS[actor_key] = original_actor
-
-
-def participation_coordinator_class(training):
-    import ray
-
-    # The correctness gateway is optional; ordinary model imports must not load its service stack.
-    native_lora = importlib.import_module("arctic_platform.correctness.harness.lora")
-    sources = {"training": native_lora._source(training._DeepSpeedWorker.__init__)}
-    ParticipationWorker = participation_worker_class(training._DeepSpeedWorker)
-    coordinator_base = participation_step_class(training.GPUTrainingJob.__ray_metadata__.modified_class)
-
-    class ParticipationCoordinator(coordinator_base):
-        async def _spawn_workers(self, cfg, ranks, master_addr, master_port, source_stage_info):
-            from dss.ray_dss.jobs.gpu import training as native_training
-
-            native_spawn = super()._spawn_workers
-            namespace, original_worker = native_lora._spawn_worker_binding(native_spawn, native_training, sources)
-            namespace["_DeepSpeedWorker"] = ParticipationWorker
-            try:
-                await native_spawn(cfg, ranks, master_addr, master_port, source_stage_info)
-                if namespace.get("_DeepSpeedWorker") is not ParticipationWorker:
-                    raise ValueError("participation worker binding changed during creation")
-            finally:
-                namespace["_DeepSpeedWorker"] = original_worker
-
-    return ray.remote(num_cpus=1, num_gpus=0)(ParticipationCoordinator)
-
-
-class WorkerParticipation:
-    def __init__(self, worker):
-        ParticipationCapture = importlib.import_module(
-            "arctic_platform.correctness.harness.optimizer"
-        ).ParticipationCapture
-
-        self.worker = worker
-        self.engine = worker._engine
-        if self.engine.global_steps != 0:
-            raise ValueError("participation must be armed before the first backward")
-        model = self.engine.module
-        decoder_getter = getattr(model, "get_decoder", None)
-        head_getter = getattr(model, "get_output_embeddings", None)
-        decoder = decoder_getter() if callable(decoder_getter) else None
-        if decoder is None and hasattr(model, "model"):
-            from arctic_platform.model.implementations.moe.vlm import get_language_model
-
-            decoder = get_language_model(model)
-        head = head_getter() if callable(head_getter) else getattr(model, "lm_head", None)
-        sources = {Path(__file__), Path(inspect.getsourcefile(ParticipationCapture))}
-        self.sources = {str(source): hashlib.sha256(source.read_bytes()).hexdigest() for source in sources}
-        self.capture = ParticipationCapture(model, decoder=decoder, head=head)
-        try:
-            self.expert_widths = {
-                name: expert_parallel_width(parameter) for name, parameter in self.capture.parameters.items()
-            }
-            self.before = self.evidence()
-        except BaseException:
-            self.close()
-            raise
-
-    def evidence(self):
-        weight_identity = importlib.import_module("arctic_platform.correctness.harness.optimizer").weight_identity
-
-        for filename, digest in self.sources.items():
-            if hashlib.sha256(Path(filename).read_bytes()).hexdigest() != digest:
-                raise ValueError("participation capture source drift")
-        return {
-            "participation": self.capture.result(),
-            "candidate_weights": {
-                name: weight_identity(self.capture.parameters[name].detach()) for name in self.capture.candidates
-            },
-            "participation_sources": deepcopy(self.sources),
-        }
-
-    def finish(self):
-        if self.worker._engine is not self.engine or self.engine.global_steps != 1:
-            raise ValueError("participation engine changed or did not complete one step")
-        return {
-            "rank": int(self.worker.rank),
-            "job_id": self.worker.job_id,
-            "before": deepcopy(self.before),
-            "after": self.evidence(),
-            "expert_parallel_widths": dict(self.expert_widths),
-        }
-
-    def close(self):
-        self.capture.close()
-
-
-def merge_worker_receipts(receipts, *, job_id, world_size):
-    merge_rank_participation = importlib.import_module(
-        "arctic_platform.correctness.harness.optimizer"
-    ).merge_rank_participation
-
-    if (
-        type(world_size) is not int
-        or world_size < 1
-        or not isinstance(job_id, str)
-        or not job_id
-        or not isinstance(receipts, list)
-        or len(receipts) != world_size
-    ):
-        raise ValueError("participation requires every actual training worker")
-    for rank, receipt in enumerate(receipts):
-        if (
-            not isinstance(receipt, dict)
-            or type(receipt.get("rank")) is not int
-            or receipt["rank"] != rank
-            or receipt.get("job_id") != job_id
-        ):
-            raise ValueError("participation worker rank or training child differs")
-        before, after = receipt.get("before"), receipt.get("after")
-        if not isinstance(before, dict) or not isinstance(after, dict):
-            raise ValueError("participation requires before/after worker evidence")
-        sources = before.get("participation_sources")
-        if not isinstance(sources, dict) or not sources or sources != after.get("participation_sources"):
-            raise ValueError("participation source identity differs before and after")
-        for filename, digest in sources.items():
-            if (
-                not isinstance(filename, str)
-                or not Path(filename).is_absolute()
-                or not isinstance(digest, str)
-                or len(digest) != 64
-                or any(character not in "0123456789abcdef" for character in digest)
-            ):
-                raise ValueError("participation source identity is invalid")
-        for evidence in (before, after):
-            inventory = evidence.get("participation")
-            if (
-                not isinstance(inventory, dict)
-                or not isinstance(inventory.get("parameters"), dict)
-                or not inventory["parameters"]
-                or any(
-                    not isinstance(entry, dict) or not isinstance(entry.get("shape"), list)
-                    for entry in inventory["parameters"].values()
-                )
-            ):
-                raise ValueError("participation worker inventory is incomplete")
-    shapes = {name: entry["shape"] for name, entry in receipts[0]["before"]["participation"]["parameters"].items()}
-    widths = receipts[0].get("expert_parallel_widths")
-    if (
-        not isinstance(widths, dict)
-        or set(widths) != set(shapes)
-        or any(type(width) is not int or width < 1 for width in widths.values())
-        or any(receipt.get("expert_parallel_widths") != widths for receipt in receipts)
-    ):
-        raise ValueError("participation expert-parallel widths are incomplete or differ across ranks")
-    participation, _ = merge_rank_participation(
-        [receipt["before"] for receipt in receipts],
-        [receipt["after"] for receipt in receipts],
-        shapes,
-        {name: [0] * widths[name] for name in shapes},
-    )
-    return {**participation, "training_child_id": job_id, "rank_receipts": deepcopy(receipts)}
-
-
-def main():
-    from dss.ray_dss import gateway_server
-
-    gateway_scope = importlib.import_module("arctic_platform.correctness.harness.lora").gateway_scope
-    importlib.import_module("arctic_platform.correctness.harness.native_optimizer").install_gateway_route(
-        gateway_server
-    )
-
-    os.environ[CAPTURE_ENV] = "1"
-    with gateway_scope(gateway_server):
-        gateway_server.main()
-
-
-def participation_capture_enabled() -> bool:
-    """Whether this process is the correctness gateway, which captures participation for every training job."""
-    return os.environ.get(CAPTURE_ENV) == "1"
-
-
-def participation_worker_class(worker_base):
-    """Capture participation for the single completed optimizer step admitted by P1."""
-
-    class ParticipationWorker(worker_base):
-        def fwd_bwd(self, batch):
-            if not hasattr(self, "_correctness_participation"):
-                self._correctness_participation = WorkerParticipation(self)
-            try:
-                return super().fwd_bwd(batch)
-            except BaseException:
-                self._correctness_participation.close()
-                raise
-
-        def step(self, learning_rate=None):
-            if not hasattr(self, "_correctness_participation"):
-                raise ValueError("participation capture requires backward before step")
-            try:
-                result = super().step(learning_rate)
-                self._correctness_participation_receipt = self._correctness_participation.finish()
-                return result
-            finally:
-                self._correctness_participation.close()
-
-        def correctness_participation_receipt(self):
-            return deepcopy(self._correctness_participation_receipt)
-
-        def destroy(self, remove_checkpoint_scratch=False):
-            capture = getattr(self, "_correctness_participation", None)
-            if capture is not None:
-                capture.close()
-            return super().destroy(remove_checkpoint_scratch=remove_checkpoint_scratch)
-
-    return ParticipationWorker
-
-
-def participation_step_class(coordinator_base):
-    """Attach the merged step-1 participation inventory to the step response of ``coordinator_base``.
-
-    Worker creation stays with ``coordinator_base``, so a coordinator that binds its own worker subclass (the LoRA
-    adapter coordinators) captures participation by binding ``participation_worker_class`` over that subclass.
-    """
-
-    class ParticipationStepCoordinator(coordinator_base):
-        async def step(self, learning_rate=None):
-            response = await super().step(learning_rate)
-            if response.get("global_steps") != 1:
-                raise ValueError("participation capture requires exactly the first optimizer step")
-            receipts = await asyncio.wait_for(
-                asyncio.gather(*(worker.correctness_participation_receipt.remote() for worker in self._workers)),
-                timeout=60,
-            )
-            response["participation"] = merge_worker_receipts(
-                receipts, job_id=self._info.job_id, world_size=len(self._workers)
-            )
-            return response
-
-    return ParticipationStepCoordinator
-
-
-def expert_parallel_width(parameter) -> int:
-    """Count the expert-parallel ranks holding disjoint dim-0 slices of ``parameter``; 1 for a replicated one."""
-    group_name = getattr(parameter, "group_name", None)
-    if group_name is None or getattr(parameter, "allreduce", True) is not False or parameter.dim() < 2:
-        return 1
-    groups = importlib.import_module("deepspeed.utils.groups")
-    return importlib.import_module("torch.distributed").get_world_size(
-        group=groups._get_expert_parallel_group(group_name)
-    )
-
-
-if __name__ == "__main__":
-    main()
+    trace._call_open = False

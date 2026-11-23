@@ -48,13 +48,13 @@ from typing import Iterable
 from typing import Mapping
 
 from arctic_platform.common.peft import normalize_lora_peft_config
+from arctic_platform.correctness.harness.optimizer import participation_step_class as first_two_step_class
+from arctic_platform.correctness.harness.optimizer import participation_worker_class as first_two_worker_class
+from arctic_platform.correctness.harness.optimizer import select_participation_coordinator
 from arctic_platform.correctness.harness.sft import SEED
+from arctic_platform.correctness.harness.storage import correctness_environment
 from arctic_platform.correctness.harness.storage import correctness_workdir
 from arctic_platform.correctness.harness.storage import require_data_fast_path
-from arctic_platform.debug.training import maybe_select_participation_coordinator
-from arctic_platform.debug.training import participation_capture_enabled
-from arctic_platform.debug.training import participation_step_class
-from arctic_platform.debug.training import participation_worker_class
 
 # Lora
 
@@ -331,6 +331,10 @@ def materialize_adapter(cfg, model_path: str | Path, workdir: str | Path) -> Pat
     seed = cfg.sub_job.get("seed")
     seed = SEED if seed is None else seed
     dtype = cfg.sub_job.get("dtype") or cfg.training.get("dtype") or "bfloat16"
+    if isinstance(dtype, str):
+        dtype = dtype.lower()
+        if dtype == "bf16":
+            dtype = "bfloat16"
     if dtype not in {"float32", "float16", "bfloat16"}:
         raise ValueError(f"unsupported deterministic LoRA model dtype: {dtype!r}")
     config_digest = hashlib.sha256((source / "config.json").read_bytes()).hexdigest()
@@ -656,120 +660,6 @@ def original_adapter_files(
         raise ValueError("original adapter initialization metadata changed during transfer")
     _verify_original_adapter(root, expected_identity, expected_original_metadata)
     return files
-
-
-@contextlib.contextmanager
-def native_worker_adapter_scope(
-    training_module,
-    files: dict[str, bytes],
-    expected_identity: dict,
-    expected_original_metadata: dict,
-    *,
-    job_id: str,
-    rank: int,
-):
-    """Wrap the actual worker's imported engine initializer before optimizer creation."""
-
-    if not isinstance(job_id, str) or not job_id.strip() or type(rank) is not int or rank < 0:
-        raise ValueError("native adapter scope requires an explicit job identity and nonnegative worker rank")
-    if (
-        not isinstance(files, dict)
-        or not {"adapter_config.json", "adapter_model.safetensors", "initialization.json"}
-        <= set(files)
-        <= set(_ORIGINAL_ADAPTER_FILES)
-        or any(not isinstance(raw, bytes) for raw in files.values())
-    ):
-        raise ValueError("original adapter transfer must contain only original pack bytes")
-    received = dict(files)
-    shared_identity = deepcopy(expected_identity)
-    original_metadata = deepcopy(expected_original_metadata)
-    original = training_module.initialize_training_engine
-    signature = inspect.signature(original)
-    if not {"model", "rank"} <= set(signature.parameters):
-        raise ValueError("native engine initializer must expose model and rank arguments")
-    if not _NATIVE_ADAPTER_SCOPE_LOCK.acquire(blocking=False):
-        raise ValueError("native adapter worker scope is already active")
-    scratch = None
-    installed = False
-    calls = 0
-    completed = None
-    receipt = {
-        "schema": "original-peft-worker-initialization-v1",
-        "job_id": job_id,
-        "rank": rank,
-        "engine_initializations": 0,
-    }
-    try:
-        scratch = correctness_workdir("original-peft-worker-")
-        with tempfile.TemporaryDirectory(prefix="adapter-", dir=scratch) as temporary:
-            path = Path(temporary)
-            for name, raw in received.items():
-                (path / name).write_bytes(raw)
-            _verify_original_adapter(path, shared_identity, original_metadata)
-
-            def check_binding():
-                if training_module.initialize_training_engine is not initialize_training_engine:
-                    raise ValueError("native engine initializer binding changed during adapter scope")
-
-            @wraps(original)
-            def initialize_training_engine(*args, **kwargs):
-                nonlocal calls, completed
-
-                from peft import get_peft_model_state_dict
-
-                calls += 1
-                if calls != 1:
-                    raise ValueError("native adapter engine initialization must be single-use per worker")
-                check_binding()
-                bound = signature.bind(*args, **kwargs)
-                if type(bound.arguments.get("rank")) is not int or bound.arguments["rank"] != rank:
-                    raise ValueError("native adapter engine rank differs from the selected worker")
-                model = bound.arguments["model"]
-                _verify_original_adapter(path, shared_identity, original_metadata)
-                shared_initialize_adapter(model, path, shared_identity)
-                _verify_original_adapter(path, shared_identity, original_metadata)
-                verified = verify_tensors(
-                    get_peft_model_state_dict(model, adapter_name="default"), original_metadata["initialization"]
-                )
-                check_binding()
-                result = original(*args, **kwargs)
-                check_binding()
-                _verify_original_adapter(path, shared_identity, original_metadata)
-                completed = {
-                    "schema": "original-peft-worker-initialization-v1",
-                    "job_id": job_id,
-                    "rank": rank,
-                    "engine_initializations": calls,
-                    "original_identity_sha256": original_metadata["identity_sha256"],
-                    "shared_identity": deepcopy(shared_identity),
-                    "initialization": verified,
-                }
-                receipt.clear()
-                receipt.update(deepcopy(completed))
-                return result
-
-            if training_module.initialize_training_engine is not original:
-                raise ValueError("native engine initializer binding changed before adapter scope")
-            training_module.initialize_training_engine = initialize_training_engine
-            installed = True
-            yield receipt
-            check_binding()
-            if calls != 1 or completed is None:
-                raise ValueError("native adapter worker requires exactly one successful engine initialization")
-            if receipt != completed:
-                raise ValueError("native adapter worker initialization receipt changed")
-            _verify_original_adapter(path, shared_identity, original_metadata)
-    finally:
-        # Restore without re-validating source: the constructor may have raised or changed the binding.
-        try:
-            if installed:
-                training_module.initialize_training_engine = original
-        finally:
-            try:
-                if scratch is not None:
-                    scratch.rmdir()
-            finally:
-                _NATIVE_ADAPTER_SCOPE_LOCK.release()
 
 
 @contextlib.contextmanager
@@ -1404,7 +1294,7 @@ def _runtime_sources(training) -> dict:
     return {
         "training": _source(training._DeepSpeedWorker.__init__),
         "engine": _source(training.initialize_training_engine),
-        "adapter": _source(shared_lora_adapter.native_worker_adapter_scope),
+        "adapter": _source(shared_lora_adapter.native_original_worker_adapter_scope),
         "lora": _source(lora.identity_metadata),
         "composition": _source(_runtime_sources),
         "native_adapter": _source(native_adapter.initialize_native_adapter),
@@ -1485,19 +1375,20 @@ def _spawn_worker_binding(spawn, training, sources: dict) -> tuple[dict, type]:
     return namespace, worker
 
 
-def _coordinator_class(training, request: dict, files_ref):
+def _coordinator_class(training, request: dict, files_ref, *, first_two: bool = False):
     """Use native creation/placement/teardown with an initialization-only worker subclass."""
     import ray
 
     _verify_runtime(training, request["sources"])
-    capture = participation_capture_enabled()
+    capture = first_two
     coordinator_base = training.GPUTrainingJob.__ray_metadata__.modified_class
     if capture:
-        coordinator_base = participation_step_class(coordinator_base)
+        selected_step_class = first_two_step_class
+        coordinator_base = selected_step_class(coordinator_base)
     worker_base = training._DeepSpeedWorker
 
     class OriginalAdapterWorker(worker_base):
-        # The native constructor takes ``cfg`` alone in current DSS and ``cfg, source_stage_info`` in older DSS.
+
         def __init__(self, cfg, *args, **kwargs):
             import ray
             from dss.ray_dss.jobs.gpu import training as native_training
@@ -1522,9 +1413,11 @@ def _coordinator_class(training, request: dict, files_ref):
         def original_adapter_receipt(self):
             return deepcopy(self._correctness_original_adapter_receipt)
 
-    selected_worker = participation_worker_class(OriginalAdapterWorker) if capture else OriginalAdapterWorker
+    selected_worker_class = first_two_worker_class
+    selected_worker = selected_worker_class(OriginalAdapterWorker) if capture else OriginalAdapterWorker
 
     class OriginalAdapterCoordinator(coordinator_base):
+
         async def _spawn_workers(self, cfg, ranks, master_addr, master_port, source_stage_info):
             from dss.ray_dss.jobs.gpu import training as native_training
 
@@ -1533,7 +1426,6 @@ def _coordinator_class(training, request: dict, files_ref):
                 raise ValueError("native original adapter coordinator layout or configuration differs")
             native_spawn = super()._spawn_workers
             namespace, original_worker = _spawn_worker_binding(native_spawn, native_training, request["sources"])
-            # Ray can deserialize inherited methods with globals separate from the imported module.
             namespace["_DeepSpeedWorker"] = selected_worker
             try:
                 try:
@@ -1544,8 +1436,7 @@ def _coordinator_class(training, request: dict, files_ref):
                     namespace["_DeepSpeedWorker"] = original_worker
                 _verify_runtime(native_training, request["sources"])
                 receipts = await asyncio.wait_for(
-                    asyncio.gather(*(worker.original_adapter_receipt.remote() for worker in self._workers)),
-                    timeout=60,
+                    asyncio.gather(*(worker.original_adapter_receipt.remote() for worker in self._workers)), timeout=60
                 )
                 _verify_receipts(receipts, request, self._info.job_id)
                 _verify_runtime(native_training, request["sources"])
@@ -1559,7 +1450,6 @@ def _coordinator_class(training, request: dict, files_ref):
                     flush=True,
                 )
             except BaseException as primary:
-                # Native spawn handles its own failures; receipt failures also require its owned teardown.
                 if self._workers:
                     try:
                         await self._kill_workers([host for host, _ in ranks])
@@ -1582,19 +1472,20 @@ def _coordinator_class(training, request: dict, files_ref):
     return ray.remote(num_cpus=1, num_gpus=0)(OriginalAdapterCoordinator)
 
 
-def _shared_coordinator_class(training, request: dict, files_ref):
+def _shared_coordinator_class(training, request: dict, files_ref, *, first_two: bool = False):
     """Keep ordinary native placement and teardown for a separately identified shared pack."""
     import ray
 
     _verify_shared_runtime(training, request["sources"])
-    capture = participation_capture_enabled()
+    capture = first_two
     coordinator_base = training.GPUTrainingJob.__ray_metadata__.modified_class
     if capture:
-        coordinator_base = participation_step_class(coordinator_base)
+        selected_step_class = first_two_step_class
+        coordinator_base = selected_step_class(coordinator_base)
     worker_base = training._DeepSpeedWorker
 
     class SharedAdapterWorker(worker_base):
-        # The native constructor takes ``cfg`` alone in current DSS and ``cfg, source_stage_info`` in older DSS.
+
         def __init__(self, cfg, *args, **kwargs):
             import ray
             from dss.ray_dss.jobs.gpu import training as native_training
@@ -1618,9 +1509,11 @@ def _shared_coordinator_class(training, request: dict, files_ref):
         def shared_adapter_receipt(self):
             return deepcopy(self._correctness_shared_adapter_receipt)
 
-    selected_worker = participation_worker_class(SharedAdapterWorker) if capture else SharedAdapterWorker
+    selected_worker_class = first_two_worker_class
+    selected_worker = selected_worker_class(SharedAdapterWorker) if capture else SharedAdapterWorker
 
     class SharedAdapterCoordinator(coordinator_base):
+
         async def _spawn_workers(self, cfg, ranks, master_addr, master_port, source_stage_info):
             from dss.ray_dss.jobs.gpu import training as native_training
 
@@ -1643,8 +1536,7 @@ def _shared_coordinator_class(training, request: dict, files_ref):
                     namespace["_DeepSpeedWorker"] = original_worker
                 _verify_shared_runtime(native_training, request["sources"])
                 receipts = await asyncio.wait_for(
-                    asyncio.gather(*(worker.shared_adapter_receipt.remote() for worker in self._workers)),
-                    timeout=60,
+                    asyncio.gather(*(worker.shared_adapter_receipt.remote() for worker in self._workers)), timeout=60
                 )
                 _verify_shared_receipts(receipts, request, self._info.job_id)
                 _verify_shared_runtime(native_training, request["sources"])
@@ -1697,13 +1589,19 @@ def install_manager(manager) -> None:
         raise ValueError("native original adapter coordinator was already replaced")
 
     def spawn(owner, info):
+        raw = info.config.model_dump(mode="json", by_alias=True)
+        marker = ((raw.get("training_config") or {}).get("debug") or {}).get("correctness_first_two", False)
+        if type(marker) is not bool:
+            raise ValueError("correctness_first_two must be an explicit boolean")
         request = _request(info.config)
         shared_request = _shared_request(info.config) if request is None else None
         if request is None and shared_request is None:
-            with maybe_select_participation_coordinator(manager_module, actor_key, original_actor, training):
-                return original_spawn(info)
+            if marker:
+                with select_participation_coordinator(manager_module, actor_key, original_actor, training):
+                    return original_spawn(info)
+            return original_spawn(info)
         selected_request = shared_request if shared_request is not None else request
-        if sum(len(node.gpu_ids) for node in info.layout) != selected_request["training_gpus"]:
+        if sum((len(node.gpu_ids) for node in info.layout)) != selected_request["training_gpus"]:
             raise ValueError("native original adapter manager allocation differs")
         if shared_request is not None:
             _verify_shared_runtime(training, shared_request["sources"])
@@ -1711,12 +1609,11 @@ def install_manager(manager) -> None:
             if (root / "initialization.json").exists():
                 raise ValueError("native shared adapter cannot contain deterministic initialization metadata")
             files = adapter_files(root, shared_request["identity"])
-            selected = _shared_coordinator_class(training, shared_request, ray.put(files))
+            selected = _shared_coordinator_class(training, shared_request, ray.put(files), first_two=marker)
         else:
             _verify_runtime(training, request["sources"])
             files = original_adapter_files(request["path"], request["identity"], request["original_metadata"])
-            selected = _coordinator_class(training, request, ray.put(files))
-        # The original spawn is synchronous: no other create can observe this temporary table entry.
+            selected = _coordinator_class(training, request, ray.put(files), first_two=marker)
         manager_module._ACTOR_CLS[actor_key] = selected
         try:
             return original_spawn(info)
@@ -2051,7 +1948,7 @@ def _owned_worker_session(worker):
     from arctic_platform.correctness.harness.gateway import _gateway_process_identity
     from arctic_platform.correctness.harness.gateway import _reap_owned_gateway_descendants
 
-    token = os.environ.get("DSS_CORRECTNESS_GATEWAY_OWNER", "")
+    token = correctness_environment("AP_CORRECTNESS_GATEWAY_OWNER", "")
     if (
         len(token) != 32
         or any(character not in "0123456789abcdef" for character in token)
@@ -2102,7 +1999,7 @@ def main() -> None:
                     "setsid",
                     "--wait",
                     "env",
-                    f"DSS_CORRECTNESS_GATEWAY_OWNER={os.urandom(16).hex()}",
+                    f"AP_CORRECTNESS_GATEWAY_OWNER={os.urandom(16).hex()}",
                     "SPT_NOENV=1",
                     *selected,
                 ]

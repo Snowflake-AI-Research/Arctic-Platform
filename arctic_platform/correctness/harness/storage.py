@@ -50,10 +50,16 @@ from typing import Tuple
 
 # Storage
 
-CORRECTNESS_TMPDIR_ENV = "DSS_CORRECTNESS_TMPDIR"
-CORRECTNESS_LOGDIR_ENV = "DSS_CORRECTNESS_LOGDIR"
+CORRECTNESS_TMPDIR_ENV = "AP_CORRECTNESS_TMPDIR"
+CORRECTNESS_LOGDIR_ENV = "AP_CORRECTNESS_LOGDIR"
 _DATA_FAST_ROOT = Path("/data-fast")
 _DATA_FAST_TMPDIR = Path("/data-fast/tmp")
+
+
+def correctness_environment(name: str, default: str | None = None) -> str | None:
+    """Prefer the AP setting while accepting the previous harness-owned DSS alias."""
+    legacy = "DSS_CORRECTNESS_" + name.removeprefix("AP_CORRECTNESS_")
+    return os.environ.get(name, os.environ.get(legacy, default))
 
 
 def require_data_fast_path(path: str | Path, *, label: str = "correctness storage path") -> Path:
@@ -73,7 +79,7 @@ def correctness_workdir(prefix: str) -> Path:
     """Create a heavyweight correctness workdir exclusively on fast storage."""
     if not isinstance(prefix, str) or os.sep in prefix or (os.altsep and os.altsep in prefix):
         raise ValueError("correctness workdir prefix must not contain a directory path")
-    override = os.environ.get(CORRECTNESS_TMPDIR_ENV)
+    override = correctness_environment(CORRECTNESS_TMPDIR_ENV)
     root = require_data_fast_path(
         override if override else _DATA_FAST_TMPDIR,
         label=CORRECTNESS_TMPDIR_ENV if override else "correctness workdir",
@@ -84,7 +90,7 @@ def correctness_workdir(prefix: str) -> Path:
 
 def correctness_logdir(prefix: str) -> Path:
     """Keep small, shareable diagnostics in the operator's current workspace."""
-    root = Path(os.environ.get(CORRECTNESS_LOGDIR_ENV) or Path.cwd() / "work" / "logs").resolve()
+    root = Path(correctness_environment(CORRECTNESS_LOGDIR_ENV) or Path.cwd() / "work" / "logs").resolve()
     root.mkdir(parents=True, exist_ok=True)
     return Path(tempfile.mkdtemp(prefix=prefix, dir=root))
 
@@ -192,7 +198,7 @@ def onboarding_node_prerequisites(request: dict) -> dict:
     native_inference = modules.get("arctic_platform.inference.utils")
     if native_inference is not None:
         try:
-            native_inference.require_supported_vllm_version(feature="DSS correctness sampling")
+            native_inference.require_supported_vllm_version(feature="Arctic Platform correctness sampling")
         except Exception as exc:
             errors.append(f"native sampling runtime: {type(exc).__name__}: {exc}")
     torch = modules.get("torch")
@@ -243,7 +249,8 @@ def onboarding_node_prerequisites(request: dict) -> dict:
             if attribute and not callable(getattr(module, attribute, None)):
                 raise ImportError(f"{module_name}.{attribute} is unavailable")
             if backend in request.get("hf_attention", []) and backend in {"flash_attention_2", "flash_attention_3"}:
-                availability = importlib.import_module("transformers.utils")
+                from transformers import utils as availability
+
                 checker = getattr(availability, f"is_flash_attn_{backend[-1]}_available")
                 if not checker():
                     raise ImportError(f"Transformers does not recognize an installed {backend} package")
@@ -801,6 +808,7 @@ DEFAULT_RECORDS_DIR = Path(__file__).resolve().parents[1] / "reference_data"
 CRITERIA = {
     "single-step-grads": "gradient-l2-norm-v1",
     "single-step-optimizer": "optimizer-state-l2-norm-v1",
+    "e2e-sft-train-validate": "sft-trajectory-ce-v1",
 }
 MAX_RECORD_BYTES = 8 * 1024 * 1024
 
@@ -917,6 +925,9 @@ def workload_identity(ctx, check_id: str, recipe: dict) -> dict:
         "python": platform.python_version(),
         "recipe": recipe,
     }
+    base_width = getattr(ctx.cfg, "placement_base_gpus", None)
+    if base_width is not None and ctx.cfg.n_gpus != base_width:
+        identity["placement_gpus"] = ctx.cfg.n_gpus
     if check_id == "single-step-grads":
         identity["gate"] = asdict(ctx.spec.test_tolerances[check_id])
     elif check_id == "single-step-optimizer":
@@ -956,8 +967,10 @@ def validate_measurements(identity: dict, measurements: dict) -> None:
             not isinstance(norms, dict)
             or not norms
             or any(
-                not isinstance(name, str) or not isinstance(value, (int, float)) or value < 0
-                for name, value in norms.items()
+                (
+                    not isinstance(name, str) or not isinstance(value, (int, float)) or value < 0
+                    for name, value in norms.items()
+                )
             )
         ):
             raise ReferencePrerequisiteError("reference gradient norms must be complete finite nonnegative scalars")
@@ -974,8 +987,8 @@ def validate_measurements(identity: dict, measurements: dict) -> None:
             if (
                 gate.get("status") != "reviewed"
                 or not isinstance(provenance, (str, dict))
-                or not provenance
-                or (isinstance(provenance, str) and not provenance.strip())
+                or (not provenance)
+                or (isinstance(provenance, str) and (not provenance.strip()))
             ):
                 raise ReferencePrerequisiteError("optimizer norm gate has no onboarding review provenance")
             if type(gate.get("absolute")) not in {int, float} or gate["absolute"] < 0:
@@ -990,6 +1003,21 @@ def validate_measurements(identity: dict, measurements: dict) -> None:
             validate_optimizer_participation(summary, backend="reference")
             if measurements.get("participation") is not None or summary.get("participation") is not None:
                 compare_participation(measurements.get("participation"), summary.get("participation"))
+    elif check == "e2e-sft-train-validate":
+        for key in ("train_losses", "train_gradient_norms"):
+            values = measurements.get(key)
+            if (
+                not isinstance(values, list)
+                or len(values) != 100
+                or (not all((isinstance(value, (int, float)) for value in values)))
+            ):
+                raise ReferencePrerequisiteError(f"reference requires all 100 scalar {key}")
+        if measurements.get("optimizer_steps") != 100:
+            raise ReferencePrerequisiteError("reference requires 100 optimizer steps")
+        if not isinstance(measurements.get("validation_cross_entropy"), (int, float)):
+            raise ReferencePrerequisiteError("reference requires validation cross-entropy")
+        if not isinstance(measurements.get("scored_answer_tokens"), int) or measurements["scored_answer_tokens"] <= 0:
+            raise ReferencePrerequisiteError("reference requires positive scored-answer-token count")
 
 
 def _config_dir(ctx, identity: dict) -> Path:
@@ -1016,6 +1044,11 @@ def _config_dir(ctx, identity: dict) -> Path:
 
 def _record_path(ctx, identity: dict) -> Path:
     directory = _config_dir(ctx, identity) / identity["check_id"]
+    width = identity.get("placement_gpus")
+    if width is not None:
+        if type(width) is not int or width < 1:
+            raise ReferencePrerequisiteError("invalid reference placement width")
+        directory /= f"gpu{width}"
     if identity["check_id"] == "e2e-sft-train-validate":
         return directory / "trajectory.json"
     recipe = identity.get("recipe", {})
@@ -1119,6 +1152,8 @@ def load_record(ctx, current_identity: dict) -> dict:
     options = ["--reference-records-dir", str(getattr(ctx, "reference_records_dir", DEFAULT_RECORDS_DIR))]
     if getattr(ctx, "local_gateway_full_model", False):
         options.append("--local-gateway-full-model")
+    elif identity["check_id"] == "e2e-sft-train-validate":
+        options.append("--local-cortex-fixture")
     if identity["check_id"] != "e2e-sft-train-validate" and recipe.get("token_budget") is not None:
         options.extend(["--reference-token-budget", str(recipe["token_budget"])])
     command = (

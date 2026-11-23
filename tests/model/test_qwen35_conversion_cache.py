@@ -700,7 +700,6 @@ def test_qwen_dcp_capture_uses_original_source_before_converted_cache(
     monkeypatch.setattr(model_builder, "_write_conversion_cache", convert_cache)
     monkeypatch.setattr(model_builder, "get_world", lambda: SimpleNamespace(is_master=True, rank=0, local_rank=0))
     monkeypatch.setattr(model_builder, "HuggingFaceStorageReader", lambda path: ("reader", Path(path)))
-    monkeypatch.setattr(model_builder, "maybe_observe_checkpoint_reader", lambda reader, *args: reader)
     monkeypatch.setattr(
         model_builder,
         "dcp_load",

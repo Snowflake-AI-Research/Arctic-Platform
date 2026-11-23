@@ -18,11 +18,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import dis
 import fcntl
 import hashlib
-import importlib
 import inspect
 import json
 import math
@@ -36,6 +36,7 @@ import sys
 import time
 import types
 import uuid
+from copy import deepcopy
 from dataclasses import dataclass
 from dataclasses import replace
 from pathlib import Path
@@ -62,7 +63,6 @@ from arctic_platform.correctness.harness.gateway import fwd_bwd_step
 from arctic_platform.correctness.harness.gateway import require_local_cortex_gateway
 from arctic_platform.correctness.harness.gateway import save_and_resolve_checkpoint_id
 from arctic_platform.correctness.harness.storage import require_data_fast_path
-from arctic_platform.debug.training import merge_worker_receipts
 
 # Names
 
@@ -134,7 +134,7 @@ def _normalized(values: Dict[str, float]) -> Dict[str, _Entry]:
     return entries
 
 
-def _canonical_dss(values: Dict[str, float]) -> Dict[str, _Entry]:
+def _canonical_ap(values: Dict[str, float]) -> Dict[str, _Entry]:
     source = _normalized(values)
     canonical: Dict[str, _Entry] = {}
     routed: Dict[str, Dict[str, _Entry]] = {}
@@ -185,7 +185,7 @@ class CanonicalTensorGroup:
     concatenate_dim: Optional[int] = None
 
 
-def canonical_dss_tensor_groups(names: Iterable[str]) -> Dict[str, CanonicalTensorGroup]:
+def canonical_ap_tensor_groups(names: Iterable[str]) -> Dict[str, CanonicalTensorGroup]:
     """Group Arctic Platform tensor names by their Hugging Face parameter representation."""
     canonical: Dict[str, CanonicalTensorGroup] = {}
     routed: Dict[str, Dict[str, str]] = {}
@@ -232,16 +232,16 @@ def _originals(entries: Dict[str, _Entry], keys: set[str]) -> List[str]:
 
 
 def align(
-    dss: Dict[str, float], reference: Dict[str, float]
+    ap: Dict[str, float], reference: Dict[str, float]
 ) -> Tuple[List[Tuple[str, float, float]], List[str], List[str]]:
     """Pair every semantic tensor and return pairs plus uncovered raw names on either side."""
-    dss_by_key = _canonical_dss(dss)
+    ap_by_key = _canonical_ap(ap)
     ref_by_key = _normalized(reference)
-    shared = sorted(set(dss_by_key) & set(ref_by_key))
-    pairs = [(key, dss_by_key[key].value, ref_by_key[key].value) for key in shared]
-    only_dss_keys = set(dss_by_key) - set(ref_by_key)
-    only_ref_keys = set(ref_by_key) - set(dss_by_key)
-    return pairs, _originals(dss_by_key, only_dss_keys), _originals(ref_by_key, only_ref_keys)
+    shared = sorted(set(ap_by_key) & set(ref_by_key))
+    pairs = [(key, ap_by_key[key].value, ref_by_key[key].value) for key in shared]
+    only_ap_keys = set(ap_by_key) - set(ref_by_key)
+    only_ref_keys = set(ref_by_key) - set(ap_by_key)
+    return pairs, _originals(ap_by_key, only_ap_keys), _originals(ref_by_key, only_ref_keys)
 
 
 STATE_KEYS = ("parameter_update", "exp_avg", "exp_avg_sq")
@@ -305,73 +305,6 @@ def tensor_digest(tensor: torch.Tensor, *, chunk_bytes: int = 8 * 1024 * 1024) -
     return digest.hexdigest()
 
 
-def model_state_manifest(engine, rank: int) -> dict:
-    model = engine.module
-    persistent_buffers = {
-        f"{prefix}.{name}" if prefix else name
-        for prefix, module in model.named_modules()
-        for name in module._buffers
-        if name not in module._non_persistent_buffers_set
-    }
-    entries = []
-    for kind, tensors in (("parameter", model.named_parameters()), ("buffer", model.named_buffers())):
-        for name, tensor in sorted(tensors):
-            entry = {
-                "name": name,
-                "kind": kind,
-                "shape": list(tensor.shape),
-                "dtype": str(tensor.dtype),
-                "requires_grad": bool(tensor.requires_grad),
-                "group_name": getattr(tensor, "group_name", None),
-                "allreduce": getattr(tensor, "allreduce", True),
-                "sha256": tensor_digest(tensor),
-            }
-            if kind == "buffer":
-                entry["persistent"] = name in persistent_buffers
-            entries.append(entry)
-    return {
-        "rank": int(rank),
-        "engine": {
-            "global_steps": int(engine.global_steps),
-            "has_moe_layers": bool(engine.has_moe_layers),
-            "num_experts": list(engine.num_experts),
-        },
-        "tensors": entries,
-    }
-
-
-class ModelStateCaptureMixin:
-    """Record local tensors immediately before save and after load when opted in."""
-
-    _model_state_output_dir = None
-
-    def _capture_model_state(self, phase: str) -> None:
-        if self._model_state_output_dir is None:
-            return
-        import deepspeed
-
-        manifest = model_state_manifest(self.engine, self.rank)
-        manifest["deepspeed_version"] = deepspeed.__version__
-        directory = Path(self._model_state_output_dir) / phase
-        directory.mkdir(parents=True, exist_ok=True)
-        (directory / f"rank-{self.rank:05d}.json").write_text(json.dumps(manifest, indent=2) + "\n")
-        print(
-            f"MODEL_STATE phase={phase} rank={self.rank} tensors={len(manifest['tensors'])} "
-            f"has_moe_layers={manifest['engine']['has_moe_layers']} "
-            f"step={manifest['engine']['global_steps']} deepspeed={manifest['deepspeed_version']}",
-            flush=True,
-        )
-
-    def save_checkpoint(self, path: str, export_hf: bool = False) -> dict:
-        self._capture_model_state("before-save")
-        return super().save_checkpoint(path, export_hf=export_hf)
-
-    def load_checkpoint(self, path: str) -> int:
-        restored_step = super().load_checkpoint(path)
-        self._capture_model_state("after-load")
-        return restored_step
-
-
 _OPTIMIZER_CAPTURE_WORKER: Any | None = None
 
 
@@ -432,7 +365,7 @@ def _optimizer_capture_worker_class() -> Any:
     base_worker = deepspeed_worker_module.DeepSpeedWorker.__ray_metadata__.modified_class
 
     @ray.remote
-    class OptimizerCaptureDeepSpeedWorker(ModelStateCaptureMixin, base_worker):
+    class OptimizerCaptureDeepSpeedWorker(base_worker):
         """Add optimizer-state artifact capture for correctness harness jobs only."""
 
         def initialize(self, master_addr: str, job_config: dict) -> bool:
@@ -444,12 +377,6 @@ def _optimizer_capture_worker_class() -> Any:
                 if not os.path.isabs(optimizer_state_output_dir):
                     raise ValueError("debug.optimizer_state_output_dir must be an absolute path")
             self._optimizer_state_output_dir = optimizer_state_output_dir
-            model_state_output_dir = debug_config.get("model_state_output_dir")
-            if model_state_output_dir is not None:
-                model_state_output_dir = os.fspath(model_state_output_dir)
-                if not os.path.isabs(model_state_output_dir):
-                    raise ValueError("debug.model_state_output_dir must be an absolute path")
-            self._model_state_output_dir = model_state_output_dir
             adapter = debug_config.get("shared_peft_adapter")
             if adapter is None:
                 return super().initialize(master_addr, job_config)
@@ -856,7 +783,8 @@ def optimizer_capture_worker() -> Iterator[None]:
     from arctic_platform.common import ray_server
 
     # Load the compatibility re-export before patching so lazy clients cannot retain an overlay.
-    compatibility_server = importlib.import_module("arctic_platform.rl.ray_server")
+    from arctic_platform.rl import ray_server as compatibility_server
+
     server_modules = [ray_server, compatibility_server]
     originals = [(module, module.ArcticRLRayServerState, module.ArcticRLRayServer) for module in server_modules]
     capture_worker = _optimizer_capture_worker_class()
@@ -892,6 +820,313 @@ def optimizer_capture_worker() -> Iterator[None]:
 
 
 # Participation
+
+
+@contextlib.contextmanager
+def select_participation_coordinator(manager_module, actor_key, original_actor, training):
+    """Capture every first-step correctness job without changing the native service."""
+    selected = participation_coordinator_class(training)
+    manager_module._ACTOR_CLS[actor_key] = selected
+    try:
+        yield
+    finally:
+        manager_module._ACTOR_CLS[actor_key] = original_actor
+
+
+def participation_coordinator_class(training):
+    import ray
+
+    from arctic_platform.correctness.harness import lora as native_lora
+
+    sources = {"training": native_lora._source(training._DeepSpeedWorker.__init__)}
+    coordinator_base = participation_step_class(training.GPUTrainingJob.__ray_metadata__.modified_class)
+
+    class ParticipationCoordinator(coordinator_base):
+        async def _spawn_workers(self, cfg, ranks, master_addr, master_port, source_stage_info):
+            from dss.ray_dss.jobs.gpu import training as native_training
+
+            from .engine_admission import runtime_request_from_config
+
+            admission = runtime_request_from_config(cfg)
+            runtime_sp_size = native_training.sp.sp_size_of(cfg.get("training_config") or {}) if admission else None
+            runtime_receipts = None
+            if admission is not None:
+                from .engine_admission import verify_runtime_node
+
+                selected_hosts = list(dict.fromkeys(host for host, _ in ranks))
+                admitted_slots = {node["host"]: node["slots"] for node in admission["nodes"]}
+                if (
+                    len(ranks) != self._world_size
+                    or len(set(ranks)) != len(ranks)
+                    or [list(rank) for rank in ranks] != admission["ranks"]
+                    or self._info.job_id != admission["training_child_id"]
+                    or self._info.zone_id != admission["zone_id"]
+                    or any(host not in admitted_slots or not 0 <= gpu < admitted_slots[host] for host, gpu in ranks)
+                ):
+                    raise ValueError("final native worker placement differs from admitted allocation")
+                check = ray.remote(num_cpus=1, num_gpus=0)(verify_runtime_node)
+                receipts = await asyncio.wait_for(
+                    asyncio.gather(
+                        *(
+                            check.options(resources={f"node:{host}": 0.001}).remote(
+                                cfg, admission, host, self._world_size, runtime_sp_size
+                            )
+                            for host in selected_hosts
+                        )
+                    ),
+                    timeout=180,
+                )
+                runtime_receipts = dict(zip(selected_hosts, receipts))
+                if any(receipt["host"] != host for host, receipt in runtime_receipts.items()):
+                    raise ValueError("final native runtime check ran on an unexpected node")
+                print("CORRECTNESS_FINAL_RUNTIME " + json.dumps(receipts), flush=True)
+            ParticipationWorker = participation_worker_class(
+                training._DeepSpeedWorker,
+                runtime_admission=admission,
+                runtime_ranks=ranks,
+                runtime_world_size=self._world_size if admission is not None else None,
+                runtime_sp_size=runtime_sp_size,
+                runtime_receipts=runtime_receipts,
+            )
+            native_spawn = super()._spawn_workers
+            namespace, original_worker = native_lora._spawn_worker_binding(native_spawn, native_training, sources)
+            namespace["_DeepSpeedWorker"] = ParticipationWorker
+            try:
+                await native_spawn(cfg, ranks, master_addr, master_port, source_stage_info)
+                if namespace.get("_DeepSpeedWorker") is not ParticipationWorker:
+                    raise ValueError("participation worker binding changed during creation")
+            finally:
+                namespace["_DeepSpeedWorker"] = original_worker
+
+    return ray.remote(num_cpus=1, num_gpus=0)(ParticipationCoordinator)
+
+
+class WorkerParticipation:
+    def __init__(self, worker):
+        self.worker = worker
+        self.engine = worker._engine
+        if self.engine.global_steps != 0:
+            raise ValueError("participation must be armed before the first backward")
+        model = self.engine.module
+        decoder_getter = getattr(model, "get_decoder", None)
+        head_getter = getattr(model, "get_output_embeddings", None)
+        decoder = decoder_getter() if callable(decoder_getter) else None
+        if decoder is None and hasattr(model, "model"):
+            from arctic_platform.model.implementations.moe.vlm import get_language_model
+
+            decoder = get_language_model(model)
+        head = head_getter() if callable(head_getter) else getattr(model, "lm_head", None)
+        sources = {Path(__file__), Path(inspect.getsourcefile(ParticipationCapture))}
+        self.sources = {str(source): hashlib.sha256(source.read_bytes()).hexdigest() for source in sources}
+        self.capture = ParticipationCapture(model, decoder=decoder, head=head)
+        try:
+            self.expert_widths = {
+                name: expert_parallel_width(parameter) for name, parameter in self.capture.parameters.items()
+            }
+            self.before = self.evidence()
+        except BaseException:
+            self.close()
+            raise
+
+    def evidence(self):
+        for filename, digest in self.sources.items():
+            if hashlib.sha256(Path(filename).read_bytes()).hexdigest() != digest:
+                raise ValueError("participation capture source drift")
+        return {
+            "participation": self.capture.result(),
+            "candidate_weights": {
+                name: weight_identity(self.capture.parameters[name].detach()) for name in self.capture.candidates
+            },
+            "participation_sources": deepcopy(self.sources),
+        }
+
+    def finish(self):
+        if self.worker._engine is not self.engine or self.engine.global_steps != 1:
+            raise ValueError("participation engine changed or did not complete one step")
+        return {
+            "rank": int(self.worker.rank),
+            "job_id": self.worker.job_id,
+            "before": deepcopy(self.before),
+            "after": self.evidence(),
+            "expert_parallel_widths": dict(self.expert_widths),
+        }
+
+    def close(self):
+        self.capture.close()
+
+
+def merge_worker_receipts(receipts, *, job_id, world_size):
+    if (
+        type(world_size) is not int
+        or world_size < 1
+        or not isinstance(job_id, str)
+        or not job_id
+        or not isinstance(receipts, list)
+        or len(receipts) != world_size
+    ):
+        raise ValueError("participation requires every actual training worker")
+    for rank, receipt in enumerate(receipts):
+        if (
+            not isinstance(receipt, dict)
+            or type(receipt.get("rank")) is not int
+            or receipt["rank"] != rank
+            or receipt.get("job_id") != job_id
+        ):
+            raise ValueError("participation worker rank or training child differs")
+        before, after = receipt.get("before"), receipt.get("after")
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            raise ValueError("participation requires before/after worker evidence")
+        sources = before.get("participation_sources")
+        if not isinstance(sources, dict) or not sources or sources != after.get("participation_sources"):
+            raise ValueError("participation source identity differs before and after")
+        for filename, digest in sources.items():
+            if (
+                not isinstance(filename, str)
+                or not Path(filename).is_absolute()
+                or not isinstance(digest, str)
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+            ):
+                raise ValueError("participation source identity is invalid")
+        for evidence in (before, after):
+            inventory = evidence.get("participation")
+            if (
+                not isinstance(inventory, dict)
+                or not isinstance(inventory.get("parameters"), dict)
+                or not inventory["parameters"]
+                or any(
+                    not isinstance(entry, dict) or not isinstance(entry.get("shape"), list)
+                    for entry in inventory["parameters"].values()
+                )
+            ):
+                raise ValueError("participation worker inventory is incomplete")
+    shapes = {name: entry["shape"] for name, entry in receipts[0]["before"]["participation"]["parameters"].items()}
+    widths = receipts[0].get("expert_parallel_widths")
+    if (
+        not isinstance(widths, dict)
+        or set(widths) != set(shapes)
+        or any(type(width) is not int or width < 1 for width in widths.values())
+        or any(receipt.get("expert_parallel_widths") != widths for receipt in receipts)
+    ):
+        raise ValueError("participation expert-parallel widths are incomplete or differ across ranks")
+    participation, _ = merge_rank_participation(
+        [receipt["before"] for receipt in receipts],
+        [receipt["after"] for receipt in receipts],
+        shapes,
+        {name: [0] * widths[name] for name in shapes},
+    )
+    return {**participation, "training_child_id": job_id, "rank_receipts": deepcopy(receipts)}
+
+
+def participation_worker_class(
+    worker_base,
+    *,
+    runtime_admission=None,
+    runtime_ranks=None,
+    runtime_world_size=None,
+    runtime_sp_size=None,
+    runtime_receipts=None,
+):
+    """Capture participation for the single completed optimizer step admitted by P1."""
+
+    class ParticipationWorker(worker_base):
+        def __init__(self, *args, **kwargs):
+            if runtime_admission is not None:
+                from .engine_admission import runtime_engine_scope
+                from .engine_admission import verify_worker_runtime
+
+                cfg = args[0] if args else kwargs["cfg"]
+                self._correctness_runtime_admission = verify_worker_runtime(
+                    cfg, runtime_admission, runtime_ranks, runtime_world_size, runtime_sp_size
+                )
+                expected = runtime_receipts[self._correctness_runtime_admission["host"]]
+                if self._correctness_runtime_admission["resolved"] != expected["resolved"]:
+                    raise ValueError("actual worker engine configuration differs from precreation admission")
+                print("CORRECTNESS_WORKER_RUNTIME " + json.dumps(self._correctness_runtime_admission), flush=True)
+                with runtime_engine_scope(self._correctness_runtime_admission):
+                    super().__init__(*args, **kwargs)
+            else:
+                super().__init__(*args, **kwargs)
+            if runtime_admission is not None:
+                import torch
+
+                if self._engine.get_data_types() != (torch.bfloat16, torch.float32):
+                    raise ValueError("actual initialized worker is not BF16 with FP32 accumulation")
+
+        def fwd_bwd(self, batch):
+            if self._engine.global_steps != 0:
+                raise ValueError("participation capture requires exactly the first optimizer step")
+            if not hasattr(self, "_correctness_participation"):
+                self._correctness_participation = WorkerParticipation(self)
+            try:
+                return super().fwd_bwd(batch)
+            except BaseException:
+                self._correctness_participation.close()
+                raise
+
+        def step(self, learning_rate=None):
+            if self._engine.global_steps != 0:
+                raise ValueError("participation capture requires exactly the first optimizer step")
+            if not hasattr(self, "_correctness_participation"):
+                raise ValueError("participation capture requires backward before step")
+            try:
+                result = super().step(learning_rate)
+                self._correctness_participation_receipt = self._correctness_participation.finish()
+                return result
+            finally:
+                self._correctness_participation.close()
+
+        def correctness_participation_receipt(self):
+            return deepcopy(self._correctness_participation_receipt)
+
+        def save(self, stage_info, path=None, checkpoint_type="resumable"):
+            if checkpoint_type != "resumable":
+                return super().save(stage_info, path=path, checkpoint_type=checkpoint_type)
+            with node_local_model_state_writer(self._engine, self.local_rank):
+                return super().save(stage_info, path=path, checkpoint_type=checkpoint_type)
+
+        def destroy(self, remove_checkpoint_scratch=False):
+            capture = getattr(self, "_correctness_participation", None)
+            if capture is not None:
+                capture.close()
+            return super().destroy(remove_checkpoint_scratch=remove_checkpoint_scratch)
+
+    return ParticipationWorker
+
+
+def participation_step_class(coordinator_base):
+    """Attach the merged step-1 participation inventory to the step response of ``coordinator_base``.
+
+    Worker creation stays with ``coordinator_base``, so a coordinator that binds its own worker subclass (the LoRA
+    adapter coordinators) captures participation by binding ``participation_worker_class`` over that subclass.
+    """
+
+    class ParticipationStepCoordinator(coordinator_base):
+        async def step(self, learning_rate=None):
+            response = await super().step(learning_rate)
+            if response.get("global_steps") != 1:
+                raise ValueError("participation capture requires exactly the first optimizer step")
+            receipts = await asyncio.wait_for(
+                asyncio.gather(*(worker.correctness_participation_receipt.remote() for worker in self._workers)),
+                timeout=60,
+            )
+            response["participation"] = merge_worker_receipts(
+                receipts, job_id=self._info.job_id, world_size=len(self._workers)
+            )
+            return response
+
+    return ParticipationStepCoordinator
+
+
+def expert_parallel_width(parameter) -> int:
+    """Count the expert-parallel ranks holding disjoint dim-0 slices of ``parameter``; 1 for a replicated one."""
+    group_name = getattr(parameter, "group_name", None)
+    if group_name is None or getattr(parameter, "allreduce", True) is not False or parameter.dim() < 2:
+        return 1
+    from deepspeed.utils import groups
+
+    return torch.distributed.get_world_size(group=groups._get_expert_parallel_group(group_name))
+
 
 PARTICIPATION_SCHEMA = "trainable-parameter-participation-v1"
 
@@ -949,7 +1184,7 @@ def validate_participation(record: dict) -> dict:
 
 
 def canonical_participation(record: dict, *, backend: str) -> dict:
-    if backend not in {"dss", "reference"}:
+    if backend not in {"ap", "reference"}:
         raise ValueError(f"unknown participation backend: {backend}")
     parameters = validate_participation(record)
     normalized = {}
@@ -958,8 +1193,8 @@ def canonical_participation(record: dict, *, backend: str) -> dict:
         if key in normalized:
             raise ValueError(f"participation inventory has duplicate canonical name {key}")
         normalized[key] = entry
-    groups = canonical_dss_tensor_groups(normalized) if backend == "dss" else {name: None for name in normalized}
-    covered = [name for group in groups.values() for name in group.originals] if backend == "dss" else list(groups)
+    groups = canonical_ap_tensor_groups(normalized) if backend == "ap" else {name: None for name in normalized}
+    covered = [name for group in groups.values() for name in group.originals] if backend == "ap" else list(groups)
     if sorted(covered) != sorted(normalized):
         raise ValueError("participation inventory has a canonical name collision")
     result = {}
@@ -982,7 +1217,7 @@ def canonical_participation(record: dict, *, backend: str) -> dict:
 
 
 def compare_participation(target: dict, reference: dict) -> tuple[int, int]:
-    actual = canonical_participation(target, backend="dss")
+    actual = canonical_participation(target, backend="ap")
     expected = canonical_participation(reference, backend="reference")
     if set(actual) != set(expected):
         raise ValueError(
@@ -1322,14 +1557,17 @@ def _native_callback_origin(callback):
         templates = [contextlib.contextmanager(wrapped)]
         tracing_template = None
         if selected.__module__ == "ray._private.worker" and selected.__name__ in {"is_initialized", "get", "put"}:
-            ray = importlib.import_module("ray")
+            import ray
+
             if callback is not getattr(ray, selected.__name__, None):
                 raise ValueError("native optimizer callback requires the current public Ray function")
-            client_hook = importlib.import_module("ray._private.client_mode_hook")
-            auto_init_hook = importlib.import_module("ray._private.auto_init_hook")
+            from ray._private import auto_init_hook
+            from ray._private import client_mode_hook as client_hook
+
             templates.extend((client_hook.client_mode_hook(wrapped), auto_init_hook.wrap_auto_init(wrapped)))
         if selected.__globals__.get("__name__") == "ray.util.tracing.tracing_helper":
-            tracing = importlib.import_module("ray.util.tracing.tracing_helper")
+            from ray.util.tracing import tracing_helper as tracing
+
             factory_name = "async_span_wrapper" if inspect.iscoroutinefunction(wrapped) else "span_wrapper"
             factories = [
                 code
@@ -1941,19 +2179,23 @@ def make_native_optimizer_scope(request, *, gateway_snowapi, gateway, manager, r
     """Bind caller-held current MAIN objects; never discover another allocation or create a receiver."""
     request = json.loads(json.dumps(request, allow_nan=False))
     _native_scope_sources(request)
-    manager_module = importlib.import_module("dss.ray_dss.zones.manager")
-    for module, name, role in (
-        (gateway_snowapi, "dss.ray_dss.gateway_snowapi", "gateway_snowapi"),
-        (gateway, "dss.ray_dss.gateway_server", "gateway"),
-        (manager_module, "dss.ray_dss.zones.manager", "manager"),
+    import ray as installed_ray
+    from dss.ray_dss import gateway_server as installed_gateway
+    from dss.ray_dss import gateway_snowapi as installed_snowapi
+    from dss.ray_dss.zones import manager as manager_module
+
+    for module, installed, role in (
+        (gateway_snowapi, installed_snowapi, "gateway_snowapi"),
+        (gateway, installed_gateway, "gateway"),
+        (manager_module, manager_module, "manager"),
     ):
-        if module is not importlib.import_module(name) or module.__file__ != request["route_sources"][role]["path"]:
+        if module is not installed or module.__file__ != request["route_sources"][role]["path"]:
             raise ValueError("native scope requires the actual selected MAIN modules")
     if type(manager) is not manager_module.ZoneManager or manager.zone_type.value != "training":
         raise ValueError("native scope requires its actual current MAIN training manager")
     verify_native_callback(manager.get_job, request["route_sources"]["manager"])
     _native_scope_origin(ray.get, request["route_sources"]["ray_get"])
-    if ray is not importlib.import_module("ray"):
+    if ray is not installed_ray:
         raise ValueError("native scope requires the current installed Ray module")
     get = ray.get
     timeout = request["rpc_timeout_seconds"]
@@ -2193,11 +2435,14 @@ def resolve_native_optimizer_parent(request, parent_id, *, gateway_snowapi, gate
     """Resolve only in the actual gateway owner; allocation fields remain caller expectations."""
     request = json.loads(json.dumps(request, allow_nan=False))
     digest = _native_split_request(request)
-    for module, name, role in (
-        (gateway_snowapi, "dss.ray_dss.gateway_snowapi", "gateway_snowapi"),
-        (gateway, "dss.ray_dss.gateway_server", "gateway"),
+    from dss.ray_dss import gateway_server as installed_gateway
+    from dss.ray_dss import gateway_snowapi as installed_snowapi
+
+    for module, installed, role in (
+        (gateway_snowapi, installed_snowapi, "gateway_snowapi"),
+        (gateway, installed_gateway, "gateway"),
     ):
-        if module is not importlib.import_module(name) or module.__file__ != request["route_sources"][role]["path"]:
+        if module is not installed or module.__file__ != request["route_sources"][role]["path"]:
             raise ValueError("native parent resolution requires the actual gateway owner modules")
     parent = gateway_snowapi._parents.get(parent_id)
     if (
@@ -2276,7 +2521,9 @@ def open_native_optimizer_zone_scope(request, binding, *, manager, ray, verify_p
         != {"hosts": request["allocation_hosts"], "world_size": request["expected_world_size"]}
     ):
         raise ValueError("native zone scope requires its exact source-bound gateway binding")
-    manager_module = importlib.import_module("dss.ray_dss.zones.manager")
+    import ray as installed_ray
+    from dss.ray_dss.zones import manager as manager_module
+
     if (
         manager_module.__file__ != request["route_sources"]["manager"]["path"]
         or type(manager) is not manager_module.ZoneManager
@@ -2285,7 +2532,7 @@ def open_native_optimizer_zone_scope(request, binding, *, manager, ray, verify_p
     ):
         raise ValueError("native zone scope requires its actual owning training manager")
     _native_scope_origin(ray.get, request["route_sources"]["ray_get"])
-    if ray is not importlib.import_module("ray"):
+    if ray is not installed_ray:
         raise ValueError("native zone scope requires canonical initialized owner Ray")
     verify_native_callback(ray.is_initialized, request["route_sources"]["ray_is_initialized"])
     if ray.is_initialized() is not True:
@@ -2627,9 +2874,19 @@ def _load(path: Path) -> dict:
     if globals_needed - _SCHEMA_GLOBALS:
         raise ValueError(f"unsupported checkpoint globals in {path.name}: {sorted(globals_needed - _SCHEMA_GLOBALS)}")
     allowed = []
-    for name in sorted(globals_needed):
-        module, _, attribute = name.rpartition(".")
-        allowed.append(getattr(importlib.import_module(module), attribute))
+    if globals_needed:
+        from deepspeed.runtime.fp16.loss_scaler import DynamicLossScaler
+        from deepspeed.runtime.fp16.loss_scaler import LossScaler
+        from deepspeed.runtime.zero.config import ZeroStageEnum
+        from deepspeed.utils.tensor_fragment import fragment_address
+
+        schema_types = {
+            "deepspeed.runtime.fp16.loss_scaler.DynamicLossScaler": DynamicLossScaler,
+            "deepspeed.runtime.fp16.loss_scaler.LossScaler": LossScaler,
+            "deepspeed.runtime.zero.config.ZeroStageEnum": ZeroStageEnum,
+            "deepspeed.utils.tensor_fragment.fragment_address": fragment_address,
+        }
+        allowed = [schema_types[name] for name in sorted(globals_needed)]
     with torch.serialization.safe_globals(allowed):
         state = torch.load(path, map_location="cpu", mmap=True, weights_only=True)
     if not isinstance(state, dict):
@@ -4352,9 +4609,9 @@ def node_local_model_state_writer(engine, node_rank: int):
 
     DeepSpeed selects the node-local model-state writer by ``engine.local_rank``, read from ``LOCAL_RANK``. DSS starts
     every Ray worker with ``LOCAL_RANK=0`` and one visible GPU, so with ``checkpoint.use_node_local_storage`` every
-    rank writes its own module state to the same path. Under expert parallelism those states hold different experts,
-    and the file left on a node is whichever rank wrote it last, not the rank-zero state the expert sidefile check
-    and the collector receipts attribute it to. ``node_rank`` is the worker's rank within its node.
+    rank writes its own module state to the same path, which can corrupt the archive even for replicated dense
+    weights. Under expert parallelism those states also hold different experts, so the last writer need not match
+    the rank-zero state attributed by collector receipts. ``node_rank`` is the worker's rank within its node.
     """
     if type(node_rank) is not int or node_rank < 0:
         raise ValueError("node-local model-state writer requires the worker's nonnegative rank within its node")

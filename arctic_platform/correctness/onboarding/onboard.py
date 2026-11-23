@@ -36,6 +36,7 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from contextlib import nullcontext
 from contextlib import redirect_stderr
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -44,6 +45,7 @@ from types import SimpleNamespace
 from arctic_platform.correctness.harness.config import DEFAULT_REFERENCE_CALIBRATION_RUNS
 from arctic_platform.correctness.harness.config import reference_calibration_worker_count
 from arctic_platform.correctness.harness.config import reference_config_subpath
+from arctic_platform.correctness.harness.config import validate_first_two_model_dtype
 from arctic_platform.correctness.harness.storage import CORRECTNESS_LOGDIR_ENV
 from arctic_platform.correctness.harness.storage import correctness_logdir
 from arctic_platform.correctness.harness.storage import correctness_workdir
@@ -108,6 +110,81 @@ def _onboarding_failure(reason: str) -> None:
     print(file=sys.stderr, flush=True)
 
 
+@contextmanager
+def _logged_output(path: Path):
+    """Retain prints and logger tracebacks before entering any backend context."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as log:
+        stdout = _ConsoleLog(sys.stdout, log)
+        stderr = _ConsoleLog(sys.stderr, log)
+        logger = logging.getLogger()
+        previous = logger.handlers[:]
+        handler = logging.StreamHandler(stderr)
+        logger.handlers = [handler]
+        try:
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                try:
+                    yield
+                except BaseException:
+                    # The outer boundary reports the exception to the console once.
+                    traceback.print_exc(file=log)
+                    raise
+        finally:
+            logger.handlers = previous
+            handler.close()
+
+
+@contextmanager
+def _onboarding_test_log(args: argparse.Namespace):
+    """Capture each test from preflight onward, including logger tracebacks."""
+    directory = getattr(args, "_diagnostics_dir", None)
+    if directory is None:
+        yield None
+        return
+    path = directory / "test.log"
+    with _logged_output(path):
+        print(f"Onboarding log ({args.test_id}): {path}", flush=True)
+        yield path
+
+
+def _failure_log_detail(path: Path | None) -> str:
+    if path is None:
+        return ""
+    return f"\nComplete log: {path}"
+
+
+def _log_tail(path: Path) -> str:
+    """Bound the fallback detail while leaving the full output in the saved log."""
+    with path.open("rb") as log:
+        log.seek(0, os.SEEK_END)
+        log.seek(max(0, log.tell() - 8192))
+        return "\n".join(log.read().decode("utf-8", errors="replace").splitlines()[-20:])
+
+
+def _failure_reason(error: BaseException, path: Path | None) -> str:
+    parts = []
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        parts.append(f"{type(error).__name__}: {error}")
+        error = error.__cause__ or (None if error.__suppress_context__ else error.__context__)
+    reason = "\nCaused by: ".join(parts)
+    if path is not None and any(part.startswith("CalledProcessError:") for part in parts):
+        reason += f"\nLast onboarding output:\n{_log_tail(path)}"
+    return reason + _failure_log_detail(path)
+
+
+@contextmanager
+def _onboarding_test_time(args: argparse.Namespace, test_id: str):
+    if not hasattr(args, "_onboarding_times"):
+        args._onboarding_times = {}
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        args._onboarding_times[test_id] = args._onboarding_times.get(test_id, 0.0) + time.monotonic() - started
+
+
 def logged_run(args: argparse.Namespace) -> int:
     """Retain diagnostics even when prerequisites or specification loading fail."""
     from arctic_platform.correctness.harness.report import total_duration
@@ -135,7 +212,7 @@ def logged_run(args: argparse.Namespace) -> int:
                     try:
                         return run(args)
                     except Exception as exc:
-                        reason = f"{type(exc).__name__}: {exc}"
+                        reason = _failure_reason(exc, log_path)
                         traceback.print_exc()
                         timings = "".join(
                             f"\nOnboarding time ({test_id}): {total_duration(elapsed)}\n"
@@ -150,6 +227,12 @@ def logged_run(args: argparse.Namespace) -> int:
                         _onboarding_failure(reason)
                         print(f"Report: {args._diagnostics_dir / 'report.md'}", file=sys.stderr, flush=True)
                         return 1
+                    except KeyboardInterrupt:
+                        traceback.print_exc(file=log)
+                        raise
+                    except BaseException:
+                        traceback.print_exc()
+                        raise
                     finally:
                         for test_id, elapsed in args._onboarding_times.items():
                             print(f"Onboarding time ({test_id}): {total_duration(elapsed)}", flush=True)
@@ -182,14 +265,20 @@ def _stream_subprocess(command, *, cwd, env) -> int:
 
 
 def _configure_fixture_target(args: argparse.Namespace, config, selection: list[str]) -> None:
+    from arctic_platform.correctness.harness.execution import _configure_e2e_model
+
+    _configure_e2e_model(args, config, selection)
     if getattr(args, "backend", None) == "cortex-training":
         args.backend = "cortex"
     if (
         getattr(args, "prepare_references", False)
         or getattr(args, "probe_layers", None) is not None
         or getattr(args, "backend", "onprem") not in {"cortex", "cortex-training"}
-        or config.is_rl
-        or not set(selection).intersection(CALIBRATED_TEST_IDS)
+        or (config.is_rl and getattr(args, "test_id", None) != "checkpoint-resume-loss")
+        or not (
+            set(selection).intersection((*CALIBRATED_TEST_IDS, "checkpoint-resume-loss"))
+            or (getattr(args, "local_gateway_full_model", False) and selection == ["e2e-sft-train-validate"])
+        )
     ):
         return
     from arctic_platform.correctness.harness.execution import _client_backend
@@ -206,24 +295,58 @@ def _configure_fixture_target(args: argparse.Namespace, config, selection: list[
         require_local_cortex_gateway(_client_backend(args))
     except ValueError as exc:
         raise ValueError(
-            "Reduced-model onboarding requires an unauthenticated HTTP loopback Cortex-training gateway. "
+            "Local model onboarding requires an unauthenticated HTTP loopback Cortex-training gateway. "
             "Remove hosted ARCTIC_CORTEX_HOST/PAT settings to use the automatically managed local gateway, "
-            "or pass --base-url for an existing local gateway. Hosted reduced-model onboarding is unsupported."
+            "or pass --base-url for an existing local gateway. Hosted local-model onboarding is unsupported."
         ) from exc
-    if args.test_id in CALIBRATED_TEST_IDS:
+    if args.test_id in (*CALIBRATED_TEST_IDS, "checkpoint-resume-loss"):
         args.local_cortex_fixture = True
+    if args.test_id == "checkpoint-resume-loss":
+        args._automatic_checkpoint_bridge = True
+
+
+def _checkpoint_placement(args: argparse.Namespace, config):
+    """Use the regression's explicit placement without mutating the reviewed config."""
+    width = getattr(args, "checkpoint_training_gpus", None)
+    if width is None:
+        return config
+    if type(width) is not int or width < 1:
+        raise ValueError("--checkpoint-training-gpus must be a positive integer")
+    if (
+        args.test_id != "checkpoint-resume-loss"
+        or config.is_rl
+        or getattr(args, "prepare_references", False)
+        or getattr(args, "probe_layers", None) is not None
+    ):
+        raise ValueError("--checkpoint-training-gpus requires supervised checkpoint-resume-loss onboarding")
+    pool = getattr(args, "gpu_pool", None) or width
+    if width > pool:
+        raise ValueError(f"requested checkpoint training width {width} exceeds GPU pool {pool}")
+    return config.at_gpu_width(width)
 
 
 @contextmanager
 def _validation_gateway(args: argparse.Namespace):
     """Use the installed DSS gateway, and shut down only the server this command started."""
     if not getattr(args, "_automatic_cortex_gateway", False):
+        if getattr(args, "_automatic_checkpoint_bridge", False):
+            from arctic_platform.correctness.harness.cortex import local_checkpoint_bridge
+
+            with local_checkpoint_bridge():
+                yield None
+            return
         yield None
         return
     from arctic_platform.correctness.harness.gateway import local_cortex_gateway
 
     directory = getattr(args, "_diagnostics_dir", args.output_dir)
-    with local_cortex_gateway(directory, gateway_module="arctic_platform.debug.training") as url:
+    if getattr(args, "_automatic_checkpoint_bridge", False):
+        from arctic_platform.correctness.harness.execution import _regression_gateway
+
+        with _regression_gateway(SimpleNamespace(**{**vars(args), "out": directory})) as url:
+            yield url
+        return
+    with local_cortex_gateway(directory, gateway_module="arctic_platform.correctness.harness.gateway") as url:
         yield url
 
 
@@ -233,6 +356,126 @@ def _checkpoint_file_identity(path: Path | str) -> dict:
         digest = hashlib.file_digest(stream, "sha256").hexdigest()
         size = os.fstat(stream.fileno()).st_size
     return {"sha256": digest, "size": size}
+
+
+def _resume_onboarding_timing(tree: ast.Module) -> ast.Module:
+    """Normalize only the exact reviewed per-test timing additions."""
+    removed = {
+        ast.dump(ast.parse(source).body[0])
+        for source in (
+            """@contextmanager
+def _onboarding_test_time(args: argparse.Namespace, test_id: str):
+    if not hasattr(args, "_onboarding_times"):
+        args._onboarding_times = {}
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        args._onboarding_times[test_id] = args._onboarding_times.get(test_id, 0.0) + time.monotonic() - started""",
+            "args._onboarding_times = {}",
+            """if not hasattr(args, "_onboarding_times"):
+    args._onboarding_times = {}""",
+            """timings = "".join(
+    f"\\nOnboarding time ({test_id}): {total_duration(elapsed)}\\n"
+    for test_id, elapsed in args._onboarding_times.items()
+)""",
+            """for test_id, elapsed in args._onboarding_times.items():
+    print(f"Onboarding time ({test_id}): {total_duration(elapsed)}", flush=True)""",
+            'results[test_id]["elapsed_seconds"] = args._onboarding_times[test_id]',
+            """if "combined reference preparation" in args._onboarding_times:
+    lines.extend([
+        "Combined reference preparation time: "
+        f"{total_duration(args._onboarding_times['combined reference preparation'])}",
+        "",
+    ])""",
+        )
+    }
+    selection_nodes = {
+        ast.dump(ast.parse(source).body[0])
+        for source in (
+            "selection = args.reference_tests or [args.test_id]",
+            'label = selection[0] if len(selection) == 1 else "combined reference preparation"',
+        )
+    }
+    contexts = {
+        ast.dump(ast.parse(f"with {source}:\n    pass").body[0].items[0])
+        for source in (
+            "_onboarding_test_time(args, label)",
+            "_onboarding_test_time(args, args.test_id)",
+            "_onboarding_test_time(child, test_id)",
+            '_onboarding_test_time(args, "combined reference preparation")',
+        )
+    }
+    report_import = ast.dump(
+        ast.parse("from arctic_platform.correctness.harness.report import total_duration").body[0]
+    )
+    failure_report = (
+        'f"# Onboarding Failed\\n\\nConfig: `{args.config}`\\n\\n"'
+        'f"## Reason\\n\\n{reason}\\n{timings}\\n"'
+        '"Complete traceback: [onboarding.log](onboarding.log)\\n"'
+    )
+    previous_failure_report = (
+        'f"# Onboarding Failed\\n\\nConfig: `{args.config}`\\n\\n"'
+        'f"## Reason\\n\\n{reason}\\n\\nComplete traceback: [onboarding.log](onboarding.log)\\n"'
+    )
+    failure_report_node = ast.dump(ast.parse(failure_report, mode="eval").body)
+    timing_line = ast.dump(
+        ast.parse(
+            """(f"Onboarding time: {total_duration(result['elapsed_seconds'])}"
+if "elapsed_seconds" in result else "Onboarding time: not run")""",
+            mode="eval",
+        ).body
+    )
+    combined_time = ast.dump(
+        ast.parse('args._onboarding_times.get("combined reference preparation")', mode="eval").body
+    )
+
+    class TimingDisplay(ast.NodeTransformer):
+        function = None
+
+        def visit(self, node):
+            identity = ast.dump(node)
+            if identity in removed or self.function == "run" and identity in selection_nodes:
+                return None
+            if self.function == "_onboard_configuration" and identity == report_import:
+                return None
+            if identity == failure_report_node:
+                return ast.parse(previous_failure_report, mode="eval").body
+            return super().visit(node)
+
+        def visit_FunctionDef(self, node):
+            previous = self.function
+            self.function = node.name
+            node = self.generic_visit(node)
+            self.function = previous
+            return node
+
+        def visit_With(self, node):
+            node = self.generic_visit(node)
+            if len(node.items) == 1 and ast.dump(node.items[0]) in contexts:
+                return node.body
+            return node
+
+        def visit_Dict(self, node):
+            for index in range(len(node.keys) - 1, -1, -1):
+                if (
+                    isinstance(node.keys[index], ast.Constant)
+                    and node.keys[index].value == "combined_reference_elapsed_seconds"
+                    and ast.dump(node.values[index]) == combined_time
+                ):
+                    del node.keys[index]
+                    del node.values[index]
+            return self.generic_visit(node)
+
+        def visit_List(self, node):
+            for index in range(len(node.elts) - 2, -1, -1):
+                if ast.dump(node.elts[index]) == timing_line and ast.dump(node.elts[index + 1]) == ast.dump(
+                    ast.Constant(value="")
+                ):
+                    del node.elts[index : index + 2]
+            return self.generic_visit(node)
+
+    return TimingDisplay().visit(tree)
 
 
 def _resume_preparation_request(request: dict, root: Path) -> dict:
@@ -360,24 +603,12 @@ def _resume_setup(args: argparse.Namespace) -> None:
     }
     if not getattr(args, "_automatic_cortex_gateway", False):
         options["base_url"] = getattr(args, "base_url", None) or os.environ.get("ARCTIC_CORTEX_BASE_URL")
-    versions = {}
-    for name in ("torch", "transformers", "huggingface-hub", "peft", "deepspeed", "ray", "dss", "dss-client"):
-        try:
-            versions[name] = importlib.metadata.version(name)
-        except importlib.metadata.PackageNotFoundError:
-            versions[name] = None
     source = Path(args.source_checkpoint)
     request = {
         "config": _checkpoint_file_identity(args.config),
         "options": options,
-        "python": sys.executable,
-        "dependencies": versions,
+        **_onboarding_runtime_sources(),
         "source": model_identity(source, refresh=True) if source.is_dir() else args.source_checkpoint,
-        "code": {
-            str(path.relative_to(root)): _checkpoint_file_identity(path)
-            for folder in ("onboarding", "harness", "reference", "checks")
-            for path in sorted((root / folder).rglob("*.py"))
-        },
     }
     digest = hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest()
     args._resume_dir = args._resume_root / args.test_spec.stem / args.test_id / digest
@@ -535,22 +766,58 @@ def _onboarding_preflight(args: argparse.Namespace, config, selection: list[str]
         ]
     if not selection:
         return
-    if not config.is_rl and any(tests[test_id].compares_to_reference for test_id in selection):
+    first_two = bool(set(selection).intersection(CALIBRATED_TEST_IDS))
+    if first_two:
+        validate_first_two_model_dtype(config)
+    first_two_compares = first_two and (
+        not config.is_rl and any(tests[test_id].compares_to_reference for test_id in selection)
+    )
+    if first_two_compares:
+        from arctic_platform.correctness.harness.engine_admission import validate_reference_accumulation
+
+        data_types = (config.training.get("ds_config") or {}).get("data_types") or {}
+        if not isinstance(data_types, dict) or data_types.get("grad_accum_dtype") is not None:
+            validate_reference_accumulation(config)
+    elif not config.is_rl and any(tests[test_id].compares_to_reference for test_id in selection):
         ds_config = config.training.get("ds_config") or {}
         dtype = str(config.sub_job.get("dtype") or config.training.get("dtype") or "bfloat16").lower()
         bf16 = ds_config.get("bf16")
         bf16_enabled = bool(bf16.get("enabled", False)) if isinstance(bf16, dict) else dtype in ("bf16", "bfloat16")
         if bf16_enabled:
-            data_types = ds_config.get("data_types")
-            accumulation = data_types.get("grad_accum_dtype") if isinstance(data_types, dict) else None
-            if accumulation != "fp32":
+            from arctic_platform.common.deepspeed_engine import TrainingEngineSpec
+            from arctic_platform.common.deepspeed_engine import build_deepspeed_config
+
+            # ``build_deepspeed_config`` resolves the target's accumulation dtype with the rule the on-prem worker
+            # shares: FP32 unless ``data_types.grad_accum_dtype`` is set, or DeepSpeed refuses FP32 accumulation under
+            # the ZeRO setting. Only the ZeRO and ``data_types`` keys decide it, so the rest of the client config is
+            # left for the target to validate.
+            overrides = {key: ds_config[key] for key in ("data_types", "zero_optimization") if key in ds_config}
+            resolved = build_deepspeed_config(
+                TrainingEngineSpec(world_size=1, ds_overrides={**overrides, "bf16": {"enabled": True}})
+            )
+            data_types = resolved.get("data_types")
+            remedy = None
+            if data_types is not None and not isinstance(data_types, dict):
+                remedy = f'Set data_types to a mapping with grad_accum_dtype "fp32" (got {data_types!r})'
+            elif (accumulation := (data_types or {}).get("grad_accum_dtype")) is None:
+                remedy = (
+                    "DeepSpeed refuses FP32 gradient accumulation with ZeRO disabled and at ZeRO stage 1 with "
+                    "compute_grad_norm false and no CPU optimizer offload, so the target would accumulate in BF16; "
+                    "change zero_optimization"
+                )
+            elif accumulation != "fp32":
+                remedy = f'Set data_types.grad_accum_dtype to "fp32" (got {accumulation!r})'
+            if remedy is not None:
                 raise ValueError(
                     f"{args.config.resolve()}: BF16 correctness comparisons use FP32 HF gradient accumulation. "
-                    'Set data_types.grad_accum_dtype to "fp32" in the supplied configuration\'s training.ds_config '
-                    "(training_config.ds_config for Cortex recipes) before onboarding; "
-                    f"got {accumulation!r}. Onboarding does not change this setting."
+                    f"{remedy} in the supplied configuration's training.ds_config (training_config.ds_config for "
+                    "Cortex recipes) before onboarding. Onboarding does not change this setting."
                 )
     _configure_fixture_target(args, config, selection)
+    if first_two_compares:
+        validate_reference_accumulation(
+            config, automatically_owned_local=getattr(args, "_automatic_cortex_gateway", False)
+        )
     if getattr(args, "_prerequisites_checked", False):
         return
     if config.n_gpus < 1 or config.sp_size < 1 or config.n_gpus % config.sp_size:
@@ -937,7 +1204,7 @@ def _probe_worker(args: argparse.Namespace) -> int:
         )
         exit_code = 0
     except Exception as error:  # CUDA OOM is an expected sizing outcome; other failures stay fatal.
-        payload.update(memory=_memory_snapshot(), error=f"{type(error).__name__}: {error}")
+        payload.update(memory=_memory_snapshot(), error=_failure_reason(error, None))
         if _is_cuda_oom(error):
             payload["status"] = "oom"
             if not cache_preexisting:
@@ -945,6 +1212,7 @@ def _probe_worker(args: argparse.Namespace) -> int:
                 payload["model_cache_removed"] = True
             exit_code = OOM_EXIT
         else:
+            traceback.print_exc()
             payload["status"] = "error"
             exit_code = 1
     args.probe_output.parent.mkdir(parents=True, exist_ok=True)
@@ -980,7 +1248,7 @@ def _spec_arms(cfg, arm_defs, vocab_size: int):
                 max_seq_len=definition.max_seq_len,
                 total_tokens=batch.total_tokens,
                 active_tokens=batch.active_tokens,
-                dss_microbatches=definition.microbatches(
+                ap_microbatches=definition.microbatches(
                     correctness_microbatch_tokens(cfg.max_tokens_per_mb), cfg.dp_size
                 ),
                 pad_fraction=batch.pad_fraction,
@@ -988,7 +1256,7 @@ def _spec_arms(cfg, arm_defs, vocab_size: int):
         )
 
     notes = []
-    if not any(arm.dss_microbatches > 1 for arm in arms):
+    if not any(arm.ap_microbatches > 1 for arm in arms):
         notes.append(
             "No arm splits into more than one microbatch, so gradient accumulation is untested; "
             "raise a global batch size or lower mb_spec.max_tokens_per_mb."
@@ -1018,7 +1286,7 @@ def build_spec(
     from arctic_platform.correctness.onboarding.synth_model import materialize_pretrained
     from arctic_platform.correctness.onboarding.synth_model import size_for_single_gpu
 
-    temporary = workdir if workdir is not None else correctness_workdir("dss-onboard-")
+    temporary = workdir if workdir is not None else correctness_workdir("ap-onboard-")
     temporary.mkdir(parents=True, exist_ok=True)
     if num_layers is None:
         num_layers, _ = size_for_single_gpu(source_checkpoint)
@@ -1072,45 +1340,6 @@ def _write_initial_spec(args: argparse.Namespace, selected: dict, first_oom: dic
     spec.write(args.test_spec)
 
 
-def _prepare_onboarding_fixture(args: argparse.Namespace, config) -> tuple[dict, int, int]:
-    """Freeze shared model and inputs without declaring any check successfully onboarded."""
-    from arctic_platform.correctness.harness.config import TestSpec
-    from arctic_platform.correctness.harness.config import config_checksum
-
-    full_layers, period, representative_layers = _model_shape(str(args.source_checkpoint))
-    with _phase("Phase 1/3", "Representative Fixture Preparation"):
-        if args.test_spec.exists():
-            spec = TestSpec.read(args.test_spec)
-            if spec.config_id != config.config_id or spec.config_checksum != config_checksum(config):
-                raise ValueError("the existing fixture specification does not match the supplied configuration")
-            selected = {
-                "status": "fit",
-                "layers": spec.model.num_hidden_layers,
-                "peak_gib": spec.model.measured_reference_peak_gib or 0.0,
-            }
-            print(f"Reusing frozen model and inputs from {args.test_spec}", flush=True)
-        else:
-            if getattr(args, "reuse_sizing", None) is not None:
-                selected = _resume_phase(args, "sizing", lambda: _reuse_sizing(args, representative_layers))
-            else:
-                selected = _resume_phase(args, "sizing", lambda: _run_probe(args, representative_layers))
-            if selected["status"] == "oom":
-                raise RuntimeError(f"the minimum representative configuration ({representative_layers} layers) OOMs")
-            if selected["status"] != "fit":
-                raise RuntimeError(
-                    f"unexpected sizing status {selected['status']!r} for {representative_layers} layers"
-                )
-            _stage("Reference", "Fixture Preparation", "Writing the shared fixture specification and frozen inputs.")
-            _resume_phase(args, "fixture", lambda: _write_initial_spec(args, selected, None))
-            spec = TestSpec.read(args.test_spec)
-            spec.applicable_tests = []
-            spec.test_tolerances = {}
-            spec.test_settings = {}
-            spec.write(args.test_spec)
-        print(f"phase 1/3 complete: selected={selected['layers']} layers peak={selected['peak_gib']:.3f} GiB")
-    return selected, full_layers, period
-
-
 def _shared_adapter(args: argparse.Namespace, config, model_path: Path | None = None) -> Path | None:
     from arctic_platform.correctness.harness.lora import shared_adapter_identity as adapter_identity
 
@@ -1128,6 +1357,7 @@ def _shared_adapter(args: argparse.Namespace, config, model_path: Path | None = 
         generated = getattr(args, "_generated_shared_adapters", {})
         key = str(model_path.resolve())
         if key not in generated:
+            # The runner generates the regression adapter with SEED; its identity binds the recorded references.
             generated[key] = generate_adapter(
                 model_path, config.training["peft_config"], correctness_workdir("shared-peft-") / "adapter", seed=SEED
             )
@@ -1183,195 +1413,6 @@ def _render_and_run_calibration(args: argparse.Namespace, selected: dict) -> Pat
     return calibration_json
 
 
-def _run_optimizer_calibration(args: argparse.Namespace) -> Path:
-    """Calibrate full-tensor optimizer deltas across a set of nondeterministic reference runs."""
-    args.output_dir = require_data_fast_path(args.output_dir, label="optimizer calibration work directory")
-    model_path = require_data_fast_path(args.optimizer_model_path, label="optimizer calibration model cache")
-
-    from decimal import ROUND_CEILING
-    from decimal import Decimal
-
-    import torch
-    from tqdm.auto import tqdm
-    from transformers import AutoConfig
-
-    from arctic_platform.correctness.checks.optimizer_state import max_pairwise_optimizer_delta
-    from arctic_platform.correctness.harness.config import TestSpec
-    from arctic_platform.correctness.harness.config import TestTolerance
-    from arctic_platform.correctness.harness.config import config_checksum
-    from arctic_platform.correctness.harness.config import load_config
-    from arctic_platform.correctness.harness.report import reference_progress
-    from arctic_platform.correctness.harness.runner import run_reference
-    from arctic_platform.correctness.harness.sft import SEED
-    from arctic_platform.correctness.harness.sft import build_synthetic_batch as build_batch
-    from arctic_platform.correctness.harness.sft import save
-
-    config = load_config(args.config)
-    spec = TestSpec.read(args.test_spec)
-    if spec.config_checksum != config_checksum(config):
-        raise ValueError("the existing spec does not match the config; onboard Test 1 before Test 2")
-    gas1 = next((arm for arm in spec.arms if arm.name == "gas1"), None)
-    if gas1 is None:
-        raise ValueError("the existing spec has no gas1 case")
-    model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-    vocab_size = getattr(model_config, "text_config", model_config).vocab_size
-    batch = build_batch(gas1.name, gas1.global_batch_size, gas1.max_seq_len, vocab_size, seed=SEED)
-    batch_path = args.output_dir / "optimizer-calibration-batch.pt"
-    save(batch, batch_path)
-    training = config.effective_training
-    optimizer_config = config.training.get("optimizer")
-    if not isinstance(optimizer_config, dict):
-        raise ValueError("optimizer calibration requires an explicit optimizer config")
-    adapter_path = _shared_adapter(args, config, model_path)
-
-    lanes = reference_calibration_worker_count(
-        getattr(args, "reference_calibration_workers", None), runs=CALIBRATION_RUNS
-    )
-    calibration_root = correctness_workdir("optimizer-calibration-")
-    manifests: list[Path] = []
-    worst_delta = 0.0
-    worst_name = None
-    losses = []
-    peaks = []
-    durations = []
-
-    def one_run(run_index: int) -> tuple[int, float, dict]:
-        run_dir = calibration_root / f"run-{run_index + 1:02d}"
-        run_dir.mkdir(parents=True, exist_ok=True)
-        started = time.monotonic()
-        result = run_reference(
-            str(model_path),
-            batch_path,
-            run_dir / "result.json",
-            token_budget=args.reference_token_budget,
-            ce_chunk=2048,
-            attn=config.reference_attention_implementation,
-            fp32_lm_head=bool(training.get("fp32_lm_head", False)),
-            fused_cross_entropy=training.get("fused_cross_entropy", False),
-            matmul_precision=training.get("matmul_precision", "highest"),
-            peft_config=training.get("peft_config"),
-            peft_adapter_path=adapter_path,
-            lm_head_token_chunk_size=config.lm_head_token_chunk_size,
-            lm_head_vocab_chunk_size=training.get("fused_lm_head_vocab_chunk_size", 8192),
-            optimizer_config=optimizer_config,
-            learning_rate=1e-2,
-            gradient_clipping=config.training.get("gradient_clipping"),
-            optimizer_dtype=config.optimizer_dtype,
-            optimizer_output_dir=run_dir / "states",
-            cuda_device=run_index % lanes,
-            deterministic=False,
-        )
-        return run_index, time.monotonic() - started, result
-
-    try:
-        completed: dict[int, tuple[float, dict]] = {}
-        for start in range(0, CALIBRATION_RUNS, lanes):
-            with ThreadPoolExecutor(max_workers=lanes) as pool:
-                futures = {
-                    pool.submit(one_run, index): index for index in range(start, min(start + lanes, CALIBRATION_RUNS))
-                }
-                for _, (index, elapsed, result) in reference_progress(
-                    futures, label="Finding optimizer tolerance", total=CALIBRATION_RUNS, completed=len(completed)
-                ):
-                    completed[index] = (elapsed, result)
-        for index in range(CALIBRATION_RUNS):
-            elapsed, result = completed[index]
-            durations.append(elapsed)
-            losses.append(float(result["loss"]))
-            peaks.append(float(result["peak_gib"]))
-            manifests.append(Path(result["optimizer_state_manifest"]))
-        parameter_count = len(json.loads(manifests[0].read_text())["parameters"])
-        pair_count = CALIBRATION_RUNS * (CALIBRATION_RUNS - 1) // 2
-        with tqdm(
-            total=parameter_count, desc=f"Comparing {pair_count} reference pairs", unit="tensor", dynamic_ncols=True
-        ) as progress:
-            worst = max_pairwise_optimizer_delta(
-                manifests,
-                optimizer_config=optimizer_config,
-                learning_rate=1e-2,
-                progress=progress,
-            )
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        if worst is not None:
-            worst_delta = worst.delta_norm
-            worst_name = f"{worst.name}::{worst.state}"
-    finally:
-        shutil.rmtree(calibration_root, ignore_errors=True)
-
-    quantum = Decimal("0.001")
-    computed_gate = GATE_SAFETY_FACTOR * worst_delta
-    rounded_gate = (Decimal(str(computed_gate)) / quantum).to_integral_value(rounding=ROUND_CEILING) * quantum
-    selected_gate = max(float(quantum), float(rounded_gate))
-    tolerance = TestTolerance(
-        absolute=selected_gate,
-        calibration_runs=CALIBRATION_RUNS,
-        raw_max_same_tensor_range=worst_delta,
-        multiplier=GATE_SAFETY_FACTOR,
-        computed_gate=computed_gate,
-        worst_tensor=worst_name,
-        status=(
-            f"calibrated from {CALIBRATION_RUNS} nondeterministic optimizer-reference executions; 4x the maximum "
-            "pairwise moment or update-residual delta, rounded upward in 1e-3 units"
-        ),
-    )
-    spec.test_tolerances["single-step-optimizer"] = tolerance
-    spec.test_settings["single-step-optimizer"] = {
-        "model_cache_path": str(model_path),
-        "num_hidden_layers": int(args.optimizer_layers),
-        "reference_token_budget": args.reference_token_budget,
-        "ce_chunk": 2048,
-        "learning_rate": 1e-2,
-        "optimizer_dtype": config.optimizer_dtype,
-        "calibration_metric": (
-            f"maximum pairwise full-tensor moment or update-residual L2 delta across {CALIBRATION_RUNS} runs"
-        ),
-    }
-    if "single-step-optimizer" not in spec.applicable_tests:
-        spec.applicable_tests.append("single-step-optimizer")
-    spec.write(args.test_spec)
-
-    output = getattr(args, "_diagnostics_dir", args.output_dir) / "optimizer-reference-repeatability.json"
-    output.write_text(
-        json.dumps(
-            {
-                "configuration": {
-                    "test_id": "single-step-optimizer",
-                    "case": gas1.name,
-                    "global_batch_size": gas1.global_batch_size,
-                    "max_seq_len": gas1.max_seq_len,
-                    "model_cache_path": str(model_path),
-                    "num_hidden_layers": int(args.optimizer_layers),
-                    "reference_token_budget": args.reference_token_budget,
-                    "runs": CALIBRATION_RUNS,
-                    "learning_rate": 1e-2,
-                    "optimizer_dtype": config.optimizer_dtype,
-                    "deterministic_algorithms": False,
-                    "flash_attention_deterministic": False,
-                },
-                "losses": losses,
-                "peak_gib": peaks,
-                "durations_seconds": durations,
-                "tolerance": {
-                    "raw_max_baseline_delta_norm": worst_delta,
-                    "worst_tensor_and_state": worst_name,
-                    "multiplier": GATE_SAFETY_FACTOR,
-                    "computed_gate": computed_gate,
-                    "rounding_quantum": float(quantum),
-                    "minimum_gate": float(quantum),
-                    "selected_gate": selected_gate,
-                },
-            },
-            indent=2,
-            sort_keys=True,
-        )
-        + "\n"
-    )
-    print(f"optimizer raw variation: {worst_delta:.9e}", flush=True)
-    print(f"optimizer selected gate: {selected_gate:.9e}", flush=True)
-    return output
-
-
 def _validation_outcome(returncode: int, output: str, report: dict | None) -> str:
     """Classify the frozen regression without mistaking process transport for a test result."""
     if _is_cuda_oom(RuntimeError(output)):
@@ -1394,9 +1435,11 @@ def _require_validation_pass(validation: dict, description: str, *, config_id: s
     if validation["status"] == "pass":
         return
     details = validation.get("reason") or "The target did not complete a passing comparison."
+    if validation.get("execution_log"):
+        details += f"\nComplete execution log: {validation['execution_log']}"
     context = f" for {config_id}" if config_id is not None else ""
     raise RuntimeError(
-        f"{description} {validation['status']}{context}\n{details}\n"
+        f"{details}\n{description} {validation['status']}{context}\n"
         f"Report: {validation.get('report') or 'not written'}\nComplete log: {validation['log']}"
     )
 
@@ -1460,6 +1503,10 @@ def _optimizer_validation_bootstrap(args: argparse.Namespace) -> dict | None:
 
 def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: str = "Validation") -> dict:
     """Run the frozen config exactly as future regression runs will execute it."""
+    automatic_gateway = getattr(args, "_automatic_cortex_gateway", False) and (
+        args.test_id in CALIBRATED_TEST_IDS
+        or (getattr(args, "local_gateway_full_model", False) and args.test_id == "e2e-sft-train-validate")
+    )
     bootstrap = _optimizer_validation_bootstrap(args)
     if bootstrap != getattr(args, "_admitted_optimizer_validation_bootstrap", bootstrap):
         raise ValueError("optimizer validation bootstrap/config changed after pre-calibration admission")
@@ -1476,6 +1523,8 @@ def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: st
         getattr(args, "backend", "onprem"),
         "--config",
         str(args.config),
+        "--config-dir",
+        str(args.checkout_root / "arctic_platform" / "correctness" / "configs"),
         "--test",
         str(args.test_id),
         "--out",
@@ -1483,6 +1532,8 @@ def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: st
     ]
     if getattr(args, "test_spec", None) is not None:
         command += ["--test-spec", str(args.test_spec)]
+    if args.test_id in {"single-step-grads", "single-step-optimizer"} and getattr(args, "tokens", None) is not None:
+        command += ["--tokens", str(args.tokens)]
     for name in (
         "host",
         "database",
@@ -1491,16 +1542,31 @@ def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: st
         "base_url",
         "pat_file",
         "gpu_pool",
+        "checkpoint_training_gpus",
     ):
+        if name == "base_url" and automatic_gateway:
+            continue
         value = getattr(args, name, None)
         if value is not None:
             command += ["--" + name.replace("_", "-"), str(value)]
+    if getattr(args, "local_gateway_full_model", False):
+        command.append("--local-gateway-full-model")
     if getattr(args, "reference_records_dir", None) is not None:
         command += ["--reference-records-dir", str(args.reference_records_dir)]
     if getattr(args, "local_cortex_fixture", False):
         command.append("--local-cortex-fixture")
+    inference_validation = args.test_id == "inference-checkpoint-loss"
+    if inference_validation and getattr(args, "inference_sampling_topology", None) is not None:
+        command += ["--inference-sampling-topology", *map(str, args.inference_sampling_topology)]
     if getattr(args, "peft_adapter", None) is not None:
         command += ["--peft-adapter", str(args.peft_adapter)]
+    if inference_validation and getattr(args, "inference_export_allocation", None) is not None:
+        command += [
+            "--inference-export-allocation",
+            str(args.inference_export_allocation),
+            "--inference-export-allocation-sha256",
+            str(args.inference_export_allocation_sha256),
+        ]
     if getattr(args, "dense_checkpoint_allocation", None) is not None:
         command += [
             "--dense-checkpoint-allocation",
@@ -1508,6 +1574,8 @@ def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: st
             "--dense-checkpoint-allocation-sha256",
             str(args.dense_checkpoint_allocation_sha256),
         ]
+    if inference_validation and getattr(args, "inference_initial_model_dir", None) is not None:
+        command += ["--inference-initial-model-dir", str(args.inference_initial_model_dir)]
     if bootstrap is not None:
         command = [
             sys.executable,
@@ -1524,37 +1592,49 @@ def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: st
     description = selected.get("model_description", f"frozen {layers}-layer regression")
     _stage(phase, "Target Run", description)
     lines: list[str] = []
-    with _validation_gateway(args) as gateway_url, log_path.open("w") as log:
-        if gateway_url is not None:
-            command += ["--base-url", gateway_url]
-        env = {**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
-        process = subprocess.Popen(
-            command,
-            cwd=args.checkout_root,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-        assert process.stdout is not None
-        try:
-            for line in process.stdout:
-                print(line, end="", flush=True)
-                log.write(line)
-                lines.append(line)
-            returncode = process.wait()
-        except BaseException:
-            process.kill()
-            process.wait()
-            raise
-        finally:
-            process.stdout.close()
+    gateway_context = nullcontext(None) if automatic_gateway else _validation_gateway(args)
+    with _logged_output(log_path):
+        with gateway_context as gateway_url:
+            if gateway_url is not None:
+                command += ["--base-url", gateway_url]
+            env = {**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
+            process = subprocess.Popen(
+                command,
+                cwd=args.checkout_root,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            assert process.stdout is not None
+            try:
+                for line in process.stdout:
+                    print(line, end="", flush=True)
+                    lines.append(line)
+                returncode = process.wait()
+            except BaseException:
+                process.kill()
+                process.wait()
+                raise
+            finally:
+                process.stdout.close()
     if bootstrap is not None and _optimizer_validation_bootstrap(args) != bootstrap:
         raise ValueError("optimizer validation bootstrap/config changed during target validation")
     output = "".join(lines)
     report_path = out_dir / "report.json"
-    report = json.loads(report_path.read_text()) if report_path.exists() else None
+    report_error = None
+    try:
+        report = json.loads(report_path.read_text()) if report_path.exists() else None
+        if report is not None and (
+            not isinstance(report, dict)
+            or not isinstance(report.get("results", []), list)
+            or any(not isinstance(row, dict) for row in report.get("results", []))
+        ):
+            raise ValueError("target report must contain an object with a results list")
+    except (OSError, ValueError) as exc:
+        report = None
+        report_error = f"Could not read target report: {type(exc).__name__}: {exc}"
     failures = [
         f"{row.get('test_id', args.test_id)} / {row.get('arm') or '-'}: "
         f"{row.get('reason') or row.get('summary') or row.get('outcome', 'no verdict')}"
@@ -1562,6 +1642,32 @@ def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: st
         if row.get("outcome") not in {"pass", "inapplicable"}
     ]
     reason = "\n".join(failures)
+    batch_path = out_dir / "batch.json"
+    try:
+        batch = json.loads(batch_path.read_text()) if batch_path.exists() else {}
+        if not isinstance(batch, dict):
+            raise ValueError("target batch report must contain an object")
+    except (OSError, ValueError) as exc:
+        from arctic_platform.correctness.harness.gateway import UnsafeCleanupError
+
+        raise UnsafeCleanupError(
+            f"Could not verify target cleanup: {type(exc).__name__}: {exc}\n"
+            f"Last target output:\n{_log_tail(log_path)}\n"
+            f"Report: {batch_path}\nComplete log: {log_path}"
+        ) from exc
+    if batch.get("stopped_unsafe") is True:
+        from arctic_platform.correctness.harness.gateway import UnsafeCleanupError
+
+        raise UnsafeCleanupError(
+            f"{reason or report_error or 'Target execution stopped because owned cleanup could not be verified.'}\n"
+            "Further onboarding stopped; owned worker cleanup must be verified before another test.\n"
+            f"Report: {report_path if report is not None else 'not written'}\nComplete log: {log_path}"
+        )
+    if report_error is not None:
+        raise RuntimeError(
+            f"{report_error}\nLast target output:\n{_log_tail(log_path)}\n"
+            f"Report: {report_path}\nComplete log: {log_path}"
+        )
     try:
         outcome = _validation_outcome(returncode, output, report)
     except RuntimeError as exc:
@@ -1570,8 +1676,9 @@ def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: st
             f"Report: {report_path if report is not None else 'not written'}\nComplete log: {log_path}"
         ) from exc
     if outcome != "pass" and not reason:
-        tail = "\n".join(line for line in output.splitlines()[-20:] if line.strip())
         reason = f"Target process exited {returncode} without a reported failure reason."
+    if outcome != "pass":
+        tail = _log_tail(log_path)
         if tail:
             reason += f"\nLast target output:\n{tail}"
     result = {
@@ -1582,21 +1689,330 @@ def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: st
         "report": str(report_path) if report_path.exists() else None,
         "reason": reason,
     }
+    if (out_dir / "full.log").exists():
+        result["execution_log"] = str(out_dir / "full.log")
     if bootstrap is not None:
         result["optimizer_validation_bootstrap"] = bootstrap
     (out_dir / "validation.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
     return result
 
 
+FIXED_TOLERANCE = "fixed-tolerance"
 # The checks whose gate is drawn from repeated reference executions rather than stated as a constant.
 CALIBRATED_TEST_IDS = ("single-step-grads", "single-step-optimizer")
 
 
 def _onboarding_kind(test_id: str) -> str:
-    """Select one of the two reference-calibrated onboarding routes."""
-    if test_id in CALIBRATED_TEST_IDS:
+    """Which onboarding a test id takes, or a refusal for an id that has none.
+
+    The gradient and optimizer checks each measure a reference spread. Checkpoint-resume measures a Arctic Platform
+    loss range with determinism off and writes that gate. Every other check holds its gate as a constant
+    in its own module, so there is nothing to size beyond the reduced model the spec already names.
+    """
+    from arctic_platform.correctness.harness.registry import registered_tests
+
+    if test_id == "checkpoint-resume-loss" or test_id in CALIBRATED_TEST_IDS:
         return test_id
+    if registered_tests().get(test_id) is not None:
+        return FIXED_TOLERANCE
     raise ValueError(f"onboarding does not support test id {test_id!r}")
+
+
+def _onboard_checkpoint_resume(args: argparse.Namespace, config) -> int:
+    """Measure three undeterministic 10-step runs, write twice that range, then run the check.
+
+    The measurement turns determinism off. The validation run is the ordinary regression, which keeps
+    best-effort determinism and reads the gate just written. A failed validation restores the spec.
+    """
+    from transformers import AutoConfig
+
+    from arctic_platform.correctness.checks.checkpoint_resume import TEST_ID
+    from arctic_platform.correctness.checks.checkpoint_resume import loss_range_gate
+    from arctic_platform.correctness.checks.checkpoint_resume import measure_undeterministic_loss_range
+    from arctic_platform.correctness.harness.config import TestSpec
+    from arctic_platform.correctness.harness.config import config_checksum
+    from arctic_platform.correctness.harness.config import scaled_for_placement
+
+    test_id = args.test_id
+    if test_id != TEST_ID:
+        raise ValueError(f"{test_id} is not the checkpoint-resume check")
+    bootstrap = config.is_rl and not args.test_spec.exists()
+    if bootstrap:
+        previous_spec = None
+        spec = _build_reference_free_rl_spec(args, config)
+    elif not args.test_spec.exists():
+        raise ValueError(
+            f"{test_id} reads the reduced model an onboarded config already has, so it requires an "
+            f"existing reviewed spec at {args.test_spec}; onboard single-step-grads for "
+            f"{config.config_id} first"
+        )
+    else:
+        previous_spec = args.test_spec.read_bytes()
+        spec = TestSpec.read(args.test_spec)
+    if spec.config_id != config.config_id:
+        raise ValueError(f"spec {spec.config_id!r} does not describe config {config.config_id!r}")
+    current_checksum = config_checksum(config)
+    if spec.config_checksum != current_checksum:
+        raise ValueError(
+            f"{config.config_id}: the reviewed spec records training config checksum "
+            f"{spec.config_checksum[:12] or 'missing'} and the config hashes to "
+            f"{current_checksum[:12]}. This path writes one tolerance and changes nothing else, so it "
+            "neither re-stamps the checksum nor runs a check against a configuration nobody reviewed; "
+            f"onboard single-step-grads again for {args.config} first"
+        )
+    placed = _checkpoint_placement(args, config)
+    arms = scaled_for_placement(list(spec.arms), placed.n_gpus // config.n_gpus)
+    model_cfg = AutoConfig.from_pretrained(spec.model.cache_path, trust_remote_code=True)
+    vocab_size = int(getattr(model_cfg, "text_config", model_cfg).vocab_size)
+    print("phase 1/2: three 10-step runs with determinism off, per case", flush=True)
+    with _validation_gateway(args) as gateway_url:
+        transport_options = {}
+        if getattr(args, "backend", "onprem") == "cortex":
+            from arctic_platform.correctness.harness.cortex import load_local_fixture
+            from arctic_platform.correctness.harness.execution import _client_backend
+            from arctic_platform.correctness.harness.gateway import HostedTransport
+
+            backend = _client_backend(args)
+            if gateway_url is not None:
+                backend = backend.model_copy(update={"base_url": gateway_url})
+            fixture = load_local_fixture(backend, spec)
+            transport_options["transport_factory"] = lambda directory: HostedTransport(
+                backend,
+                placed,
+                model_name=fixture["model_name"],
+                spec=spec,
+                published_fixture=fixture,
+                attn_implementation=config.attention_implementation,
+                determinism="off",
+                **({"preserve_native_topology": True} if config.is_rl else {}),
+            )
+        raw_range, where = measure_undeterministic_loss_range(
+            placed.training,
+            spec.model.cache_path,
+            slots=placed.n_gpus,
+            vocab_size=vocab_size,
+            arms=arms,
+            workdir=args.output_dir / "checkpoint-resume-calibration",
+            attn_implementation=config.attention_implementation,
+            spec=spec,
+            **transport_options,
+        )
+    gate = loss_range_gate(raw_range, where)
+    print(
+        f"phase 1/2 complete: raw_range={raw_range} worst={where} "
+        f"computed={gate.computed_gate} absolute={gate.absolute}",
+        flush=True,
+    )
+    layers = int(spec.model.num_hidden_layers)
+    spec.test_tolerances[test_id] = gate
+    spec.applicable_tests = sorted({*spec.applicable_tests, test_id})
+    spec.write(args.test_spec)
+    try:
+        validation = _run_final_regression(args, {"layers": layers}, phase="phase 2/2")
+        _require_validation_pass(validation, test_id, config_id=config.config_id)
+    except BaseException:
+        if previous_spec is None:
+            if args.test_spec.exists():
+                failed_spec = args.output_dir / f"unvalidated-rl-spec-{time.time_ns()}.json"
+                shutil.move(str(args.test_spec), str(failed_spec))
+        else:
+            args.test_spec.write_bytes(previous_spec)
+        raise
+    manifest = {
+        "config_id": config.config_id,
+        "config_path": str(args.config),
+        "test_id": test_id,
+        "training_gpus": placed.n_gpus,
+        "raw_loss_range": raw_range,
+        "worst": where,
+        "multiplier": gate.multiplier,
+        "computed_gate": gate.computed_gate,
+        "absolute": gate.absolute,
+        "model_cache_path": spec.model.cache_path,
+        "num_hidden_layers": layers,
+        "applicable_tests": spec.applicable_tests,
+        "test_spec": str(args.test_spec),
+        "bootstrapped_reference_free_rl": bootstrap,
+        "validation_attempts": [validation],
+        "validated_report": validation["report"],
+    }
+    manifest_path = args.output_dir / f"onboarding-{test_id}.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    print(
+        f"onboarded {config.config_id} {test_id}: absolute={gate.absolute} validation=pass",
+        flush=True,
+    )
+    print(f"spec: {args.test_spec}", flush=True)
+    print(f"manifest: {manifest_path}", flush=True)
+    print(f"validated report: {validation['report']}", flush=True)
+    return 0
+
+
+def _build_reference_free_rl_spec(args: argparse.Namespace, config):
+    """Create an RL candidate without a supervised reference run or calibrated gate."""
+    from arctic_platform.correctness.harness.config import TestSpec
+    from arctic_platform.correctness.harness.config import arms_for
+    from arctic_platform.correctness.harness.config import config_checksum
+    from arctic_platform.correctness.harness.registry import RL_INAPPLICABLE_REASON
+    from arctic_platform.correctness.harness.registry import registered_tests
+    from arctic_platform.correctness.onboarding.synth_model import describe_source_model
+
+    entry = registered_tests()[args.test_id]
+    if not config.is_rl or entry.compares_to_reference or entry.requires_hosted_control_plane:
+        raise ValueError("initial RL onboarding requires a reference-free, locally runnable check")
+    canonical_spec = Path(__file__).resolve().parents[1] / "specs" / f"{config.config_id}.json"
+    if args.test_spec.resolve() != canonical_spec:
+        raise ValueError(
+            f"initial RL onboarding must publish to {canonical_spec}; regression reads the canonical "
+            "spec, not a custom --test-spec destination"
+        )
+    arm_defs = arms_for(config.max_seq_len, config.n_gpus)
+    if args.tokens != arm_defs[0].max_seq_len:
+        raise ValueError(
+            f"initial RL onboarding requires the config-derived {arm_defs[0].max_seq_len}-token "
+            "case width; a smaller --tokens value would not match the regression cases"
+        )
+    model, vocab_size, evidence = describe_source_model(str(args.source_checkpoint))
+    arms, notes = _spec_arms(config, arm_defs, vocab_size)
+    spec = TestSpec(
+        config_id=config.config_id,
+        config_path=str(config.path),
+        model=model,
+        arms=arms,
+        attn_implementations=[config.attention_implementation],
+        applicable_tests=[args.test_id],
+        config_checksum=config_checksum(config),
+        test_settings={args.test_id: {"source_metadata": evidence}},
+        inapplicable={
+            test_id: RL_INAPPLICABLE_REASON
+            for test_id, test in registered_tests().items()
+            if test.compares_to_reference
+        },
+        notes=notes,
+    )
+    spec.notes.append(
+        f"Reference-free RL bootstrap retained all {model.num_hidden_layers} original text layers and "
+        "the original vision configuration, and generated the cases from config and safetensors "
+        "headers without constructing an HF model, reading tensor payloads, sizing a reference or "
+        "calibrating a tolerance. RL checks use the configured full model. Parameter count, "
+        "initialization seed and reference sizing are unknown/not measured; stored tensor elements "
+        "include buffers and are not an architecture parameter count. The legacy model content_hash "
+        "binds filenames and sizes only; source_metadata separately binds config/index bytes and "
+        "tensor header schema, not weight payloads."
+    )
+    return spec
+
+
+def _onboard_fixed_tolerance_test(args: argparse.Namespace, config) -> int:
+    """Validate a fixed-gate check, bootstrapping an RL spec when none exists.
+
+    An existing reviewed model and its settings remain frozen. Initial RL onboarding describes the
+    original config and tensor headers and generates cases, with no reference sizing or calibration.
+    Both paths use the check's own fixed criterion and publish applicability only after the ordinary regression passes.
+    """
+    from arctic_platform.correctness.harness.config import TestSpec
+    from arctic_platform.correctness.harness.config import config_checksum
+    from arctic_platform.correctness.harness.registry import registered_tests
+
+    test_id = args.test_id
+    entry = registered_tests()[test_id]
+    if entry.requires_hosted_control_plane:
+        raise ValueError(
+            f"{test_id} creates jobs only the hosted control plane can create, so onboarding cannot run "
+            "it here and must not publish a verdict it did not measure. The hosted command runs the "
+            "checks named on its command line whether or not a spec lists them as applicable, so this "
+            "check needs no entry in applicable_tests:\n"
+            f"  python -m arctic_platform.correctness hosted --config {args.config} --test {test_id} "
+            "--host <account-host> --database <database> --schema <schema> --pat-file <file>"
+        )
+    bootstrap = config.is_rl and not args.test_spec.exists()
+    if bootstrap:
+        previous_spec = None
+        spec = _build_reference_free_rl_spec(args, config)
+    elif not args.test_spec.exists():
+        raise ValueError(
+            f"{test_id} reads the reduced model an onboarded config already has, so it requires an "
+            f"existing reviewed spec at {args.test_spec}; onboard single-step-grads for "
+            f"{config.config_id} first"
+        )
+    else:
+        previous_spec = args.test_spec.read_bytes()
+        spec = TestSpec.read(args.test_spec)
+    if spec.config_id != config.config_id:
+        raise ValueError(f"spec {spec.config_id!r} does not describe config {config.config_id!r}")
+    current_checksum = config_checksum(config)
+    if spec.config_checksum != current_checksum:
+        raise ValueError(
+            f"{config.config_id}: the reviewed spec records training config checksum "
+            f"{spec.config_checksum[:12] or 'missing'} and the config hashes to "
+            f"{current_checksum[:12]}. This path publishes one test id and changes nothing else, so it "
+            "neither re-stamps the checksum nor runs a check against a configuration nobody reviewed; "
+            f"onboard single-step-grads again for {args.config} first"
+        )
+
+    layers = int(spec.model.num_hidden_layers)
+    already_listed = not bootstrap and test_id in spec.applicable_tests
+    full_model = (
+        config.is_rl or test_id == "inference-checkpoint-loss" or getattr(args, "local_gateway_full_model", False)
+    )
+    model_description = (
+        f"configured full model {config.model_name}"
+        if full_model
+        else f"frozen {layers}-layer {spec.model.cache_path}"
+    )
+    print(
+        f"phase 1/1: {test_id} is gated by a constant in {entry.fn.__module__}, so there is nothing to "
+        f"size and nothing to calibrate; running it against the {model_description}",
+        flush=True,
+    )
+    spec.applicable_tests = sorted({*spec.applicable_tests, test_id})
+    try:
+        spec.write(args.test_spec)
+        from arctic_platform.correctness.harness.storage import CRITERIA
+
+        if test_id in CRITERIA:
+            _prepare_references(args)
+        validation = _run_final_regression(
+            args, {"layers": layers, "model_description": model_description}, phase="phase 1/1"
+        )
+        _require_validation_pass(validation, test_id, config_id=config.config_id)
+    except BaseException:
+        if previous_spec is None:
+            if args.test_spec.exists():
+                failed_spec = args.output_dir / f"unvalidated-rl-spec-{time.time_ns()}.json"
+                shutil.move(str(args.test_spec), str(failed_spec))
+        else:
+            args.test_spec.write_bytes(previous_spec)
+        raise
+
+    manifest = {
+        "config_id": config.config_id,
+        "config_path": str(args.config),
+        "test_id": test_id,
+        "tolerance": f"fixed constant in {entry.fn.__module__}; not calibrated and not written to the spec",
+        "model_cache_path": spec.model.cache_path,
+        "num_hidden_layers": layers,
+        "validated_model_scope": "configured-full-model" if full_model else "frozen-reference",
+        "validated_model_name": config.model_name if full_model else spec.model.cache_path,
+        "frozen_reference_num_hidden_layers": None if config.is_rl else layers,
+        "applicable_tests": spec.applicable_tests,
+        "already_listed_before_this_run": already_listed,
+        "bootstrapped_reference_free_rl": bootstrap,
+        "test_spec": str(args.test_spec),
+        "validation_attempts": [validation],
+        "validated_report": validation["report"],
+    }
+    manifest_path = args.output_dir / f"onboarding-{test_id}.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    print(
+        f"onboarded {config.config_id} {test_id}: validation=pass, "
+        f"applicable_tests={', '.join(spec.applicable_tests)}",
+        flush=True,
+    )
+    print(f"spec: {args.test_spec}", flush=True)
+    print(f"manifest: {manifest_path}", flush=True)
+    print(f"validated report: {validation['report']}", flush=True)
+    return 0
 
 
 def _run_local_optimizer_calibration(args: argparse.Namespace, config, spec) -> Path:
@@ -1642,6 +2058,9 @@ def _run_local_optimizer_calibration(args: argparse.Namespace, config, spec) -> 
         "optimizer_dtype": config.optimizer_dtype,
         "calibration_metric": criterion,
     }
+    reviewed_gate = _reviewed_gate(args, test_id)
+    if reviewed_gate is not None:
+        spec.test_settings[test_id]["reviewed_absolute_gate"] = reviewed_gate
     spec.applicable_tests = list(dict.fromkeys([*spec.applicable_tests, test_id]))
     ctx = SimpleNamespace(config_id=config.config_id, cfg=config, spec=spec)
     arm_receipts = {}
@@ -1837,6 +2256,8 @@ def _onboard_optimizer_test(args: argparse.Namespace, config) -> int:
             calibration_json = Path(
                 _resume_phase(args, "calibration", lambda: str(_run_local_optimizer_calibration(args, config, spec)))
             )
+            if (getattr(args, "gpu_pool", None) or config.n_gpus) >= 2 * config.n_gpus:
+                _resume_phase(args, "references", lambda: _prepare_references(args))
         selected = {"layers": optimizer_layers}
         with _phase("Phase 3/3", "Target Validation", f"Validating the frozen {optimizer_layers}-layer fixture."):
             validation = _resume_phase(args, "validation", lambda: _run_final_regression(args, selected))
@@ -1875,7 +2296,6 @@ def _onboard_optimizer_test(args: argparse.Namespace, config) -> int:
 
 
 def _parent(args: argparse.Namespace) -> int:
-    kind = _onboarding_kind(args.test_id)
     _validate_storage(args)
     args.checkout_root = _checkout_root(args.config)
     sys.path.insert(0, str(args.checkout_root))
@@ -1886,38 +2306,75 @@ def _parent(args: argparse.Namespace) -> int:
     from arctic_platform.correctness.harness.storage import ensure_no_interrupted_builds
 
     config = load_config(args.config)
+    placed = _checkpoint_placement(args, config)
     _configure_fixture_target(args, config, [args.test_id])
     if config.is_rl:
         from arctic_platform.correctness.harness.registry import RL_INAPPLICABLE_REASON
+        from arctic_platform.correctness.harness.registry import registered_tests
 
-        raise ValueError(f"{config.config_id}: {RL_INAPPLICABLE_REASON}")
+        entry = registered_tests().get(args.test_id)
+        if entry is None or entry.compares_to_reference:
+            own = sorted(t.test_id for t in registered_tests().values() if not t.compares_to_reference)
+            raise ValueError(
+                f"{config.config_id}: {RL_INAPPLICABLE_REASON}. Onboarding {args.test_id} freezes a tolerance "
+                "against that reference, so there is nothing to onboard for it; the checks that do not use "
+                f"the reference are onboarded with --test-id: {', '.join(own)}"
+            )
     args.source_checkpoint = _select_source_checkpoint(args.source_checkpoint, config)
     local_fixture = getattr(args, "local_cortex_fixture", False)
     if local_fixture and (
         getattr(args, "backend", "onprem") != "cortex"
+        or (config.is_rl and args.test_id != "checkpoint-resume-loss")
         or getattr(args, "local_gateway_full_model", False)
-        or args.test_id not in CALIBRATED_TEST_IDS
+        or args.test_id not in (*CALIBRATED_TEST_IDS, "checkpoint-resume-loss")
     ):
-        raise ValueError("local Cortex fixture onboarding requires supervised Cortex gradients or optimizer")
+        raise ValueError(
+            "local Cortex fixture onboarding requires supervised Cortex gradients or optimizer, or checkpoint-resume"
+        )
     if getattr(args, "backend", "onprem") == "cortex":
         from arctic_platform.correctness.harness.execution import _client_backend
         from arctic_platform.correctness.harness.gateway import require_local_cortex_gateway
+        from arctic_platform.correctness.harness.gateway import rl_gpu_count
 
-        if not local_fixture:
-            raise ValueError("Cortex onboarding requires an explicit local Cortex fixture")
+        full_model = getattr(args, "local_gateway_full_model", False)
+        rl_fixed_check = (
+            config.is_rl
+            and args.test_id in {"inference-checkpoint-loss", "rl-weight-sync", "rl-router-replay"}
+            and not full_model
+        )
+        supervised_full_model = (
+            not config.is_rl and full_model and args.test_id in {"inference-checkpoint-loss", "e2e-sft-train-validate"}
+        )
+        supervised_initial_model = (
+            not config.is_rl
+            and not full_model
+            and args.test_id == "inference-checkpoint-loss"
+            and getattr(args, "inference_initial_model_dir", None) is not None
+        )
+        if supervised_initial_model:
+            from arctic_platform.correctness.harness.execution import _load_inference_initial_model_dir
+
+            _load_inference_initial_model_dir(
+                SimpleNamespace(**{**vars(args), "test": [args.test_id], "all_configs": False})
+            )
+        if not (rl_fixed_check or supervised_full_model or supervised_initial_model or local_fixture):
+            raise ValueError(
+                "Cortex onboarding requires a local reference-free RL fixed-gate check or "
+                "a local full-model supervised inference/e2e check, pinned initial-model inference, "
+                "or an explicit local Cortex fixture"
+            )
         require_local_cortex_gateway(_client_backend(args))
-        required_gpus = config.n_gpus
+        required_gpus = rl_gpu_count(config) if config.is_rl else placed.n_gpus
         pool = getattr(args, "gpu_pool", None) or required_gpus
         if pool < required_gpus:
             raise ValueError(f"GPU pool is smaller than the required {required_gpus} GPUs")
     else:
-        _onboarding_preflight(args, config)
+        _onboarding_preflight(args, placed)
         validate_against_host(
-            config,
-            (args._preflight_gpu_capacity if hasattr(args, "_preflight_gpu_capacity") else available_gpus()),
+            placed, args._preflight_gpu_capacity if hasattr(args, "_preflight_gpu_capacity") else available_gpus()
         )
         ensure_no_interrupted_builds()
-    _onboarding_preflight(args, config)
+    _onboarding_preflight(args, placed)
     from arctic_platform.correctness.harness.config import GAS1_TOKEN_CAP
     from arctic_platform.correctness.harness.config import correctness_microbatch_tokens
     from arctic_platform.correctness.harness.config import max_sequence_tokens
@@ -1938,10 +2395,15 @@ def _parent(args: argparse.Namespace) -> int:
     )
     args.reference_token_budget = min(requested_reference_budget, GAS1_TOKEN_CAP)
     _resume_setup(args)
+    kind = _onboarding_kind(args.test_id)
     if kind == "single-step-optimizer":
         if not args.test_spec.exists():
             _prepare_onboarding_fixture(args, config)
         return _onboard_optimizer_test(args, config)
+    if kind == "checkpoint-resume-loss":
+        return _onboard_checkpoint_resume(args, config)
+    if kind == FIXED_TOLERANCE:
+        return _onboard_fixed_tolerance_test(args, config)
 
     from arctic_platform.correctness.harness.config import TestSpec
 
@@ -1949,23 +2411,59 @@ def _parent(args: argparse.Namespace) -> int:
     observations = [selected]
 
     previous_spec = args.test_spec.read_bytes()
+    spec = TestSpec.read(args.test_spec)
+    frozen_tolerance = spec.test_tolerances.get(args.test_id)
     try:
         with _phase(
             "Phase 2/3",
             "Gradient Calibration",
-            f"Finding tolerance from {CALIBRATION_RUNS} nondeterministic HF reference runs per GAS arm.",
+            (
+                f"Preserving reviewed tolerance {frozen_tolerance.absolute:.9e} from the frozen specification."
+                if frozen_tolerance is not None
+                else f"Finding tolerance from {CALIBRATION_RUNS} nondeterministic HF reference runs per GAS arm."
+            ),
         ):
-            spec = TestSpec.read(args.test_spec)
             spec.applicable_tests = list(dict.fromkeys([*spec.applicable_tests, args.test_id]))
             spec.write(args.test_spec)
-            calibration_json = Path(
-                _resume_phase(
-                    args,
-                    "calibration",
-                    lambda: str(_render_and_run_calibration(args, selected)),
+            if frozen_tolerance is None:
+                calibration_json = Path(
+                    _resume_phase(
+                        args,
+                        "calibration",
+                        lambda: str(_render_and_run_calibration(args, selected)),
+                    )
                 )
-            )
+            else:
+                calibration_json = getattr(args, "_diagnostics_dir", args.output_dir) / "reference-repeatability.json"
+                calibration_json.write_text(
+                    json.dumps(
+                        {
+                            "tolerance": {"selected_gate": frozen_tolerance.absolute},
+                            "reused_spec_tolerance": json.loads(previous_spec)["test_tolerances"][args.test_id],
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
             calibration = json.loads(calibration_json.read_text())
+            reviewed_gate = _reviewed_gate(args, args.test_id)
+            if reviewed_gate is not None:
+                calibrated_gate = calibration["tolerance"]["selected_gate"]
+                if frozen_tolerance is not None and reviewed_gate != frozen_tolerance.absolute:
+                    raise ValueError("a reviewed gate cannot replace an existing frozen gradient gate")
+                calibrated_spec = TestSpec.read(args.test_spec)
+                tolerance = calibrated_spec.test_tolerances[args.test_id]
+                tolerance.absolute = reviewed_gate
+                if frozen_tolerance is None:
+                    tolerance.status += "; acceptance uses the explicitly reviewed absolute gate"
+                calibrated_spec.write(args.test_spec)
+                calibration["tolerance"].update(
+                    calibrated_gate=calibrated_gate,
+                    reviewed_absolute_gate=reviewed_gate,
+                    selected_gate=reviewed_gate,
+                )
+                calibration_json.write_text(json.dumps(calibration, indent=2, sort_keys=True) + "\n")
             if local_fixture:
                 _stage(
                     "Reference",
@@ -2018,6 +2516,7 @@ def _parent(args: argparse.Namespace) -> int:
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
     from arctic_platform.correctness.harness.execution import add_connection_arguments
+    from arctic_platform.correctness.harness.registry import registered_tests
 
     add_connection_arguments(parser)
     parser.add_argument("--config", type=Path, required=True)
@@ -2028,16 +2527,44 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cache-root", type=Path, default=Path("/data-fast/base-models/synthetic"))
     parser.add_argument("--test-spec", type=Path)
     parser.add_argument(
+        "--checkpoint-training-gpus",
+        type=int,
+        help=(
+            "explicit supervised checkpoint calibration and validation placement; reviewed config and arms stay fixed"
+        ),
+    )
+    parser.add_argument(
+        "--inference-sampling-topology",
+        type=int,
+        nargs=3,
+        metavar=("GPUS", "TP", "PP"),
+        help="explicit original Flash-Next16 sampling allocation, TP and PP for final inference validation",
+    )
+    parser.add_argument("--inference-export-allocation", type=Path, help="same-job local inference allocation JSON")
+    parser.add_argument("--inference-export-allocation-sha256", help="full SHA256 of the allocation JSON bytes")
+    parser.add_argument(
+        "--dense-checkpoint-allocation", type=Path, help="same-job local dense optimizer allocation JSON"
+    )
+    parser.add_argument(
+        "--dense-checkpoint-allocation-sha256", help="full SHA256 of the dense optimizer allocation JSON bytes"
+    )
+    parser.add_argument(
+        "--inference-initial-model-dir",
+        type=Path,
+        help="already admitted absolute FAST model directory for initial local Cortex inference training only",
+    )
+    parser.add_argument(
         "--test-id",
         "--test",
-        choices=("all", *CALIBRATED_TEST_IDS),
         default="all",
-        help="onboard one check, or all applicable checks (default); prerequisites are automatic",
+        help=(
+            "onboard one check, or all applicable checks (default); prerequisites are automatic; available checks: "
+            + ", ".join(registered_tests())
+        ),
     )
     parser.add_argument(
         "--reference-tests",
         nargs="+",
-        choices=CALIBRATED_TEST_IDS,
         help="prepare these HF checks together using the same workload; requires --prepare-references",
     )
     parser.add_argument("--output-dir", type=Path)
@@ -2050,10 +2577,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         type=Path,
         help="reuse a reviewed source-bound sizing receipt, then continue calibration and validation",
     )
-    parser.add_argument(
-        "--reuse-sizing-sha256",
-        help="full SHA256 of the immutable sizing reuse receipt",
-    )
+    parser.add_argument("--reuse-sizing-sha256", help="full SHA256 of the immutable sizing reuse receipt")
     parser.add_argument(
         "--prepare-references",
         action="store_true",
@@ -2066,10 +2590,10 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--reference-calibration-runs", type=int, default=CALIBRATION_RUNS)
     parser.add_argument(
-        "--dense-checkpoint-allocation", type=Path, help="same-job local dense optimizer allocation JSON"
-    )
-    parser.add_argument(
-        "--dense-checkpoint-allocation-sha256", help="full SHA256 of the dense optimizer allocation JSON bytes"
+        "--reviewed-gate",
+        action="append",
+        type=_reviewed_gate_argument,
+        help="TEST=absolute gate retained during fresh calibration; repeat once per selected test",
     )
     parser.add_argument(
         "--peft-adapter",
@@ -2083,6 +2607,11 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         help="concurrent HF reference workers (default: available GPUs on this node, capped at 8)",
     )
     parser.add_argument(
+        "--local-gateway-full-model",
+        action="store_true",
+        help="explicit full-model selection for inference; local supervised E2E selects it automatically",
+    )
+    parser.add_argument(
         "--local-cortex-fixture",
         action="store_true",
         help="validate the reduced supervised gradient or optimizer fixture through a local DSS gateway",
@@ -2092,19 +2621,9 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         type=Path,
         help="source-pinned caller bootstrap for final local Cortex optimizer validation only",
     )
-    parser.add_argument(
-        "--optimizer-validation-bootstrap-sha256",
-        help="full SHA256 of the caller bootstrap",
-    )
-    parser.add_argument(
-        "--optimizer-validation-config",
-        type=Path,
-        help="private caller bootstrap configuration",
-    )
-    parser.add_argument(
-        "--optimizer-validation-config-sha256",
-        help="full SHA256 of the private caller configuration",
-    )
+    parser.add_argument("--optimizer-validation-bootstrap-sha256", help="full SHA256 of the caller bootstrap")
+    parser.add_argument("--optimizer-validation-config", type=Path, help="private caller bootstrap configuration")
+    parser.add_argument("--optimizer-validation-config-sha256", help="full SHA256 of the private caller configuration")
 
 
 def _prepare_references(args: argparse.Namespace) -> int:
@@ -2116,15 +2635,22 @@ def _prepare_references(args: argparse.Namespace) -> int:
     from arctic_platform.correctness.harness.config import TestSpec
     from arctic_platform.correctness.harness.config import config_checksum
     from arctic_platform.correctness.harness.config import load_config
+    from arctic_platform.correctness.harness.config import placement_widths
+    from arctic_platform.correctness.harness.config import scaled_for_placement
     from arctic_platform.correctness.harness.execution import _client_backend
     from arctic_platform.correctness.harness.runner import execute
+    from arctic_platform.correctness.harness.storage import CRITERIA
     from arctic_platform.correctness.harness.storage import require_git_records_dir
 
     selection = args.reference_tests or [args.test_id]
-    if any(test_id not in CALIBRATED_TEST_IDS for test_id in selection):
-        raise ValueError("--prepare-references supports only the two HF single-step checks")
+    if any(test_id not in CRITERIA for test_id in selection):
+        raise ValueError("--prepare-references supports only the three HF single-GPU checks")
     args.reference_records_dir = require_git_records_dir(args.reference_records_dir)
     config = load_config(args.config)
+    if not config.has_training:
+        raise ValueError(
+            f"{config.config_id}: correctness onboarding requires a training sub-job; this is inference-only"
+        )
     spec_path = args.test_spec or Path(__file__).resolve().parents[1] / "specs" / f"{config.config_id}.json"
     spec = TestSpec.read(spec_path)
     if config.is_rl or spec.config_checksum != config_checksum(config) or spec.config_id != config.config_id:
@@ -2132,6 +2658,8 @@ def _prepare_references(args: argparse.Namespace) -> int:
     for test_id in selection:
         if test_id not in spec.applicable_tests:
             raise ValueError(f"{test_id} is not applicable to {config.config_id}")
+    if args.local_gateway_full_model and selection != ["e2e-sft-train-validate"]:
+        raise ValueError("full-model reference mode is only for E2E")
     _onboarding_preflight(args, config, selection)
     model = AutoConfig.from_pretrained(spec.model.cache_path, trust_remote_code=True)
     vocab_size = int(getattr(model, "text_config", model).vocab_size)
@@ -2141,169 +2669,78 @@ def _prepare_references(args: argparse.Namespace) -> int:
     # Reference-only execution needs the Cortex record format, not a reachable target service.
     backend = _client_backend(args) if configured else CortexConfig(base_url="http://127.0.0.1:1")
     arms = [ArmDefinition(arm.name, arm.global_batch_size, arm.max_seq_len) for arm in spec.arms]
-    execute(
-        config,
-        spec,
-        arms,
-        vocab_size=vocab_size,
-        select=selection,
-        reference_token_budget=args.reference_token_budget,
-        workdir=args.output_dir,
-        prepare_references=True,
-        reference_records_dir=args.reference_records_dir,
-        reference_calibration_runs=args.reference_calibration_runs,
-        reference_calibration_workers=args.reference_calibration_workers,
-        client_backend=backend,
-        peft_adapter=_shared_adapter(args, config),
+    first_two_only = all(test_id in CALIBRATED_TEST_IDS for test_id in selection)
+    widths = (
+        placement_widths(config.n_gpus, getattr(args, "gpu_pool", None) or config.n_gpus)
+        if first_two_only
+        else [config.n_gpus]
     )
+    for width in widths:
+        execute(
+            config.at_gpu_width(width),
+            spec,
+            scaled_for_placement(arms, width // config.n_gpus),
+            vocab_size=vocab_size,
+            select=selection,
+            reference_token_budget=args.reference_token_budget,
+            workdir=(
+                args.output_dir / f"gpu{width}" if first_two_only and args.output_dir is not None else args.output_dir
+            ),
+            prepare_references=True,
+            reference_records_dir=args.reference_records_dir,
+            reference_calibration_runs=args.reference_calibration_runs,
+            reference_calibration_workers=args.reference_calibration_workers,
+            client_backend=backend,
+            local_gateway_full_model=args.local_gateway_full_model,
+            peft_adapter=_shared_adapter(args, config),
+        )
     return 0
-
-
-def _onboarding_spec_identity(spec: dict, test_id: str) -> str | None:
-    """Adding another check must not invalidate this check's reviewed workload."""
-    if (
-        not isinstance(spec, dict)
-        or test_id not in spec.get("applicable_tests", [])
-        or not spec.get("config_checksum")
-    ):
-        return None
-    fields = ("config_id", "config_checksum", "model", "arms", "attn_implementations", "param_name_map")
-    projection = {name: spec.get(name) for name in fields}
-    projection["test_tolerance"] = spec.get("test_tolerances", {}).get(test_id)
-    projection["test_settings"] = spec.get("test_settings", {}).get(test_id)
-    return hashlib.sha256(json.dumps(projection, sort_keys=True).encode()).hexdigest()
-
-
-def _onboarding_options(args: argparse.Namespace) -> dict:
-    names = (
-        "tokens",
-        "reference_token_budget",
-        "source_checkpoint",
-        "peft_adapter",
-    )
-    return json.loads(json.dumps({name: getattr(args, name, None) for name in names}, default=str))
-
-
-def _onboarding_state(args: argparse.Namespace, config, spec_path: Path) -> tuple[dict, dict]:
-    from arctic_platform.correctness.harness.config import TestSpec
-    from arctic_platform.correctness.harness.config import config_checksum
-
-    spec = {}
-    try:
-        candidate = json.loads(TestSpec.read(spec_path).to_json())
-        if candidate["config_id"] == config.config_id and candidate["config_checksum"] == config_checksum(config):
-            spec = candidate
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
-        pass
-    summary = {}
-    try:
-        candidate = json.loads(spec_path.with_suffix(".onboarding.json").read_text())
-        if candidate["config_id"] == config.config_id and isinstance(candidate["results"], dict):
-            summary = candidate
-    except (OSError, ValueError, KeyError, TypeError):
-        pass
-    return spec, summary
-
-
-def _completed_onboarding(args: argparse.Namespace, spec: dict, summary: dict, test_id: str) -> dict | None:
-    identity = _onboarding_spec_identity(spec, test_id)
-    if identity is None:
-        return None
-    saved = summary.get("results", {}).get(test_id, {})
-    if not isinstance(saved, dict):
-        saved = {}
-    options = _onboarding_options(args)
-    if (
-        saved.get("status") == "onboarded"
-        and saved.get("exit_code") == 0
-        and saved.get("spec_identity") == identity
-        and saved.get("options") == options
-    ):
-        return dict(saved)
-    # Older explicit-check runs did not update the summary. Recover only a passing
-    # validation with a matching frozen spec, never applicability alone.
-    if (
-        saved.get("status") == "failed"
-        or saved.get("spec_identity") is not None
-        or not hasattr(args, "_resume_root")
-        or any(options.values())
-    ):
-        return None
-    relative = Path(spec["config_id"]) / test_id
-    paths = set((args._resume_root / relative).glob("*/validation.json"))
-    for log_root in {args._resume_root.parent, Path.cwd() / "work" / "logs"}:
-        paths.update(log_root.glob(f"*/onboarding-state/{relative}/*/validation.json"))
-    for path in sorted(paths):
-        try:
-            phase = json.loads(path.read_text())
-            if (
-                phase["result"]["status"] == "pass"
-                and _onboarding_spec_identity(json.loads(phase["spec"]), test_id) == identity
-            ):
-                return {
-                    "status": "onboarded",
-                    "exit_code": 0,
-                    "spec_identity": identity,
-                    "options": options,
-                    "validation_checkpoint": str(path),
-                }
-        except (OSError, ValueError, KeyError, TypeError, AttributeError):
-            continue
-    return None
-
-
-def _save_onboarding_summary(args: argparse.Namespace, config, spec_path: Path, results: dict, **details) -> dict:
-    _, previous = _onboarding_state(args, config, spec_path)
-    summary = {
-        **previous,
-        "config_id": config.config_id,
-        "config": str(args.config),
-        "test_spec": str(spec_path),
-        "results": results,
-        **details,
-    }
-    destination = spec_path.with_suffix(".onboarding.json")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", dir=destination.parent, prefix=f".{destination.name}-", delete=False
-        ) as stream:
-            temporary = Path(stream.name)
-            stream.write(json.dumps(summary, indent=2, sort_keys=True) + "\n")
-        temporary.replace(destination)
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
-    if hasattr(args, "_diagnostics_dir"):
-        (args._diagnostics_dir / "onboarding.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
-    return summary
 
 
 def run(args: argparse.Namespace) -> int:
     from arctic_platform.correctness.harness.config import config_id
     from arctic_platform.correctness.harness.config import load_config
     from arctic_platform.correctness.harness.config import local_config_path
+    from arctic_platform.correctness.harness.execution import _load_dense_checkpoint_allocation
+    from arctic_platform.correctness.harness.execution import _load_inference_export_allocation
+    from arctic_platform.correctness.harness.execution import _load_inference_initial_model_dir
+    from arctic_platform.correctness.harness.registry import registered_tests
 
+    for test_id in CALIBRATED_TEST_IDS:
+        _reviewed_gate(args, test_id)
     if args.test_id == "all" and (getattr(args, "prepare_references", False) or args.probe_layers is not None):
         args.test_id = "single-step-grads"
-    if args.test_id != "all":
+    if args.test_id != "all" and not getattr(args, "prepare_references", False):
         _onboarding_kind(args.test_id)
-    for test_id in getattr(args, "reference_tests", None) or []:
-        _onboarding_kind(test_id)
-    from arctic_platform.correctness.harness.execution import _load_dense_checkpoint_allocation
-
+    if getattr(args, "inference_export_allocation", None) is not None:
+        args.inference_export_allocation = Path(args.inference_export_allocation).resolve()
     if getattr(args, "dense_checkpoint_allocation", None) is not None:
         args.dense_checkpoint_allocation = Path(args.dense_checkpoint_allocation).resolve()
     _load_dense_checkpoint_allocation(
         SimpleNamespace(**{**vars(args), "test": [args.test_id], "all_configs": False}),
         allow_automatic_gateway=True,
     )
+    _load_inference_export_allocation(SimpleNamespace(**{**vars(args), "test": [args.test_id], "all_configs": False}))
+    _load_inference_initial_model_dir(SimpleNamespace(**{**vars(args), "test": [args.test_id], "all_configs": False}))
     _optimizer_validation_bootstrap(args)
     if getattr(args, "local_cortex_fixture", False) and (
-        getattr(args, "prepare_references", False) or args.probe_layers is not None
+        args.probe_layers is not None
+        or (
+            getattr(args, "prepare_references", False)
+            and (args.reference_tests or [args.test_id]) != ["e2e-sft-train-validate"]
+        )
     ):
-        raise ValueError("local Cortex fixture selection is only for onboarding with final target validation")
+        raise ValueError(
+            "local Cortex fixture selection is only for onboarding with final target validation "
+            "or reduced E2E reference preparation"
+        )
+    topology = getattr(args, "inference_sampling_topology", None)
+    if topology is not None and (
+        getattr(args, "prepare_references", False)
+        or args.probe_layers is not None
+        or args.test_id != "inference-checkpoint-loss"
+    ):
+        raise ValueError("explicit inference sampling topology is only for final inference onboarding")
     reuse = getattr(args, "reuse_sizing", None)
     reuse_sha256 = getattr(args, "reuse_sizing_sha256", None)
     if (reuse is None) != (reuse_sha256 is None):
@@ -2321,14 +2758,24 @@ def run(args: argparse.Namespace) -> int:
         raise ValueError(
             f"{config.config_id}: correctness onboarding requires a training sub-job; this is inference-only"
         )
+    selection = args.reference_tests or (list(registered_tests()) if args.test_id == "all" else [args.test_id])
+    from arctic_platform.correctness.harness.execution import _configure_e2e_model
+
+    _configure_e2e_model(args, config, selection)
+    if not config.is_rl and set(selection).intersection(CALIBRATED_TEST_IDS):
+        validate_first_two_model_dtype(config)
     if args.reference_records_dir is not None:
         args.reference_records_dir = args.reference_records_dir.resolve()
-    if getattr(args, "peft_adapter", None) is not None:
-        from arctic_platform.correctness.harness.config import load_config
 
-        if not getattr(args, "prepare_references", False) and getattr(args, "backend", "onprem") != "onprem":
+    if getattr(args, "peft_adapter", None) is not None:
+        if (
+            args.test_id not in {"single-step-grads", "single-step-optimizer"}
+            or getattr(args, "reference_tests", None)
+            and not set(args.reference_tests) <= {"single-step-grads", "single-step-optimizer"}
+            or not getattr(args, "prepare_references", False)
+            and getattr(args, "backend", "onprem") != "onprem"
+        ):
             raise ValueError("--peft-adapter requires on-prem first-two SFT onboarding or reference preparation")
-        config = load_config(args.config)
         _onboarding_preflight(args, config)
         args.peft_adapter = _shared_adapter(args, config)
     if getattr(args, "prepare_references", False):
@@ -2368,18 +2815,33 @@ def run(args: argparse.Namespace) -> int:
             )
             print(f"Report: {report}", flush=True)
         return 0
-    options = _onboarding_options(args)
-    try:
-        with _onboarding_test_time(args, args.test_id):
+    with _onboarding_test_log(args) as test_log, _onboarding_test_time(args, args.test_id):
+        try:
+            options = _onboarding_options(args)
+            runtime_identity = _onboarding_runtime_identity(_onboarding_runtime_sources())
             code = _parent(args)
-    except Exception as exc:
-        _save_onboarding_summary(
-            args,
-            config,
-            spec_path,
-            {**summary.get("results", {}), args.test_id: {"status": "failed", "reason": str(exc)}},
-        )
-        raise
+        except Exception as exc:
+            _save_onboarding_summary(
+                args,
+                config,
+                spec_path,
+                {
+                    **summary.get("results", {}),
+                    args.test_id: {
+                        "status": "failed",
+                        "reason": _failure_reason(exc, test_log),
+                        "log": str(test_log) if test_log is not None else None,
+                    },
+                },
+            )
+            raise
+        reason = None
+        if code != 0:
+            reason = f"Onboarding process exited {code}."
+            if test_log is not None:
+                reason += f"\nLast onboarding output:\n{_log_tail(test_log)}"
+            reason += _failure_log_detail(test_log)
+            _onboarding_failure(reason)
     spec, _ = _onboarding_state(args, config, spec_path)
     result = {
         "status": "onboarded" if code == 0 else "failed",
@@ -2388,7 +2850,12 @@ def run(args: argparse.Namespace) -> int:
         "elapsed_seconds": args._onboarding_times[args.test_id],
         "spec_identity": _onboarding_spec_identity(spec, args.test_id) if code == 0 else None,
         "options": options,
+        "runtime_identity": runtime_identity if code == 0 else None,
     }
+    if test_log is not None:
+        result["log"] = str(test_log)
+    if reason is not None:
+        result["reason"] = reason
     _save_onboarding_summary(
         args, config, spec_path, {**summary.get("results", {}), args.test_id: result}, skipped_tests=[]
     )
@@ -2398,6 +2865,7 @@ def run(args: argparse.Namespace) -> int:
 def _onboard_configuration(args: argparse.Namespace) -> int:
     """Resolve a config-only onboarding request and retain each check's actual result."""
     from arctic_platform.correctness.harness.config import load_config
+    from arctic_platform.correctness.harness.execution import _configure_e2e_model
     from arctic_platform.correctness.harness.gateway import UnsafeCleanupError
     from arctic_platform.correctness.harness.registry import onboarding_inapplicable_reason
     from arctic_platform.correctness.harness.registry import registered_tests
@@ -2418,7 +2886,16 @@ def _onboard_configuration(args: argparse.Namespace) -> int:
             print(f"skip {test_id}: {reason}", flush=True)
         else:
             selected.append(test_id)
-    selected.sort(key=lambda test_id: (test_id != "single-step-grads", test_id))
+    selected.sort(
+        key=lambda test_id: (
+            (
+                0
+                if test_id == "single-step-grads"
+                else 1 if test_id == "single-step-optimizer" else 3 if test_id == "checkpoint-resume-loss" else 2
+            ),
+            test_id,
+        )
+    )
     spec_path = (
         Path(args.test_spec).resolve()
         if args.test_spec is not None
@@ -2439,6 +2916,15 @@ def _onboard_configuration(args: argparse.Namespace) -> int:
     selected = pending
     output = Path(args.output_dir) if args.output_dir is not None else None
     queue = list(selected)
+    if (
+        selected
+        and not config.is_rl
+        and not spec_path.exists()
+        and any(test_id not in CALIBRATED_TEST_IDS for test_id in selected)
+        and "single-step-grads" not in queue
+    ):
+        queue.insert(0, "single-step-grads")
+        print("preparing the gradient fixture required by the selected check", flush=True)
     unsafe_cleanup = None
     for index, test_id in enumerate(queue, start=1):
         if unsafe_cleanup:
@@ -2452,37 +2938,50 @@ def _onboard_configuration(args: argparse.Namespace) -> int:
                 "output_dir": output / test_id if output is not None else None,
             }
         )
-        _stage(f"Onboarding {index}/{len(queue)}", test_id.replace("-", " "), f"Config: {config.config_id}")
-        options = _onboarding_options(child)
-        with _onboarding_test_time(child, test_id):
+        if test_id == "single-step-grads" and test_id not in selected:
+            # A full-model E2E request still builds its shared spec with a reduced gradient fixture.
+            child.local_gateway_full_model = False
+        if hasattr(args, "_diagnostics_dir"):
+            child._diagnostics_dir = args._diagnostics_dir / test_id
+        with _onboarding_test_log(child) as test_log, _onboarding_test_time(child, test_id):
+            _stage(f"Onboarding {index}/{len(queue)}", test_id.replace("-", " "), f"Config: {config.config_id}")
             try:
+                _configure_e2e_model(child, config, [test_id])
+                options = _onboarding_options(child)
+                runtime_identity = _onboarding_runtime_identity(_onboarding_runtime_sources())
                 _onboarding_preflight(child, config, [test_id])
                 if output is None:
                     output = correctness_workdir("config-onboarding-")
                 child.output_dir = output / test_id
-                if hasattr(args, "_diagnostics_dir"):
-                    child._diagnostics_dir = args._diagnostics_dir / test_id
-                    child._diagnostics_dir.mkdir(parents=True, exist_ok=True)
                 code = _parent(child)
                 results[test_id] = {
                     "status": "onboarded" if code == 0 else "failed",
                     "exit_code": code,
                     "output_dir": str(child.output_dir),
                 }
+                if code != 0:
+                    reason = f"Onboarding process exited {code}."
+                    if test_log is not None:
+                        reason += f"\nLast onboarding output:\n{_log_tail(test_log)}"
+                    results[test_id]["reason"] = reason + _failure_log_detail(test_log)
+                    _onboarding_failure(f"{test_id}: {results[test_id]['reason']}")
             except UnsafeCleanupError as exc:
                 unsafe_cleanup = str(exc)
-                results[test_id] = {"status": "failed", "reason": str(exc), "exit_code": 1}
+                results[test_id] = {"status": "failed", "reason": _failure_reason(exc, test_log), "exit_code": 1}
                 traceback.print_exc()
-                _onboarding_failure(f"{test_id}: {exc}")
+                _onboarding_failure(f"{test_id}: {results[test_id]['reason']}")
             except Exception as exc:
-                results[test_id] = {"status": "failed", "reason": str(exc), "exit_code": 1}
+                results[test_id] = {"status": "failed", "reason": _failure_reason(exc, test_log), "exit_code": 1}
                 traceback.print_exc()
-                _onboarding_failure(f"{test_id}: {exc}")
+                _onboarding_failure(f"{test_id}: {results[test_id]['reason']}")
+        if test_log is not None:
+            results[test_id]["log"] = str(test_log)
         results[test_id]["elapsed_seconds"] = args._onboarding_times[test_id]
         if results[test_id]["status"] == "onboarded":
             current_spec, _ = _onboarding_state(args, config, spec_path)
             results[test_id]["spec_identity"] = _onboarding_spec_identity(current_spec, test_id)
             results[test_id]["options"] = options
+            results[test_id]["runtime_identity"] = runtime_identity
         _save_onboarding_summary(args, config, spec_path, {**retained, **results})
         current_spec, _ = _onboarding_state(args, config, spec_path)
         for completed_id in list(skipped):
@@ -2492,7 +2991,13 @@ def _onboard_configuration(args: argparse.Namespace) -> int:
                 queue.append(completed_id)
                 print(f"rebuilding {completed_id}: its frozen workload changed during onboarding", flush=True)
     references = [
-        test_id for test_id in requested if test_id in CRITERIA and results[test_id]["status"] == "onboarded"
+        test_id
+        for test_id in requested
+        if test_id in CRITERIA and results[test_id]["status"] == "onboarded"
+        # Full-model E2E references were prepared independently; do not replace them with reduced records.
+        and not (
+            test_id == "e2e-sft-train-validate" and results[test_id].get("options", {}).get("local_gateway_full_model")
+        )
     ]
     preparation_error = previous.get("combined_reference_error")
     if (
@@ -2618,135 +3123,430 @@ def main(argv=None) -> int:
     return logged_run(parser.parse_args(argv))
 
 
-@contextmanager
-def _onboarding_test_time(args: argparse.Namespace, test_id: str):
-    if not hasattr(args, "_onboarding_times"):
-        args._onboarding_times = {}
-    started = time.monotonic()
+def _reviewed_gate_argument(value: str) -> tuple[str, float]:
     try:
-        yield
-    finally:
-        args._onboarding_times[test_id] = args._onboarding_times.get(test_id, 0.0) + time.monotonic() - started
+        test_id, raw = value.split("=", 1)
+        gate = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected TEST=positive-finite-absolute-gate") from exc
+    if test_id not in CALIBRATED_TEST_IDS or not math.isfinite(gate) or gate <= 0:
+        raise argparse.ArgumentTypeError("reviewed gate requires a supported test and positive finite value")
+    return test_id, gate
 
 
-def _resume_onboarding_timing(tree: ast.Module) -> ast.Module:
-    """Normalize only the exact reviewed per-test timing additions."""
-    removed = {
-        ast.dump(ast.parse(source).body[0])
-        for source in (
-            """@contextmanager
-def _onboarding_test_time(args: argparse.Namespace, test_id: str):
-    if not hasattr(args, "_onboarding_times"):
-        args._onboarding_times = {}
-    started = time.monotonic()
+def _reviewed_gate(args: argparse.Namespace, test_id: str) -> float | None:
+    gates = getattr(args, "reviewed_gate", None) or []
+    if len(dict(gates)) != len(gates):
+        raise ValueError("each test may have only one --reviewed-gate")
+    return dict(gates).get(test_id)
+
+
+def _onboarding_runtime_sources() -> dict:
+    """Use the same capture/reference code and environment binding as phase retries."""
+    root = Path(__file__).resolve().parents[1]
+    versions = {}
+    for name in ("torch", "transformers", "huggingface-hub", "peft", "deepspeed", "ray", "dss", "dss-client"):
+        try:
+            versions[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            versions[name] = None
+    return {
+        "python": sys.executable,
+        "dependencies": versions,
+        "code": {
+            str(path.relative_to(root)): _checkpoint_file_identity(path)
+            for folder in ("onboarding", "harness", "reference", "checks")
+            for path in sorted((root / folder).rglob("*.py"))
+        },
+    }
+
+
+def _onboarding_runtime_identity(sources: dict) -> str:
+    projection = {name: sources[name] for name in ("python", "dependencies", "code")}
+    return hashlib.sha256(json.dumps(projection, sort_keys=True).encode()).hexdigest()
+
+
+def _prepare_onboarding_fixture(args: argparse.Namespace, config) -> tuple[dict, int, int]:
+    """Freeze shared model and inputs without declaring any check successfully onboarded."""
+    from arctic_platform.correctness.harness.config import TestSpec
+    from arctic_platform.correctness.harness.config import config_checksum
+
+    full_layers, period, representative_layers = _model_shape(str(args.source_checkpoint))
+    with _phase("Phase 1/3", "Representative Fixture Preparation"):
+        if args.test_spec.exists():
+            spec = TestSpec.read(args.test_spec)
+            if spec.config_id != config.config_id or spec.config_checksum != config_checksum(config):
+                raise ValueError("the existing fixture specification does not match the supplied configuration")
+            selected = {
+                "status": "fit",
+                "layers": spec.model.num_hidden_layers,
+                "peak_gib": spec.model.measured_reference_peak_gib or 0.0,
+            }
+            print(f"Reusing frozen model and inputs from {args.test_spec}", flush=True)
+        else:
+            if getattr(args, "reuse_sizing", None) is not None:
+                selected = _resume_phase(args, "sizing", lambda: _reuse_sizing(args, representative_layers))
+            else:
+                selected = _resume_phase(args, "sizing", lambda: _run_probe(args, representative_layers))
+            if selected["status"] == "oom":
+                raise RuntimeError(f"the minimum representative configuration ({representative_layers} layers) OOMs")
+            if selected["status"] != "fit":
+                raise RuntimeError(
+                    f"unexpected sizing status {selected['status']!r} for {representative_layers} layers"
+                )
+            _stage("Reference", "Fixture Preparation", "Writing the shared fixture specification and frozen inputs.")
+            _resume_phase(args, "fixture", lambda: _write_initial_spec(args, selected, None))
+            spec = TestSpec.read(args.test_spec)
+            spec.applicable_tests = []
+            spec.test_tolerances = {}
+            spec.test_settings = {}
+            spec.write(args.test_spec)
+        print(f"phase 1/3 complete: selected={selected['layers']} layers peak={selected['peak_gib']:.3f} GiB")
+    return selected, full_layers, period
+
+
+def _run_optimizer_calibration(args: argparse.Namespace) -> Path:
+    """Calibrate full-tensor optimizer deltas across a set of nondeterministic reference runs."""
+    args.output_dir = require_data_fast_path(args.output_dir, label="optimizer calibration work directory")
+    model_path = require_data_fast_path(args.optimizer_model_path, label="optimizer calibration model cache")
+
+    from decimal import ROUND_CEILING
+    from decimal import Decimal
+
+    import torch
+    from tqdm.auto import tqdm
+    from transformers import AutoConfig
+
+    from arctic_platform.correctness.checks.optimizer_state import max_pairwise_optimizer_delta
+    from arctic_platform.correctness.harness.config import TestSpec
+    from arctic_platform.correctness.harness.config import TestTolerance
+    from arctic_platform.correctness.harness.config import config_checksum
+    from arctic_platform.correctness.harness.config import load_config
+    from arctic_platform.correctness.harness.report import reference_progress
+    from arctic_platform.correctness.harness.runner import run_reference
+    from arctic_platform.correctness.harness.sft import SEED
+    from arctic_platform.correctness.harness.sft import build_synthetic_batch as build_batch
+    from arctic_platform.correctness.harness.sft import save
+
+    config = load_config(args.config)
+    spec = TestSpec.read(args.test_spec)
+    if spec.config_checksum != config_checksum(config):
+        raise ValueError("the existing spec does not match the config; onboard Test 1 before Test 2")
+    gas1 = next((arm for arm in spec.arms if arm.name == "gas1"), None)
+    if gas1 is None:
+        raise ValueError("the existing spec has no gas1 case")
+    model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    vocab_size = getattr(model_config, "text_config", model_config).vocab_size
+    batch = build_batch(gas1.name, gas1.global_batch_size, gas1.max_seq_len, vocab_size, seed=SEED)
+    batch_path = args.output_dir / "optimizer-calibration-batch.pt"
+    save(batch, batch_path)
+    training = config.effective_training
+    optimizer_config = config.training.get("optimizer")
+    if not isinstance(optimizer_config, dict):
+        raise ValueError("optimizer calibration requires an explicit optimizer config")
+    adapter_path = _shared_adapter(args, config, model_path)
+
+    lanes = reference_calibration_worker_count(
+        getattr(args, "reference_calibration_workers", None), runs=CALIBRATION_RUNS
+    )
+    calibration_root = correctness_workdir("optimizer-calibration-")
+    manifests: list[Path] = []
+    worst_delta = 0.0
+    worst_name = None
+    losses = []
+    peaks = []
+    durations = []
+
+    def one_run(run_index: int) -> tuple[int, float, dict]:
+        run_dir = calibration_root / f"run-{run_index + 1:02d}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        started = time.monotonic()
+        result = run_reference(
+            str(model_path),
+            batch_path,
+            run_dir / "result.json",
+            token_budget=args.reference_token_budget,
+            ce_chunk=2048,
+            attn=config.reference_attention_implementation,
+            fp32_lm_head=bool(training.get("fp32_lm_head", False)),
+            fused_cross_entropy=training.get("fused_cross_entropy", False),
+            matmul_precision=training.get("matmul_precision", "highest"),
+            peft_config=training.get("peft_config"),
+            peft_adapter_path=adapter_path,
+            lm_head_token_chunk_size=config.lm_head_token_chunk_size,
+            lm_head_vocab_chunk_size=training.get("fused_lm_head_vocab_chunk_size", 8192),
+            optimizer_config=optimizer_config,
+            learning_rate=1e-2,
+            gradient_clipping=config.training.get("gradient_clipping"),
+            optimizer_dtype=config.optimizer_dtype,
+            optimizer_output_dir=run_dir / "states",
+            cuda_device=run_index % lanes,
+            deterministic=False,
+        )
+        return run_index, time.monotonic() - started, result
+
     try:
-        yield
+        completed: dict[int, tuple[float, dict]] = {}
+        for start in range(0, CALIBRATION_RUNS, lanes):
+            with ThreadPoolExecutor(max_workers=lanes) as pool:
+                futures = {
+                    pool.submit(one_run, index): index for index in range(start, min(start + lanes, CALIBRATION_RUNS))
+                }
+                for _, (index, elapsed, result) in reference_progress(
+                    futures, label="Finding optimizer tolerance", total=CALIBRATION_RUNS, completed=len(completed)
+                ):
+                    completed[index] = (elapsed, result)
+        for index in range(CALIBRATION_RUNS):
+            elapsed, result = completed[index]
+            durations.append(elapsed)
+            losses.append(float(result["loss"]))
+            peaks.append(float(result["peak_gib"]))
+            manifests.append(Path(result["optimizer_state_manifest"]))
+        parameter_count = len(json.loads(manifests[0].read_text())["parameters"])
+        pair_count = CALIBRATION_RUNS * (CALIBRATION_RUNS - 1) // 2
+        with tqdm(
+            total=parameter_count, desc=f"Comparing {pair_count} reference pairs", unit="tensor", dynamic_ncols=True
+        ) as progress:
+            worst = max_pairwise_optimizer_delta(
+                manifests,
+                optimizer_config=optimizer_config,
+                learning_rate=1e-2,
+                progress=progress,
+            )
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if worst is not None:
+            worst_delta = worst.delta_norm
+            worst_name = f"{worst.name}::{worst.state}"
     finally:
-        args._onboarding_times[test_id] = args._onboarding_times.get(test_id, 0.0) + time.monotonic() - started""",
-            "args._onboarding_times = {}",
-            """if not hasattr(args, "_onboarding_times"):
-    args._onboarding_times = {}""",
-            """timings = "".join(
-    f"\\nOnboarding time ({test_id}): {total_duration(elapsed)}\\n"
-    for test_id, elapsed in args._onboarding_times.items()
-)""",
-            """for test_id, elapsed in args._onboarding_times.items():
-    print(f"Onboarding time ({test_id}): {total_duration(elapsed)}", flush=True)""",
-            'results[test_id]["elapsed_seconds"] = args._onboarding_times[test_id]',
-            """if "combined reference preparation" in args._onboarding_times:
-    lines.extend([
-        "Combined reference preparation time: "
-        f"{total_duration(args._onboarding_times['combined reference preparation'])}",
-        "",
-    ])""",
-        )
+        shutil.rmtree(calibration_root, ignore_errors=True)
+
+    quantum = Decimal("0.001")
+    computed_gate = GATE_SAFETY_FACTOR * worst_delta
+    rounded_gate = (Decimal(str(computed_gate)) / quantum).to_integral_value(rounding=ROUND_CEILING) * quantum
+    selected_gate = max(float(quantum), float(rounded_gate))
+    tolerance = TestTolerance(
+        absolute=selected_gate,
+        calibration_runs=CALIBRATION_RUNS,
+        raw_max_same_tensor_range=worst_delta,
+        multiplier=GATE_SAFETY_FACTOR,
+        computed_gate=computed_gate,
+        worst_tensor=worst_name,
+        status=(
+            f"calibrated from {CALIBRATION_RUNS} nondeterministic optimizer-reference executions; 4x the maximum "
+            "pairwise moment or update-residual delta, rounded upward in 1e-3 units"
+        ),
+    )
+    spec.test_tolerances["single-step-optimizer"] = tolerance
+    spec.test_settings["single-step-optimizer"] = {
+        "model_cache_path": str(model_path),
+        "num_hidden_layers": int(args.optimizer_layers),
+        "reference_token_budget": args.reference_token_budget,
+        "ce_chunk": 2048,
+        "learning_rate": 1e-2,
+        "optimizer_dtype": config.optimizer_dtype,
+        "calibration_metric": (
+            f"maximum pairwise full-tensor moment or update-residual L2 delta across {CALIBRATION_RUNS} runs"
+        ),
     }
-    selection_nodes = {
-        ast.dump(ast.parse(source).body[0])
-        for source in (
-            "selection = args.reference_tests or [args.test_id]",
-            'label = selection[0] if len(selection) == 1 else "combined reference preparation"',
+    if "single-step-optimizer" not in spec.applicable_tests:
+        spec.applicable_tests.append("single-step-optimizer")
+    spec.write(args.test_spec)
+
+    output = getattr(args, "_diagnostics_dir", args.output_dir) / "optimizer-reference-repeatability.json"
+    output.write_text(
+        json.dumps(
+            {
+                "configuration": {
+                    "test_id": "single-step-optimizer",
+                    "case": gas1.name,
+                    "global_batch_size": gas1.global_batch_size,
+                    "max_seq_len": gas1.max_seq_len,
+                    "model_cache_path": str(model_path),
+                    "num_hidden_layers": int(args.optimizer_layers),
+                    "reference_token_budget": args.reference_token_budget,
+                    "runs": CALIBRATION_RUNS,
+                    "learning_rate": 1e-2,
+                    "optimizer_dtype": config.optimizer_dtype,
+                    "deterministic_algorithms": False,
+                    "flash_attention_deterministic": False,
+                },
+                "losses": losses,
+                "peak_gib": peaks,
+                "durations_seconds": durations,
+                "tolerance": {
+                    "raw_max_baseline_delta_norm": worst_delta,
+                    "worst_tensor_and_state": worst_name,
+                    "multiplier": GATE_SAFETY_FACTOR,
+                    "computed_gate": computed_gate,
+                    "rounding_quantum": float(quantum),
+                    "minimum_gate": float(quantum),
+                    "selected_gate": selected_gate,
+                },
+            },
+            indent=2,
+            sort_keys=True,
         )
+        + "\n"
+    )
+    print(f"optimizer raw variation: {worst_delta:.9e}", flush=True)
+    print(f"optimizer selected gate: {selected_gate:.9e}", flush=True)
+    return output
+
+
+def _onboarding_spec_identity(spec: dict, test_id: str) -> str | None:
+    """Adding another check must not invalidate this check's reviewed workload."""
+    if (
+        not isinstance(spec, dict)
+        or test_id not in spec.get("applicable_tests", [])
+        or not spec.get("config_checksum")
+    ):
+        return None
+    fields = ("config_id", "config_checksum", "model", "arms", "attn_implementations", "param_name_map")
+    projection = {name: spec.get(name) for name in fields}
+    projection["test_tolerance"] = spec.get("test_tolerances", {}).get(test_id)
+    projection["test_settings"] = spec.get("test_settings", {}).get(test_id)
+    return hashlib.sha256(json.dumps(projection, sort_keys=True).encode()).hexdigest()
+
+
+def _onboarding_options(args: argparse.Namespace) -> dict:
+    names = (
+        "tokens",
+        "reference_token_budget",
+        "source_checkpoint",
+        "peft_adapter",
+        "gpu_pool",
+        "reviewed_gate",
+        "backend",
+        "host",
+        "base_url",
+        "checkpoint_training_gpus",
+        "inference_sampling_topology",
+        "inference_export_allocation",
+        "inference_export_allocation_sha256",
+        "inference_initial_model_dir",
+        "dense_checkpoint_allocation",
+        "dense_checkpoint_allocation_sha256",
+        "local_gateway_full_model",
+    )
+    return json.loads(json.dumps({name: getattr(args, name, None) for name in names}, default=str))
+
+
+def _onboarding_state(args: argparse.Namespace, config, spec_path: Path) -> tuple[dict, dict]:
+    from arctic_platform.correctness.harness.config import TestSpec
+    from arctic_platform.correctness.harness.config import config_checksum
+
+    spec = {}
+    try:
+        candidate = json.loads(TestSpec.read(spec_path).to_json())
+        if candidate["config_id"] == config.config_id and candidate["config_checksum"] == config_checksum(config):
+            spec = candidate
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        pass
+    summary = {}
+    try:
+        candidate = json.loads(spec_path.with_suffix(".onboarding.json").read_text())
+        if candidate["config_id"] == config.config_id and isinstance(candidate["results"], dict):
+            summary = candidate
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return spec, summary
+
+
+def _completed_onboarding(args: argparse.Namespace, spec: dict, summary: dict, test_id: str) -> dict | None:
+    identity = _onboarding_spec_identity(spec, test_id)
+    if identity is None:
+        return None
+    saved = summary.get("results", {}).get(test_id, {})
+    if not isinstance(saved, dict):
+        saved = {}
+    if test_id == "e2e-sft-train-validate":
+        from arctic_platform.correctness.harness.config import load_config
+        from arctic_platform.correctness.harness.execution import _configure_e2e_model
+
+        args = argparse.Namespace(**vars(args))
+        _configure_e2e_model(args, load_config(args.config), [test_id])
+    options = _onboarding_options(args)
+    runtime_identity = _onboarding_runtime_identity(_onboarding_runtime_sources())
+    if (
+        saved.get("status") == "onboarded"
+        and saved.get("exit_code") == 0
+        and saved.get("spec_identity") == identity
+        and saved.get("options") == options
+        and saved.get("runtime_identity") == runtime_identity
+    ):
+        return dict(saved)
+    # Older explicit-check runs did not update the summary. Recover only a passing
+    # validation whose original request binds the current runtime and frozen spec.
+    if (
+        saved.get("status") == "failed"
+        or saved.get("spec_identity") is not None
+        or saved.get("runtime_identity") is not None
+        or not hasattr(args, "_resume_root")
+        or any(options.values())
+    ):
+        return None
+    relative = Path(spec["config_id"]) / test_id
+    paths = set((args._resume_root / relative).glob("*/validation.json"))
+    for log_root in {args._resume_root.parent, Path.cwd() / "work" / "logs"}:
+        paths.update(log_root.glob(f"*/onboarding-state/{relative}/*/validation.json"))
+    for path in sorted(paths):
+        try:
+            manifest = json.loads(path.with_name("request.json").read_text())
+            request = manifest["request"]
+            digest = hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest()
+            if (
+                manifest["schema"] != "onboarding-resume-request-v1"
+                or path.parent.name != digest
+                or request["config"] != _checkpoint_file_identity(args.config)
+                or request["options"]["test_id"] != test_id
+                or _onboarding_runtime_identity(request) != runtime_identity
+            ):
+                continue
+            phase = json.loads(path.read_text())
+            if (
+                phase["result"]["status"] == "pass"
+                and _onboarding_spec_identity(json.loads(phase["spec"]), test_id) == identity
+            ):
+                return {
+                    "status": "onboarded",
+                    "exit_code": 0,
+                    "spec_identity": identity,
+                    "options": options,
+                    "runtime_identity": runtime_identity,
+                    "validation_checkpoint": str(path),
+                }
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            continue
+    return None
+
+
+def _save_onboarding_summary(args: argparse.Namespace, config, spec_path: Path, results: dict, **details) -> dict:
+    _, previous = _onboarding_state(args, config, spec_path)
+    summary = {
+        **previous,
+        "config_id": config.config_id,
+        "config": str(args.config),
+        "test_spec": str(spec_path),
+        "results": results,
+        **details,
     }
-    contexts = {
-        ast.dump(ast.parse(f"with {source}:\n    pass").body[0].items[0])
-        for source in (
-            "_onboarding_test_time(args, label)",
-            "_onboarding_test_time(args, args.test_id)",
-            "_onboarding_test_time(child, test_id)",
-            '_onboarding_test_time(args, "combined reference preparation")',
-        )
-    }
-    report_import = ast.dump(
-        ast.parse("from arctic_platform.correctness.harness.report import total_duration").body[0]
-    )
-    failure_report = (
-        'f"# Onboarding Failed\\n\\nConfig: `{args.config}`\\n\\n"'
-        'f"## Reason\\n\\n{reason}\\n{timings}\\n"'
-        '"Complete traceback: [onboarding.log](onboarding.log)\\n"'
-    )
-    previous_failure_report = (
-        'f"# Onboarding Failed\\n\\nConfig: `{args.config}`\\n\\n"'
-        'f"## Reason\\n\\n{reason}\\n\\nComplete traceback: [onboarding.log](onboarding.log)\\n"'
-    )
-    failure_report_node = ast.dump(ast.parse(failure_report, mode="eval").body)
-    timing_line = ast.dump(
-        ast.parse(
-            """(f"Onboarding time: {total_duration(result['elapsed_seconds'])}"
-if "elapsed_seconds" in result else "Onboarding time: not run")""",
-            mode="eval",
-        ).body
-    )
-    combined_time = ast.dump(
-        ast.parse('args._onboarding_times.get("combined reference preparation")', mode="eval").body
-    )
-
-    class TimingDisplay(ast.NodeTransformer):
-        function = None
-
-        def visit(self, node):
-            identity = ast.dump(node)
-            if identity in removed or self.function == "run" and identity in selection_nodes:
-                return None
-            if self.function == "_onboard_configuration" and identity == report_import:
-                return None
-            if identity == failure_report_node:
-                return ast.parse(previous_failure_report, mode="eval").body
-            return super().visit(node)
-
-        def visit_FunctionDef(self, node):
-            previous = self.function
-            self.function = node.name
-            node = self.generic_visit(node)
-            self.function = previous
-            return node
-
-        def visit_With(self, node):
-            node = self.generic_visit(node)
-            if len(node.items) == 1 and ast.dump(node.items[0]) in contexts:
-                return node.body
-            return node
-
-        def visit_Dict(self, node):
-            for index in range(len(node.keys) - 1, -1, -1):
-                if (
-                    isinstance(node.keys[index], ast.Constant)
-                    and node.keys[index].value == "combined_reference_elapsed_seconds"
-                    and ast.dump(node.values[index]) == combined_time
-                ):
-                    del node.keys[index]
-                    del node.values[index]
-            return self.generic_visit(node)
-
-        def visit_List(self, node):
-            for index in range(len(node.elts) - 2, -1, -1):
-                if ast.dump(node.elts[index]) == timing_line and ast.dump(node.elts[index + 1]) == ast.dump(
-                    ast.Constant(value="")
-                ):
-                    del node.elts[index : index + 2]
-            return self.generic_visit(node)
-
-    return TimingDisplay().visit(tree)
+    destination = spec_path.with_suffix(".onboarding.json")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", dir=destination.parent, prefix=f".{destination.name}-", delete=False
+        ) as stream:
+            temporary = Path(stream.name)
+            stream.write(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+        temporary.replace(destination)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    if hasattr(args, "_diagnostics_dir"):
+        (args._diagnostics_dir / "onboarding.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    return summary
 
 
 if __name__ == "__main__":

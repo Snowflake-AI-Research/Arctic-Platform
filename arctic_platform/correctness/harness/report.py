@@ -28,6 +28,7 @@ import threading
 import time
 from concurrent.futures import FIRST_COMPLETED
 from concurrent.futures import wait
+from contextvars import ContextVar
 from dataclasses import asdict
 from datetime import datetime
 from datetime import timezone
@@ -112,6 +113,65 @@ def collect(repo: Optional[Path] = None) -> Dict[str, str]:
 RULE = "  " + "-" * 99
 SEPARATOR = ["", RULE, ""]
 SPINNER_FRAMES = "|/-\\"
+_RUN_PROGRESS = ContextVar("correctness_run_progress", default=None)
+
+
+class RunProgress:
+    """Keep the operator informed while detailed execution output goes to a log."""
+
+    def __init__(self, label: str, *, stream: TextIO, interval: float = 30, clock=None) -> None:
+        self.label = label
+        self.stream = stream
+        self.interval = interval
+        self.clock = clock if clock is not None else time.monotonic
+        self.phase = "Preparing configuration, references and target runtime"
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+
+    def update(self, phase: str, *, announce: bool = True) -> str:
+        with self._lock:
+            previous = self.phase
+            self.phase = phase
+        if announce:
+            print(f"  {self.label}: {phase}", file=self.stream, flush=True)
+        return previous
+
+    def _wait(self) -> None:
+        while not self._stop.wait(self.interval):
+            with self._lock:
+                phase = self.phase
+            try:
+                print(
+                    f"  Still waiting: {self.label}; {phase}; "
+                    f"elapsed {total_duration(self.clock() - self.started)} "
+                    "(controller waiting; backend completion not yet reported)",
+                    file=self.stream,
+                    flush=True,
+                )
+            except (OSError, ValueError):
+                return
+
+    def __enter__(self) -> "RunProgress":
+        self.started = self.clock()
+        self.update(self.phase)
+        self._token = _RUN_PROGRESS.set(self)
+        self._thread = threading.Thread(target=self._wait, name="correctness-run-progress", daemon=True)
+        try:
+            self._thread.start()
+        except BaseException:
+            _RUN_PROGRESS.reset(self._token)
+            raise
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self._stop.set()
+        try:
+            if self._thread is not None:
+                # A blocked log consumer must not prevent backend cleanup.
+                self._thread.join(timeout=0.1)
+        finally:
+            _RUN_PROGRESS.reset(self._token)
 
 
 class Activity:
@@ -119,6 +179,7 @@ class Activity:
 
     def __init__(self, message: str, *, stream: TextIO | None = None, interval: float = 0.1) -> None:
         self.message = message
+        self._progress = _RUN_PROGRESS.get() if stream is None else None
         self.stream = stream if stream is not None else sys.stdout
         self.interval = interval
         self._stop = threading.Event()
@@ -142,6 +203,8 @@ class Activity:
             self._render()
 
     def __enter__(self) -> "Activity":
+        if self._progress is not None:
+            self._previous_phase = self._progress.update(self.message)
         if not self._interactive:
             print(f"  {self.message} ...", file=self.stream, flush=True)
             return self
@@ -151,6 +214,8 @@ class Activity:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
+        if self._progress is not None:
+            self._progress.update(self._previous_phase, announce=False)
         if not self._interactive:
             return
         self._stop.set()
@@ -227,11 +292,11 @@ def runtime_table(timing, wall_seconds: float) -> str:
     width = max(9, max(len(n) for n in names) + 2)
     header = "  runtime    " + "".join(n.rjust(width) for n in names) + "total".rjust(width)
     rows = list(SEPARATOR) + [header]
-    engines = [("reference", "reference"), ("Arctic Platform", "dss")]
+    engines = [("reference", "reference"), ("Arctic Platform", "ap")]
     if any("optimizer_reference" in timing[name] for name in names):
         engines.append(("opt ref", "optimizer_reference"))
-    if any("optimizer_dss" in timing[name] for name in names):
-        engines.append(("opt Arctic Platform", "optimizer_dss"))
+    if any("optimizer_ap" in timing[name] for name in names):
+        engines.append(("opt Arctic Platform", "optimizer_ap"))
     for engine, key in engines:
         cells = [timing[n].get(key) for n in names]
         total = sum(v for v in cells if v is not None)
@@ -317,18 +382,20 @@ def arm_verdict(result: TestResult, arm: Optional[ArmSpec], timing: Optional[dic
         lines.append(f"    INAPPLICABLE  {result.reason}")
         return "\n".join(lines)
 
-    if "reference_loss" in m and "dss_loss" in m:
+    # Historical results remain readable; new AP metrics take precedence.
+    ap_loss = m.get("ap_loss", m.get("dss_loss"))
+    if "reference_loss" in m and ap_loss is not None:
         lines.append(
-            f"    loss          reference {m['reference_loss']:<12.6f} Arctic Platform {m['dss_loss']:<12.6f} "
+            f"    loss          reference {m['reference_loss']:<12.6f} Arctic Platform {ap_loss:<12.6f} "
             f"delta {m.get('loss_delta', 0.0):.3e}"
         )
     elif "loss_delta" in m:
         lines.append(f"    loss          delta {m['loss_delta']:.3e}")
 
-    observed = m.get("dss_model_calls_observed")
+    observed = m.get("ap_model_calls_observed", m.get("dss_model_calls_observed"))
     ref_calls = m.get("reference_microbatches")
     if observed is not None or ref_calls is not None:
-        predicted = m.get("dss_microbatches_predicted")
+        predicted = m.get("ap_microbatches_predicted", m.get("dss_microbatches_predicted"))
         note = (
             ""
             if observed is None or predicted is None or int(predicted) == int(observed)
@@ -340,7 +407,7 @@ def arm_verdict(result: TestResult, arm: Optional[ArmSpec], timing: Optional[dic
 
     compared = int(m.get("tensors_compared", 0))
     if compared:
-        unmatched = int(m.get("unmatched_dss", 0)) + int(m.get("unmatched_reference", 0))
+        unmatched = int(m.get("unmatched_ap", m.get("unmatched_dss", 0))) + int(m.get("unmatched_reference", 0))
         over_stated = int(m.get("tensors_over_stated_criterion", 0))
         label = 43  # one column for every sub-row, so the values below form a single readable column
         tail = f", {unmatched} unmatched" if unmatched else ""
@@ -562,7 +629,7 @@ def to_markdown(
                     f"{a.total_tokens:,}",
                     f"{a.active_tokens:,}",
                     f"{a.pad_fraction:.1%}",
-                    f"{a.dss_microbatches}",
+                    f"{a.ap_microbatches}",
                 ]
                 for a in spec.arms
             ],

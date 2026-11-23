@@ -52,7 +52,7 @@ Issues = "https://github.com/Snowflake-AI-Research/Arctic-Platform/issues"
 
 [project]
 name = "arctic_platform"
-version = "0.2.1.dev0"
+version = "0.2.2.dev0"
 description = "Snowflake LLM training library w/ RL"
 authors = [
     {name = "Tunji Ruwase", email = "tunji.ruwase@snowflake.com"},
@@ -135,8 +135,7 @@ formatting = [
     "autoflake",
 ]
 
-# Correctness onboarding, HF references, target execution, and CPU selftests.
-# Sampling and model-specific attention kernels are installed separately.
+# Correctness onboarding, HF references and CPU selftests; GPU kernels remain separately installed.
 correctness = [
     "arctic_platform[cortex]",
     "arctic_platform[sft]",

@@ -119,26 +119,26 @@ class ArmSpec:
     max_seq_len: int
     total_tokens: int
     active_tokens: int
-    dss_microbatches: int
+    ap_microbatches: int
     pad_fraction: float
 
     @property
     def exercises_accumulation(self) -> bool:
-        return self.dss_microbatches > 1
+        return self.ap_microbatches > 1
 
 
 @dataclass
 class ModelSpec:
-    """The synthetic model recipe. Regenerable from the seed, so the path is a cache and not an input."""
+    """Prepared synthetic recipe or pinned original source; unmeasured reference-free metadata may be None."""
 
     source_checkpoint: str
     num_hidden_layers: int
-    vision_depth: int
-    seed: int
-    param_count: int
+    vision_depth: Optional[int]
+    seed: Optional[int]
+    param_count: Optional[int]
     cache_path: str
     content_hash: str
-    sized_against_gib: float
+    sized_against_gib: Optional[float]
     measured_reference_peak_gib: Optional[float] = None
 
 
@@ -212,6 +212,13 @@ class TestSpec:
     @staticmethod
     def read(path: Path) -> "TestSpec":
         raw = json.loads(Path(path).read_text())
+        # Previously onboarded specifications retain their original bytes.
+        for arm in raw["arms"]:
+            if "dss_microbatches" in arm:
+                legacy = arm.pop("dss_microbatches")
+                if "ap_microbatches" in arm and arm["ap_microbatches"] != legacy:
+                    raise ValueError("specification has conflicting AP and legacy microbatch counts")
+                arm.setdefault("ap_microbatches", legacy)
         return TestSpec(
             config_id=raw["config_id"],
             config_path=raw["config_path"],
@@ -284,6 +291,7 @@ class LoadedConfig:
     sub_jobs: List[Dict[str, Any]] = field(default_factory=list)
     native: ArcticClientConfig | None = None
     hardware: Literal["H200", "B200", "B300"] | None = None
+    placement_base_gpus: int | None = None
 
     @property
     def training(self) -> Dict[str, Any]:
@@ -430,7 +438,13 @@ class LoadedConfig:
                 update={"training_gpus": gpus, "training": native_training},
                 deep=True,
             )
-        return replace(self, sub_job=sub_job, sub_jobs=sub_jobs, native=native)
+        return replace(
+            self,
+            sub_job=sub_job,
+            sub_jobs=sub_jobs,
+            native=native,
+            placement_base_gpus=self.placement_base_gpus or self.n_gpus,
+        )
 
     @property
     def sp_size(self) -> int:
@@ -721,6 +735,24 @@ def config_checksum(config: LoadedConfig) -> str:
             projection.update({key: raw[key] for key in ("sampling_gpus", "sampling")})
         canonical = json.dumps(projection, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def validate_first_two_model_dtype(config: LoadedConfig) -> None:
+    """Admit only BF16 model parameters, independently of accumulator and optimizer-state precision."""
+    # The declared model dtype and the first-two payload's training override are separate inputs.
+    for location, dtype in (
+        ("sub_job.dtype", config.sub_job.get("dtype")),
+        ("training_config.dtype", config.training.get("dtype")),
+    ):
+        if dtype is None:
+            continue
+        if not isinstance(dtype, str) or dtype.lower() not in {"bf16", "bfloat16"}:
+            raise ValueError(
+                f"{config.config_id}: first-two correctness onboarding, reference preparation and regression "
+                f"support only BF16 model dtype ('bfloat16' or 'bf16'); got {location}={dtype!r}. "
+                "Non-BF16 model execution is not admitted; the target and HF reference use BF16. "
+                "FP32 gradient accumulation is a separate setting and remains supported."
+            )
 
 
 def _sibling_for(path: Path, gpu_type: str) -> str:

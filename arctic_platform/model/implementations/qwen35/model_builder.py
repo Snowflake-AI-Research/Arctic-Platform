@@ -36,7 +36,6 @@ from torch.distributed.checkpoint.state_dict_loader import load as dcp_load
 from torch.distributed.tensor import DTensor, distribute_tensor
 from transformers import AutoConfig, AutoModelForCausalLM, GenerationConfig, PretrainedConfig
 
-from arctic_platform.debug.lora import maybe_observe_checkpoint_reader
 from arctic_platform.debug.training import maybe_capture_reduced_fixture_mtp
 from arctic_platform.model.config import ActivationCheckpointConfig
 from arctic_platform.model.implementations.gpu.activation_offload import install_activation_offload
@@ -636,9 +635,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
     else:
         dcp_load(
             state_dict,
-            storage_reader=maybe_observe_checkpoint_reader(
-                HuggingFaceStorageReader(path=snapshot_path.as_posix()), model, state_dict, config, parallel_dims
-            ),
+            storage_reader=HuggingFaceStorageReader(path=snapshot_path.as_posix()),
         )
     # Restore weight tying broken by to_empty() for HF models
     if not isinstance(model, PreTrainedModelPrimeRL) and model.config.tie_word_embeddings:

@@ -17,12 +17,10 @@
 
 from __future__ import annotations
 
-import importlib
-
 import pytest
 
 pytest.register_assert_rewrite(f"{__package__}.library")
-library = importlib.import_module(".library", __package__)
+from . import library  # noqa: E402
 
 for _name in library._SELFTEST_FIXTURES:
     globals()[_name] = getattr(library, _name)

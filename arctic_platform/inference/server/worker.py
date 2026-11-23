@@ -19,8 +19,6 @@ from uuid import uuid4
 
 import ray
 
-from arctic_platform.debug.inference import maybe_begin_inference_startup_attempt
-from arctic_platform.debug.inference import maybe_finish_inference_startup_attempt
 from arctic_platform.debug.weight_sync import maybe_collect_broadcast_verification
 from arctic_platform.inference.envs import arctic_inference_effective_enabled
 from arctic_platform.inference.server.chat import ChatModel, resolve_chat_model
@@ -49,6 +47,8 @@ logger = logging.getLogger("arctic_platform.inference.server")
 _UNEXPECTED_KWARG_RE = re.compile(r"unexpected keyword argument '([^']+)'")
 _SAMPLE_ID_PARAM_KEY = "dss_sample_id"
 _REPLAY_ID_PARAM_KEY = "dss_router_replay_id"
+# The same trajectory's previous capture, read from extra_args, which a server without this key leaves unused.
+_REPLAY_PREFIX_ID_PARAM_KEY = "dss_router_replay_prefix_id"
 _ROUTER_REPLAY_MARKER_KEY = "router_replay"
 _ROUTER_REPLAY_RETURN_INFO_PARAM_KEY = "dss_return_back_router_info"
 _ROUTER_REPLAY_STOP_TOKEN_SEQUENCES_PARAM_KEY = "dss_stop_token_sequences"
@@ -647,6 +647,7 @@ def _result_from_output(
     cache_tx: Any = None,
     sample_id: str | None = None,
     replay_id: str | None = None,
+    prefix_replay_id: str | None = None,
     request_id: str | None = None,
     replica_label: str | None = None,
     return_back_router_info: bool = False,
@@ -676,6 +677,13 @@ def _result_from_output(
         "generation_len": len(choice.token_ids),
         "prefix_cache_len": int(num_cached) if num_cached is not None else 0,
     }
+    stats = getattr(final_output, "metrics", None)
+    if stats is not None:
+        # Same-host engine timestamps are monotonic; unset phases are 0.0.
+        offset = time.time() - time.monotonic()
+        for key in ("queued_ts", "scheduled_ts", "first_token_ts", "last_token_ts"):
+            if (value := getattr(stats, key)) > 0:
+                result[key] = value + offset
 
     spec = getattr(choice, "spec_decode_metrics", None)
     if spec is not None:
@@ -707,6 +715,7 @@ def _result_from_output(
         cache_tx=cache_tx,
         sample_id=sample_id,
         replay_id=replay_id,
+        prefix_replay_id=prefix_replay_id,
         request_id=request_id,
         replica_label=replica_label,
         return_back_router_info=return_back_router_info,
@@ -721,6 +730,7 @@ def _maybe_cache_routed_experts(
     cache_tx: Any,
     sample_id: str | None,
     replay_id: str | None,
+    prefix_replay_id: str | None,
     request_id: str | None,
     replica_label: str | None,
     return_back_router_info: bool,
@@ -745,6 +755,24 @@ def _maybe_cache_routed_experts(
             f"capture_len={capture_len} expected_capture_len={expected_capture_len} "
             f"capture_shape={list(routed.shape)}"
         )
+    # This request re-prefills the prefix capture's positions; keep the routes the earlier request sampled with.
+    prefix_len = 0
+    if prefix_replay_id is not None:
+        try:
+            prefix = cache_tx.get(prefix_replay_id)
+        except KeyError:  # another replica served the earlier request, or the cache evicted it
+            prefix = None
+        if prefix is not None:
+            if prefix.shape[0] >= prompt_len or tuple(prefix.shape[1:]) != tuple(routed.shape[1:]):
+                raise ValueError(
+                    "router-replay prefix capture must end inside the prompt, with the same layer/top-k shape "
+                    f"trajectory_id={sample_id!r} replay_id={replay_id!r} prefix_replay_id={prefix_replay_id!r} "
+                    f"prefix_shape={list(prefix.shape)} prompt_len={prompt_len} capture_shape={list(routed.shape)}"
+                )
+            import torch
+
+            prefix_len = int(prefix.shape[0])
+            routed = torch.cat([prefix, torch.as_tensor(routed[prefix_len:]).to(prefix.device, prefix.dtype)])
     cache_key = replay_id or sample_id
     if replay_id is not None and replay_id.startswith("rr1:"):
         cache_tx.put_new(cache_key, routed)
@@ -759,6 +787,7 @@ def _maybe_cache_routed_experts(
         "prompt_len": prompt_len,
         "generation_len": generation_len,
         "capture_len": capture_len,
+        "prefix_len": prefix_len,
     }
     if return_back_router_info:
         tensor = routed.detach().cpu() if hasattr(routed, "detach") else routed
@@ -1012,9 +1041,6 @@ class InferenceWorker(StreamingWorkerMixin):
         max_attempts = _env_int("ARCTIC_VLLM_ENGINE_STARTUP_ATTEMPTS", 5)
         retry_base_s = _env_float("ARCTIC_VLLM_ENGINE_STARTUP_RETRY_BASE_S", 1.0)
         for attempt in range(1, max_attempts + 1):
-            durable_attempt = maybe_begin_inference_startup_attempt(attempt)
-            attempt_error = None
-            attempt_outcome = "ready"
             startup_error_dir = _begin_engine_startup_capture()
             try:
                 attempt_kwargs = dict(engine_kwargs)
@@ -1049,7 +1075,7 @@ class InferenceWorker(StreamingWorkerMixin):
                 )
                 self._register_router_replay_shm(attempt_kwargs, vllm_config, model_id)
                 if semi_p:
-                    from arctic_platform.inference.server.semip_asyncllm import restore_and_attach
+                    from arctic_platform.inference.server.semip_frontend import restore_and_attach
                     self.llm = await restore_and_attach(engine_kwargs, semi_p_agents, vllm_config)
                 else:
                     self.llm = AsyncLLM.from_vllm_config(
@@ -1058,12 +1084,10 @@ class InferenceWorker(StreamingWorkerMixin):
                     )
                 break
             except BaseException as exc:
-                attempt_error = exc
                 self._cleanup_registered_router_replay_shm()
                 # semi_p is not retried here: the restore retries its own
                 # ports, so another attempt would only repeat a whole restore.
                 if semi_p or attempt >= max_attempts or not _is_address_in_use_error(exc):
-                    attempt_outcome = "error"
                     tail = _console_tail()
                     startup_exc = _engine_startup_error(exc, startup_error_dir)
                     target = startup_exc if startup_exc is not None else exc
@@ -1072,7 +1096,6 @@ class InferenceWorker(StreamingWorkerMixin):
                     if startup_exc is not None:
                         raise startup_exc from exc
                     raise
-                attempt_outcome = "retry"
                 delay_s = retry_base_s * attempt + random.uniform(0.0, retry_base_s)
                 logger.warning(
                     "vLLM engine startup hit address-in-use on attempt %d/%d; "
@@ -1085,11 +1108,6 @@ class InferenceWorker(StreamingWorkerMixin):
                 await asyncio.sleep(delay_s)
             finally:
                 _end_engine_startup_capture(startup_error_dir)
-                maybe_finish_inference_startup_attempt(
-                    durable_attempt,
-                    attempt_outcome,
-                    attempt_error,
-                )
         self._maybe_init_router_replay_tx(engine_kwargs, router_replay_engine_kwargs)
         # The live grammar now always masks the sampler's stop set, so replay
         # mirrors it unconditionally. get_tokenizer() raises under
@@ -1396,6 +1414,7 @@ class InferenceWorker(StreamingWorkerMixin):
         return_action_masks = bool(sampling_params.pop(_RETURN_ACTION_MASKS_PARAM_KEY, False))
         extra_args = dict(sampling_params.get("extra_args", None) or {})
         extra_args.pop(_RETURN_ACTION_MASKS_PARAM_KEY, None)
+        prefix_replay_id = extra_args.pop(_REPLAY_PREFIX_ID_PARAM_KEY, None)
         if extra_args:
             sampling_params["extra_args"] = extra_args
         else:
@@ -1408,6 +1427,8 @@ class InferenceWorker(StreamingWorkerMixin):
             replay_id = str(replay_id)
         if replay_id is not None and sample_id is None:
             raise ValueError(f"{_REPLAY_ID_PARAM_KEY} requires {_SAMPLE_ID_PARAM_KEY}")
+        if prefix_replay_id is not None and replay_id is None:
+            raise ValueError(f"{_REPLAY_PREFIX_ID_PARAM_KEY} requires {_REPLAY_ID_PARAM_KEY}")
         return_back_router_info = bool(
             sampling_params.pop(_ROUTER_REPLAY_RETURN_INFO_PARAM_KEY, False)
         )
@@ -1453,6 +1474,7 @@ class InferenceWorker(StreamingWorkerMixin):
             cache_tx=self._router_replay_tx,
             sample_id=sample_id,
             replay_id=replay_id,
+            prefix_replay_id=prefix_replay_id,
             request_id=request_id,
             replica_label=self._replica_label,
             return_back_router_info=return_back_router_info,
@@ -1500,22 +1522,6 @@ class InferenceWorker(StreamingWorkerMixin):
     def get_state(self) -> str:
         return self.state.value
 
-    def get_stats(self) -> dict[str, Any]:
-        """Return the latest scheduler stats, plus liveness metadata.
-
-        Used by the per-replica concurrency-adjust loop in
-        :class:`arctic_platform.inference.server.scheduler.Scheduler`. The keys
-        ``gpu_cache_usage`` / ``num_requests_running`` /
-        ``num_requests_waiting`` are read by the scheduler to drive the
-        ``utilization_based_concurrency`` heuristic.
-        """
-        latest = get_collector().latest()
-        return {
-            "state": self.state.value,
-            "pid": os.getpid(),
-            **latest,
-        }
-
     def drain_metrics(self) -> dict[str, Any]:
         """Drain snapshots and return lifetime counters without resetting them."""
         from arctic_platform.inference.server.action_mask_replay import (
@@ -1529,6 +1535,9 @@ class InferenceWorker(StreamingWorkerMixin):
             "spec_decoding": get_collector().spec_decoding_totals(),
             "action_mask_replay_cache": action_mask_replay_cache_stats(),
         }
+
+    def num_waiting_reqs(self) -> int:
+        return get_collector().num_waiting_reqs
 
     def set_replica_id(self, replica_id: int) -> None:
         """Tell this worker its position in the replica pool so that the
@@ -1727,6 +1736,16 @@ class InferenceWorker(StreamingWorkerMixin):
         )
         return {"status": "paused", "mode": mode, "clear_cache": clear_cache}
 
+    async def freeze_generation(self) -> dict[str, Any]:
+        """Hold in-flight requests in place; unlike pause_generation, streams stay open
+        and new ones queue. An engine that is already paused is left to its pauser."""
+        if self.state != WorkerLifecycleState.READY or self.llm is None:
+            return {"status": "skipped", "reason": f"state={self.state.value}"}
+        if await self.llm.is_paused():
+            return {"status": "skipped", "reason": "already paused"}
+        await self.llm.pause_generation(mode="keep", clear_cache=False)
+        return {"status": "frozen"}
+
     async def resume_generation(self) -> dict[str, Any]:
         if self.state != WorkerLifecycleState.READY or self.llm is None:
             return {"status": "skipped", "reason": f"state={self.state.value}"}
@@ -1860,6 +1879,7 @@ class InferenceWorker(StreamingWorkerMixin):
                   lora_int_id, lora_name, lora_config, bucket_size,
                   engine_only, staging, evict_first),
         )
+        results = maybe_collect_broadcast_verification(results, engine_only=engine_only, llm=self.llm, rank_offset=rank_offset)
         if not engine_only:
             self._active_lora_int_id = lora_int_id
             self._active_lora_name = lora_name

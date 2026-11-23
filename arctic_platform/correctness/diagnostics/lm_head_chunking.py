@@ -14,7 +14,7 @@
 # limitations under the License.
 
 # !/usr/bin/env python3
-"""First-two diagnostic that removes the fused LM-head chunk size from a copied config.
+"""First-two diagnostic that disables LM-head chunking through copied model options.
 
 The source config and reviewed specification are not edited. This altered workload
 still requires compatible prepared reference records; a canonical record must not
@@ -34,19 +34,21 @@ from typing import Optional
 from arctic_platform.correctness import api
 from arctic_platform.correctness.harness.config import LoadedConfig
 
-KNOB = "fused_lm_head_token_chunk_size"
+KNOB = "lm_head.token_chunk_size"
 
 
 def without_chunked_head(cfg: LoadedConfig) -> LoadedConfig:
-    """A copy of ``cfg`` whose training sub-job has no ``fused_lm_head_token_chunk_size``."""
+    """Disable chunking explicitly without changing the source config or legacy settings."""
     stripped = copy.deepcopy(cfg)
     for sub in [stripped.sub_job, *stripped.sub_jobs]:
         training = sub.get("training_config")
         if isinstance(training, dict):
-            training.pop(KNOB, None)
-            prime_rl = training.get("prime_rl")
-            if isinstance(prime_rl, dict):
-                prime_rl.pop(KNOB, None)
+            options = training.get("model_options") or {}
+            training["model_options"] = options
+            options[KNOB] = "disabled"
+            lm_head = options.get("lm_head")
+            if isinstance(lm_head, dict):
+                lm_head["token_chunk_size"] = "disabled"
     return stripped
 
 
@@ -56,7 +58,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     def execute_without_chunked_head(cfg, *args, **kwargs):
         print(
-            f"diagnostic: {KNOB} removed (was {cfg.training.get(KNOB)!r}) for {cfg.config_id} on {cfg.n_gpus} GPU(s)",
+            f"diagnostic: model_options[{KNOB!r}] disabled (was {cfg.lm_head_token_chunk_size!r}) "
+            f"for {cfg.config_id} on {cfg.n_gpus} GPU(s)",
             flush=True,
         )
         return execute(without_chunked_head(cfg), *args, **kwargs)

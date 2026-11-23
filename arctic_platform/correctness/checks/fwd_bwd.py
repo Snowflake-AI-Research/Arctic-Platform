@@ -81,7 +81,7 @@ def _run_arm(ctx, arm) -> TestResult:
             _, inactive = compare_participation(participation, reference.get("participation"))
             target_norms = active_gradient_norms(participation, target_norms)
             reference_norms = active_gradient_norms(reference["participation"], reference_norms)
-        pairs, only_dss, only_reference = align(target_norms, reference_norms)
+        pairs, only_ap, only_reference = align(target_norms, reference_norms)
         if not pairs:
             raise ValueError("gradient comparison has no active parameter coverage")
     except ValueError as error:
@@ -98,7 +98,7 @@ def _run_arm(ctx, arm) -> TestResult:
     # Every parameter pairs, or the comparison is not the one being claimed: an unmatched name is a tensor
     # nobody checked, and the tensors that did pair would report a pass for coverage the case never had.
     expected = len(pairs) + len(only_reference)
-    if only_dss or only_reference:
+    if only_ap or only_reference:
         return TestResult(
             test_id="single-step-grads",
             config_id=ctx.config_id,
@@ -108,13 +108,13 @@ def _run_arm(ctx, arm) -> TestResult:
             reason=(
                 "Parameter-name alignment is incomplete, so the comparison "
                 "does not cover every parameter. Unmatched Arctic Platform names: "
-                f"{', '.join(only_dss[:4])}{' ...' if len(only_dss) > 4 else ''}. "
+                f"{', '.join(only_ap[:4])}{' ...' if len(only_ap) > 4 else ''}. "
                 "Unmatched reference names: "
                 f"{', '.join(only_reference[:4])}{' ...' if len(only_reference) > 4 else ''}."
             ),
             metrics={
                 "tensors_compared": float(len(pairs)),
-                "dss_tensors": float(expected),
+                "ap_tensors": float(expected),
                 "reference_tensors": float(len(reference["grad_norms"])),
             },
         )
@@ -137,7 +137,7 @@ def _run_arm(ctx, arm) -> TestResult:
             f"Every parameter's gradient norm is off by roughly the same factor ({median_ratio:.6f}), "
             "which points at a scalar "
             "rather than at a module: the loss denominator or the gradient-accumulation scaling. "
-            f"This arm packs {arm.global_batch_size} sequences into {arm.dss_microbatches} microbatches with "
+            f"This arm packs {arm.global_batch_size} sequences into {arm.ap_microbatches} microbatches with "
             f"{arm.pad_fraction:.1%} padding."
         )
     elif over_stated:
@@ -156,7 +156,7 @@ def _run_arm(ctx, arm) -> TestResult:
         mismatches=failures,
         worst_name=worst_name,
         metrics={
-            "dss_loss": target.avg_loss,
+            "ap_loss": target.avg_loss,
             "reference_loss": reference["loss"],
             "loss_delta": loss_delta,
             "median_ratio": median_ratio,
@@ -165,11 +165,11 @@ def _run_arm(ctx, arm) -> TestResult:
             "inactive_parameters_verified": float(inactive),
             "tensors_over_stated_criterion": float(len(over_stated)),
             "stated_criterion_abs": gate,
-            "unmatched_dss": float(len(only_dss)),
+            "unmatched_ap": float(len(only_ap)),
             "unmatched_reference": float(len(only_reference)),
             "reference_microbatches": float(reference["microbatches"]),
-            "dss_microbatches_predicted": float(arm.dss_microbatches),
-            **({"dss_model_calls_observed": float(target.model_calls)} if target.model_calls is not None else {}),
+            "ap_microbatches_predicted": float(arm.ap_microbatches),
+            **({"ap_model_calls_observed": float(target.model_calls)} if target.model_calls is not None else {}),
         },
     )
 
