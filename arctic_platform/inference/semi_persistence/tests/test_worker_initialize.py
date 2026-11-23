@@ -61,7 +61,9 @@ class _Env:
         self.no_think_tokens = False
         self.async_llm_errors = []
         self.restore_errors = []
-        self.attached = types.SimpleNamespace(get_tokenizer=lambda: None)
+        # Worker methods the restored engine's processes have: its snapshot may predate any of them.
+        self.worker_methods = {"forced_route_support"}
+        self.attached = types.SimpleNamespace(get_tokenizer=lambda: None, collective_rpc=self.collective_rpc)
 
     def record(self, name, *args):
         self.calls.append((name, args))
@@ -92,6 +94,16 @@ class _Env:
         if self.restore_errors:
             raise self.restore_errors.pop(0)
         return self.attached
+
+    async def collective_rpc(self, method, timeout=None, args=(), kwargs=None):
+        self.record("collective_rpc", method)
+        if method not in self.worker_methods:
+            # What AsyncLLM raises when a worker lacks the method (vLLM 0.33 run_method, EngineCore utility call).
+            raise Exception(
+                "Call to collective_rpc method failed: Worker failed with error "
+                f"'Method {method!r} is not implemented.', please check the stack trace above for the root cause"
+            )
+        return [None]
 
     def matched_baseline(self):
         return _module(
@@ -258,10 +270,21 @@ def test_semi_p_loads_the_checkpoint_adapter_into_the_restored_engine(
 
 
 def test_semi_p_serves_router_replay(env):
-    _initialize(env, semi_p=True, enable_return_routed_experts=True,
-                router_replay_max_cache_bytes=1024)
+    worker = _initialize(env, semi_p=True, enable_return_routed_experts=True,
+                         router_replay_max_cache_bytes=1024)
     [(kwargs, _, _)] = env.called("restore_and_attach")
     assert kwargs["enable_return_routed_experts"] is True
     assert "router_replay_max_cache_bytes" not in kwargs
     assert env.called("router_replay_shm") == [("job-1",)]
     assert env.called("router_replay_tx") == [(True,)]
+    assert worker._force_routes_enabled
+
+
+def test_semi_p_restored_from_a_snapshot_without_forced_routes_captures_only(env, caplog):
+    env.worker_methods = set()
+    with caplog.at_level(logging.WARNING):
+        worker = _initialize(env, semi_p=True, enable_return_routed_experts=True)
+    assert env.called("collective_rpc") == [("forced_route_support",)]
+    assert worker.state == env.worker.WorkerLifecycleState.READY
+    assert not worker._force_routes_enabled
+    assert "forced_route_support" in caplog.text
