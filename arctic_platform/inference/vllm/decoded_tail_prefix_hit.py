@@ -20,6 +20,10 @@ hashes. At generation completion, register the last reusable interior hash so
 a continuation can share the block when its other cache groups also hit.
 """
 
+from functools import cache
+
+from vllm.distributed.aux_output_connector.connector import AuxOutputSchedulerConnector
+from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
 from vllm.v1.request import Request
@@ -37,13 +41,13 @@ class SchedulerDecodedTailPatch(ArcticPatch[Scheduler]):
         coordinator = self.kv_cache_manager.coordinator
         if finished and coordinator.enable_partial_hash_hits:
             for manager in coordinator.single_type_managers:
-                if (
-                    type(manager) is FullAttentionManager
-                    and manager.enable_caching
-                    and manager.kv_cache_spec.prefix_cacheable
-                ):
+                # R-SWA recycles decode gaps and HiSparse publishes only after host writeback.
+                if type(manager) is FullAttentionManager and manager.kv_cache_spec.prefix_cacheable:
                     cacheable = coordinator.get_num_cacheable_tokens(settled, manager.kv_cache_group_id)
                     _cache_computed_tail(manager, request, cacheable)
+                    routes = self.aux_output_connector
+                    if routes is not None and routes._manager is manager:
+                        _retain_partial_routes(routes, request, cacheable)
         return finished
 
 
@@ -66,11 +70,42 @@ def _cache_computed_tail(manager: FullAttentionManager, request: Request, cachea
         )
 
 
-_PATCHED = False
+def _retain_partial_routes(routes: AuxOutputSchedulerConnector, request: Request, cacheable: int) -> None:
+    grain = routes._hash_block_size
+    per_block = routes._block_size // grain
+    prompt_limit = request.num_prompt_tokens - int(not routes._manager.use_eagle)
+    for limit in (min(prompt_limit, cacheable), cacheable):
+        end = min(limit // grain, len(request.block_hashes))
+        count = end % per_block
+        if end <= 0 or not count:
+            continue
+        last = request.block_hashes[end - 1]
+        key = maybe_convert_block_hash(last)
+        if key not in routes._kv_cached and routes._gpu_cached(last):
+            # Native eviction and reset release the references stored under this endpoint.
+            hashes = request.block_hashes[end - count:end]
+            routes._kv_cached[key] = hashes
+            routes._retained_hashes.extend(hashes)
 
 
+class AuxDecodedTailPatch(ArcticPatch[AuxOutputSchedulerConnector]):
+    _orig_max_cache_hit = AuxOutputSchedulerConnector.max_cache_hit
+
+    def max_cache_hit(self, request: Request) -> int:
+        hit = self._orig_max_cache_hit(request)
+        # Only the first missing physical block can extend the contiguous route prefix.
+        grain = self._hash_block_size
+        next_block = hit // self._block_size + 1
+        end = min(len(request.block_hashes), next_block * (self._block_size // grain) - 1)
+        for index in range(end - 1, hit // grain - 1, -1):
+            key = maybe_convert_block_hash(request.block_hashes[index])
+            if key in self._kv_cached:
+                self._kv_cached.move_to_end(key)
+                return min((index + 1) * grain, request.num_tokens - 1)
+        return hit
+
+
+@cache
 def ensure_decoded_tail_prefix_hit() -> None:
-    global _PATCHED
-    if not _PATCHED:
-        SchedulerDecodedTailPatch.apply_patch()
-        _PATCHED = True
+    SchedulerDecodedTailPatch.apply_patch()
+    AuxDecodedTailPatch.apply_patch()
