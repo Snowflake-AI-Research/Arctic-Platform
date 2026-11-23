@@ -192,7 +192,8 @@ Dump:
 
 ```
 both      init (they rendezvous inside vLLM; neither returns until both arrive)
-leader    generate, attach, stage, save_weights, detach, sleep, arm_mq_park
+leader    generate, attach, stage, save_weights, release_host_weights, detach,
+          sleep, arm_mq_park
 leader    cuda_checkpoint   -> drop_graphs + destroy_nccl across ALL ranks
 agents    cuda_checkpoint   (must follow: the leader's tears down their ranks too)
 leader    criu_dump         -> parks every rank's queue as its last collective
@@ -234,9 +235,16 @@ agents    mq_follower_unpark(handle) -> one blob of response handles each
 leader    mq_finish_unpark([blob, ...])
 both      cuda_restore
 leader    reinit_nccl (first EFA bring-up), attach, load_weights,
-          wake_up_weights, repin, plan/restore_weights, wake_up_kv_cache,
-          recapture_graphs
+          refill_host_weights, wake_up_weights, repin, plan/restore_weights,
+          wake_up_kv_cache, recapture_graphs
 ```
+
+`release_host_weights` and `refill_host_weights` are leader `collective_rpc`s
+like the steps around them, so they reach every rank on every node; each rank
+refills from its own global `weight/rank{R}`, and only node 0's `meta.json`
+records `host_weights`. Both are no-ops for every model that runs here today
+(only DeepSeek's Engram tables qualify); see
+[instance_DESIGN.md](instance_DESIGN.md) *Host-Resident Parameters*.
 
 **Joint or nothing.** A node-partition that cold-starts while another restores would
 rendezvous with a group that does not exist, and the failure is a deadlock in

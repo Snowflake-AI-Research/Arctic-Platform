@@ -138,6 +138,7 @@ CHAT_MODELS = MappingProxyType(
         "NemotronHForCausalLM": ChatModel("nemotron_v3", "qwen3_coder", thinking_optional=True),
         "InklingForCausalLM": ChatModel("inkling", "inkling", thinking_optional=True),
         "InklingForConditionalGeneration": ChatModel("inkling", "inkling", thinking_optional=True),
+        "Inkling2ForConditionalGeneration": ChatModel("inkling", "inkling", thinking_optional=True),
     }
 )
 
