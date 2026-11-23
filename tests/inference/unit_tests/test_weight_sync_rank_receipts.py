@@ -32,7 +32,6 @@ def _worker_load(worker, method, rank_results, *args, **kwargs):
         ("load_weights_cuda_ipc", ({},)),
         ("load_weights_cuda_ipc_chunk", ({}, None)),
         ("load_weights_from_shm_path", ("/dev/shm/x",)),
-        ("sync_weights_broadcast", ("localhost", 12345, 1, 3)),
     ],
 )
 def test_worker_reports_every_tp_ranks_received_checksum(worker, method, args):
@@ -57,7 +56,14 @@ def test_broadcast_keeps_checksums_with_parameter_traces(worker, monkeypatch):
     }
 
 
-def test_broadcast_rendezvous_reports_engine_state(worker):
-    ranks = [{"status": "engine_ready", "rank": i, "world_size": 3} for i in (1, 2)]
-    result = _worker_load(worker, "sync_weights_broadcast", ranks, "localhost", 12345, 1, 3, engine_only=True)
-    assert result == ranks[0]
+@pytest.mark.parametrize(
+    "method, extra",
+    [("sync_weights_broadcast", ()), ("sync_lora_weights_broadcast", (1, "adapter", {}))],
+)
+def test_broadcast_returns_rank_receipts_only_after_a_load(worker, method, extra):
+    args = ("localhost", 12345, 1, 3, *extra)
+    ready = [{"status": "engine_ready", "rank": i, "world_size": 3} for i in (1, 2)]
+    assert _worker_load(worker, method, ready, *args, engine_only=True) == ready[0]
+
+    ranks = [{"recv_l2_sq": 32.5, "loaded": 3}, {"recv_l2_sq": 30.0, "loaded": 3}]
+    assert _worker_load(worker, method, ranks, *args) == {**ranks[0], "rank_recv_l2_sq": [32.5, 30.0]}
