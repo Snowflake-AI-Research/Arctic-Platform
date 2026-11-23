@@ -1,0 +1,14 @@
+{
+  "qwen3-8b/standard/h200-training-full.json": {
+    "config_id": "model-h200-train",
+    "previous_path": "model-h200-train.config"
+  },
+  "qwen3.8-flash-next/long/h200-training-full.json": {
+    "config_id": "h200-training-full",
+    "previous_path": "h200-training-full.json"
+  },
+  "tiny-qwen3-129m/standard/h200-training-full.json": {
+    "config_id": "tiny-qwen3-129m-one-h200",
+    "previous_path": "tiny-qwen3-129m-one-h200.json"
+  }
+}
