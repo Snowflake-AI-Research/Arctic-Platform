@@ -58,7 +58,9 @@ def chat_body_from_responses(body: dict[str, Any]) -> dict[str, Any]:
             role = "system" if item["role"] == "developer" else item["role"]
             messages.append(dict(role=role, content=_text(item["content"])))
         elif kind == "function_call":
-            call = dict(id=item["call_id"], type="function", function=dict(name=item["name"], arguments=item["arguments"]))
+            call = dict(
+                id=item["call_id"], type="function", function=dict(name=item["name"], arguments=item["arguments"])
+            )
             if messages and messages[-1]["role"] == "assistant":
                 messages[-1].setdefault("tool_calls", []).append(call)
             else:
@@ -77,7 +79,10 @@ def chat_body_from_responses(body: dict[str, Any]) -> dict[str, Any]:
         if any(tool.get("strict") for tool in body["tools"]):
             raise ValueError("strict function schemas are not supported")
         chat["tools"] = [
-            dict(type="function", function={key: tool[key] for key in ("name", "description", "parameters") if key in tool})
+            dict(
+                type="function",
+                function={key: tool[key] for key in ("name", "description", "parameters") if key in tool},
+            )
             for tool in body["tools"]
         ]
     if body.get("max_output_tokens") is not None:
@@ -96,15 +101,22 @@ def responses_from_chat(
     if message["content"] or not message["tool_calls"]:
         output.append(
             dict(
-                type="message", id=f"msg_{uuid.uuid4().hex}", role="assistant", status=status,
+                type="message",
+                id=f"msg_{uuid.uuid4().hex}",
+                role="assistant",
+                status=status,
                 content=[dict(type="output_text", text=message["content"] or "", annotations=[])],
             )
         )
     for call in message["tool_calls"]:
         output.append(
             dict(
-                type="function_call", id=f"fc_{uuid.uuid4().hex}", call_id=call["id"],
-                name=call["function"]["name"], arguments=call["function"]["arguments"], status=status,
+                type="function_call",
+                id=f"fc_{uuid.uuid4().hex}",
+                call_id=call["id"],
+                name=call["function"]["name"],
+                arguments=call["function"]["arguments"],
+                status=status,
             )
         )
     usage = dict(

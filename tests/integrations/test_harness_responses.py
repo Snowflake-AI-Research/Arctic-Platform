@@ -60,7 +60,9 @@ def served(generation):
     def parser(text):
         return "calling", [dict(id="call_2", type="function", function=dict(name="ls", arguments="{}"))]
 
-    proxy = ChatCompletionsProxy(generate, tokenizer, "m", max_model_len=4096, default_max_tokens=16, parse_tool_calls=parser)
+    proxy = ChatCompletionsProxy(
+        generate, tokenizer, "m", max_model_len=4096, default_max_tokens=16, parse_tool_calls=parser
+    )
     proxy.start()
     yield proxy, tokenizer
     proxy.stop()
