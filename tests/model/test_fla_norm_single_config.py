@@ -12,12 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""fla's two forward norm kernels run one configuration once the GLM-5.3 norms are imported.
+"""Importing the GLM-5.3 norms pins FLA's two forward norm kernels to one configuration before either launches.
 
-fla times each kernel's menu on the first call of a row-count bucket (``NB``) and keeps the fastest entry; the entries
-sum a row's squares in different orders. In a subprocess under Triton's CPU interpreter, with Triton's benchmark made
-to raise, the test imports the GLM-5.3 norms and launches fla's own wrappers for the output norm and the q/k norm at
-NB 1 and NB 2: no launch may time the menu, and each must run BT 16 with 4 warps.
+fla times each menu on the first call of a row-count bucket (``NB``) and keeps the fastest entry; the entries sum a
+row's squares in different orders. Under Triton's CPU interpreter, with the benchmark made to raise, fla's own
+wrappers must run BT 16 with 4 warps at NB 1 and NB 2 without timing.
 """
 
 import os
@@ -30,6 +29,8 @@ pytest.importorskip("fla")
 pytest.importorskip("triton")
 
 _SCRIPT = """
+import sys
+
 import torch
 from triton.runtime.autotuner import Autotuner
 
@@ -44,7 +45,7 @@ from fla.modules.l2norm import l2norm_fwd
 from fla.modules.l2norm import l2norm_fwd_kernel
 
 torch.manual_seed(0)
-for rows in (64 * 3, 64 * 1025 + 1):  # NB 1, NB 2
+for rows in map(int, sys.argv[1:]):
     x, gate = torch.randn(rows, 128, dtype=torch.bfloat16), torch.randn(rows, 128, dtype=torch.bfloat16)
     rms_norm_gated(x, gate, torch.ones(128, dtype=torch.bfloat16), None, activation="sigmoid", eps=1e-5)
     l2norm_fwd(x)
@@ -56,6 +57,7 @@ print("ok")
 
 
 def test_fla_forward_norms_run_one_configuration():
-    env = dict(os.environ, TRITON_INTERPRET="1", PYTHONPATH=os.pathsep.join(sys.path))
-    result = subprocess.run([sys.executable, "-c", _SCRIPT], env=env, capture_output=True, text=True, timeout=600)
+    env = dict(os.environ, TRITON_INTERPRET="1", FLA_CACHE_MODE="disabled", PYTHONPATH=os.pathsep.join(sys.path))
+    command = [sys.executable, "-c", _SCRIPT, "192", "65537"]  # NB 1 and NB 2
+    result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=600)
     assert result.returncode == 0 and result.stdout.split()[-1:] == ["ok"], result.stderr[-3000:]

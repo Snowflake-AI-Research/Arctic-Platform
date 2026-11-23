@@ -21,8 +21,7 @@ The reference norms run every step as separate FP32 elementwise passes. On CUDA 
   norm kernels. Without it, ``llama`` mode: FP32 statistics, the normalized value cast to the input
   dtype, then the weight -- the reference's own order.
 - ``Glm5NextTextRMSNormGated`` (the KDA output norm, ``weight * norm(x) * sigmoid(gate)`` in FP32)
-  runs FLA's fused gated norm, imported through ``vllm_rounding``, which pins its configuration and that of the
-  q/k norm ``chunk_kda`` runs.
+  runs FLA's fused gated norm. Importing this module pins it and the q/k norm in ``chunk_kda`` before either runs.
 
 CPU inputs run the same arithmetic in torch (the reference forward, for the gated norm and without
 ``fp32_parity``).
@@ -36,7 +35,7 @@ import torch
 from torch import Tensor
 from torch import nn
 
-from arctic_platform.model.implementations.gpu.vllm_rounding import fla_rms_norm_gated
+from arctic_platform.model.implementations.gpu import vllm_rounding  # noqa: F401 - pin both FLA norms before chunk_kda
 
 
 def _rms_norm_forward(self, hidden_states: Tensor) -> Tensor:
@@ -60,7 +59,9 @@ def _rms_norm_reference_order_forward(self, hidden_states: Tensor) -> Tensor:
 def _rms_norm_gated_forward(self, hidden_states: Tensor, gate: Tensor | None = None) -> Tensor:
     if not hidden_states.is_cuda or gate is None:
         return type(self).forward(self, hidden_states, gate)
-    return fla_rms_norm_gated(hidden_states, gate, self.weight, None, activation="sigmoid", eps=self.variance_epsilon)
+    from fla.modules.fused_norm_gate import rms_norm_gated
+
+    return rms_norm_gated(hidden_states, gate, self.weight, None, activation="sigmoid", eps=self.variance_epsilon)
 
 
 def fuse_glm5_next_norms(model: nn.Module, *, fp32_parity: bool = True) -> dict[str, int]:
