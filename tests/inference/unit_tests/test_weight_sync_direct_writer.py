@@ -85,7 +85,34 @@ if "vllm" not in sys.modules:
     structured_output.__path__ = []
     sys.modules["vllm.v1.structured_output"] = structured_output
     sys.modules["vllm.v1.structured_output.backend_xgrammar"] = xgrammar_mod
-    for name in ("vllm.v1", "vllm.v1.core", "vllm.v1.core.sched", "vllm.v1.metrics"):
+    # The forced-routes patch targets, marked as patched like check_stop above.
+    class NewRequestData:
+        @classmethod
+        def from_request(cls, request):
+            return None
+
+    class GPUModelRunner:
+        def prepare_inputs(self, *args, **kwargs):
+            return None
+
+    NewRequestData.from_request.__func__._arctic_forced_routes = True
+    GPUModelRunner.prepare_inputs._arctic_forced_routes = True
+    for name, attrs in {
+        "vllm.distributed": {},
+        "vllm.distributed.aux_output_connector": {},
+        "vllm.distributed.aux_output_connector.connector": dict(AuxOutputSchedulerConnector=object),
+        "vllm.v1.core.sched.output": dict(NewRequestData=NewRequestData),
+        "vllm.v1.worker": {},
+        "vllm.v1.worker.gpu": {},
+        "vllm.v1.worker.gpu.model_runner": dict(GPUModelRunner=GPUModelRunner),
+        "vllm.v1.worker.gpu_worker": dict(Worker=type("Worker", (), {})),
+    }.items():
+        sys.modules[name] = types.ModuleType(name)
+        sys.modules[name].__dict__.update(attrs)
+    for name in (
+        "vllm.v1", "vllm.v1.core", "vllm.v1.core.sched", "vllm.v1.metrics", "vllm.distributed",
+        "vllm.distributed.aux_output_connector", "vllm.v1.worker", "vllm.v1.worker.gpu",
+    ):
         sys.modules[name].__path__ = []
 
 from arctic_platform.inference.server.weight_sync.receiver import (

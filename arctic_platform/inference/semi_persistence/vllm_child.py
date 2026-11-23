@@ -3235,7 +3235,8 @@ def _semip_serve_core(core, input_address, output_address):
             "engine core input thread "
             + ("died" if not input_thread.is_alive() else "is not ready")
             + f" after {_SERVING_READY_TIMEOUT_S:.0f}s")
-    return _semip_core_summary(core.vllm_config)
+    # Older snapshots omit this field and must not receive the optional worker RPC.
+    return dict(_semip_core_summary(core.vllm_config), forced_route_support_rpc=True)
 
 
 def _semip_serving_tick(core, pipe_conn, asleep,

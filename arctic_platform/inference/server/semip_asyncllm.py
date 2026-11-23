@@ -159,7 +159,8 @@ async def attach(handle: Any, vllm_config: Any, renderer: Any = None,
     except BaseException:
         _teardown(handle.inst, handle.agents)
         raise
-    llm._init_semi_p(handle.inst, handle.agents)
+    llm._init_semi_p(handle.inst, handle.agents,
+                     forced_route_support_rpc=summary.get("forced_route_support_rpc", False))
     llm._start_death_watch(llm._on_child_death)
     logger.info("semi_p: front end attached in %.2fs (serve_core %.2fs, "
                 "AsyncLLM %.2fs, %s)", time.perf_counter() - t0, t_serve, t_llm,

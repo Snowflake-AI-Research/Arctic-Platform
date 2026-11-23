@@ -29,6 +29,7 @@ from arctic_platform.inference.vllm.dense_prompt_logprobs import (
     stage_sampling_params as _stage_dense_prompt_logprobs,
     take_dense as _take_dense_prompt_logprobs,
 )
+from arctic_platform.inference.vllm.router_replay import FORCED_ROUTES_KEY
 from arctic_platform.inference.vllm.spec_decode_grammar import (
     ensure_spec_decode_grammar_fix,
 )
@@ -650,6 +651,7 @@ def _result_from_output(
     request_id: str | None = None,
     replica_label: str | None = None,
     return_back_router_info: bool = False,
+    admitted_prefix: Any = None,
 ) -> dict[str, Any]:
     if not final_output or not final_output.outputs:
         return {
@@ -711,6 +713,7 @@ def _result_from_output(
         request_id=request_id,
         replica_label=replica_label,
         return_back_router_info=return_back_router_info,
+        admitted_prefix=admitted_prefix,
     )
     return result
 
@@ -726,6 +729,7 @@ def _maybe_cache_routed_experts(
     request_id: str | None,
     replica_label: str | None,
     return_back_router_info: bool,
+    admitted_prefix: Any = None,
 ) -> None:
     if cache_tx is None or sample_id is None:
         return
@@ -735,9 +739,24 @@ def _maybe_cache_routed_experts(
     if routed is None:
         logger.warning("router-replay: routed_experts missing for sample_id=%s", sample_id)
         return
-    capture_len = int(routed.shape[0])
+    # The prefix the request was admitted with, else (engines that cannot force routes) the named capture now.
+    prefix = admitted_prefix
+    if prefix is None and prefix_replay_id is not None:
+        try:
+            prefix = cache_tx.get(prefix_replay_id)
+        except KeyError:  # another replica served the earlier request, or the cache evicted it
+            pass
+    prefix_len = 0 if prefix is None else int(prefix.shape[0])
     prompt_len = int(result["prompt_len"])
     generation_len = int(result["generation_len"])
+    if prefix is not None:
+        if prefix_len >= prompt_len or tuple(prefix.shape[1:]) != tuple(routed.shape[1:]):
+            raise ValueError(
+                "router-replay prefix capture must end inside the prompt, with the same layer/top-k shape "
+                f"trajectory_id={sample_id!r} replay_id={replay_id!r} prefix_replay_id={prefix_replay_id!r} "
+                f"prefix_shape={list(prefix.shape)} prompt_len={prompt_len} capture_shape={list(routed.shape)}"
+            )
+    capture_len = int(routed.shape[0]) + (prefix_len if admitted_prefix is not None else 0)
     expected_capture_len = prompt_len + generation_len - 1
     if capture_len != expected_capture_len:
         raise ValueError(
@@ -747,24 +766,14 @@ def _maybe_cache_routed_experts(
             f"capture_len={capture_len} expected_capture_len={expected_capture_len} "
             f"capture_shape={list(routed.shape)}"
         )
-    # This request re-prefills the prefix capture's positions; keep the routes the earlier request sampled with.
-    prefix_len = 0
-    if prefix_replay_id is not None:
-        try:
-            prefix = cache_tx.get(prefix_replay_id)
-        except KeyError:  # another replica served the earlier request, or the cache evicted it
-            prefix = None
-        if prefix is not None:
-            if prefix.shape[0] >= prompt_len or tuple(prefix.shape[1:]) != tuple(routed.shape[1:]):
-                raise ValueError(
-                    "router-replay prefix capture must end inside the prompt, with the same layer/top-k shape "
-                    f"trajectory_id={sample_id!r} replay_id={replay_id!r} prefix_replay_id={prefix_replay_id!r} "
-                    f"prefix_shape={list(prefix.shape)} prompt_len={prompt_len} capture_shape={list(routed.shape)}"
-                )
-            import torch
+    if admitted_prefix is not None:
+        import numpy as np
 
-            prefix_len = int(prefix.shape[0])
-            routed = torch.cat([prefix, torch.as_tensor(routed[prefix_len:]).to(prefix.device, prefix.dtype)])
+        routed = np.concatenate([admitted_prefix, routed])
+    elif prefix is not None:
+        import torch
+
+        routed = torch.cat([prefix, torch.as_tensor(routed[prefix_len:]).to(prefix.device, prefix.dtype)])
     cache_key = replay_id or sample_id
     if replay_id is not None and replay_id.startswith("rr1:"):
         cache_tx.put_new(cache_key, routed)
@@ -874,6 +883,8 @@ def _ensure_actor_logging(level: int = logging.INFO) -> str:
 @ray.remote
 class InferenceWorker(StreamingWorkerMixin):
     """Ray actor that hosts an in-process vLLM AsyncLLM engine."""
+
+    _force_routes_enabled = False
 
     def __init__(self) -> None:
         # First, so that everything below is loggable.  Reported rather than
@@ -1101,6 +1112,8 @@ class InferenceWorker(StreamingWorkerMixin):
             finally:
                 _end_engine_startup_capture(startup_error_dir)
         self._maybe_init_router_replay_tx(engine_kwargs, router_replay_engine_kwargs)
+        if engine_kwargs.get("enable_return_routed_experts"):
+            await self._init_forced_routes()
         # The live grammar now always masks the sampler's stop set, so replay
         # mirrors it unconditionally. get_tokenizer() raises under
         # skip_tokenizer_init, and such an engine cannot compile a grammar to
@@ -1266,6 +1279,16 @@ class InferenceWorker(StreamingWorkerMixin):
             return None
         return bool(parser.is_reasoning_end(prompt_ids))
 
+    async def _init_forced_routes(self) -> None:
+        replies = await self.llm.collective_rpc("forced_route_support")
+        reasons = {reason for reason in replies if reason is not None}
+        self._force_routes_enabled = not reasons
+        if reasons:
+            logger.warning(
+                "Router replay: re-prefilled prefix positions keep the engine's own routes, as before, because %s",
+                "; ".join(sorted(reasons)),
+            )
+
     def _maybe_init_router_replay_tx(
         self,
         engine_kwargs: dict[str, Any],
@@ -1381,6 +1404,25 @@ class InferenceWorker(StreamingWorkerMixin):
             grammar_stop_token_ids=grammar_stop_token_ids,
         )
 
+    def _supply_route_history(self, prefix_id: str | None, params: Any) -> Any:
+        """Attach the named capture for the engine to force where it recomputes those positions; return it for the
+        completion splice, or None when it is not here. An empty record still tracks the request's own rows."""
+        import numpy as np
+
+        history, prefix = {}, None
+        if prefix_id is not None:
+            try:
+                rows = self._router_replay_tx.get(prefix_id).cpu().numpy()
+            except KeyError:  # another replica served the earlier request, or the cache evicted it
+                pass
+            else:
+                history = {"rows": rows.tobytes(), "dtype": rows.dtype.str}
+                # A view of the sent bytes: the request holds no reference to the cached tensor.
+                prefix = np.frombuffer(history["rows"], rows.dtype).reshape(rows.shape)
+                params.routed_experts_prompt_start = len(rows)
+        params.extra_args = {**(params.extra_args or {}), FORCED_ROUTES_KEY: history}
+        return prefix
+
     async def generate(self, prompt: Any, sampling_params: dict[str, Any]) -> dict[str, Any]:
         """Generate for one prompt: text, ``list[int]``, or a 1-D integer CPU tensor of token ids."""
         if self.state != WorkerLifecycleState.READY:
@@ -1406,6 +1448,8 @@ class InferenceWorker(StreamingWorkerMixin):
         return_action_masks = bool(sampling_params.pop(_RETURN_ACTION_MASKS_PARAM_KEY, False))
         extra_args = dict(sampling_params.get("extra_args", None) or {})
         extra_args.pop(_RETURN_ACTION_MASKS_PARAM_KEY, None)
+        if FORCED_ROUTES_KEY in extra_args:  # an out-of-range expert id there would fault the engine's gather
+            raise ValueError(f"{FORCED_ROUTES_KEY} is set by the server from {_REPLAY_PREFIX_ID_PARAM_KEY}")
         prefix_replay_id = extra_args.pop(_REPLAY_PREFIX_ID_PARAM_KEY, None)
         if extra_args:
             sampling_params["extra_args"] = extra_args
@@ -1442,6 +1486,13 @@ class InferenceWorker(StreamingWorkerMixin):
         _stage_dense_prompt_logprobs(sampling_params)
         _coerce_structured_outputs_params(sampling_params)
         params = SamplingParams(**sampling_params)
+        if router_replay_required and params.routed_experts_prompt_start:
+            raise ValueError("A full router-replay capture requires routed_experts_prompt_start=0")
+        admitted_prefix = None
+        if router_replay_required and self._force_routes_enabled:
+            admitted_prefix = self._supply_route_history(prefix_replay_id, params)
+            if admitted_prefix is None:
+                prefix_replay_id = None
         request_id = str(uuid4())
         effective_prompt, prompt_token_ids, reasoning_ended = self._prefill_think_for_generation(
             prompt,
@@ -1470,6 +1521,7 @@ class InferenceWorker(StreamingWorkerMixin):
             request_id=request_id,
             replica_label=self._replica_label,
             return_back_router_info=return_back_router_info,
+            admitted_prefix=admitted_prefix,
         )
         if self._return_reasoning_content:
             self._apply_reasoning_parser(result, reasoning_ended=reasoning_ended)

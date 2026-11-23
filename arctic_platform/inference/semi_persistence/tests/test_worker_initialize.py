@@ -61,7 +61,8 @@ class _Env:
         self.no_think_tokens = False
         self.async_llm_errors = []
         self.restore_errors = []
-        self.attached = types.SimpleNamespace(get_tokenizer=lambda: None)
+        self.forced_route_reason = None
+        self.attached = types.SimpleNamespace(get_tokenizer=lambda: None, collective_rpc=self.collective_rpc)
 
     def record(self, name, *args):
         self.calls.append((name, args))
@@ -93,6 +94,11 @@ class _Env:
             raise self.restore_errors.pop(0)
         return self.attached
 
+    async def collective_rpc(self, method, timeout=None, args=(), kwargs=None):
+        self.record("collective_rpc", method)
+        assert method == "forced_route_support"
+        return [self.forced_route_reason]
+
     def matched_baseline(self):
         return _module(
             "matched_baseline", MATCH_ENV="SEMIP_MATCHED_BASELINE",
@@ -121,6 +127,8 @@ def env(monkeypatch):
         "arctic_platform.inference.vllm.dense_prompt_logprobs": _module(
             "dense", RESULT_KEY="dense", stage_sampling_params=noop,
             take_dense=noop),
+        "arctic_platform.inference.vllm.router_replay": _module(
+            "router_replay", FORCED_ROUTES_KEY="forced_routes"),
         "arctic_platform.inference.vllm.spec_decode_grammar": _module(
             "spec", ensure_spec_decode_grammar_fix=noop),
         "arctic_platform.inference.vllm.startup_error": _module(
@@ -258,10 +266,21 @@ def test_semi_p_loads_the_checkpoint_adapter_into_the_restored_engine(
 
 
 def test_semi_p_serves_router_replay(env):
-    _initialize(env, semi_p=True, enable_return_routed_experts=True,
-                router_replay_max_cache_bytes=1024)
+    worker = _initialize(env, semi_p=True, enable_return_routed_experts=True,
+                         router_replay_max_cache_bytes=1024)
     [(kwargs, _, _)] = env.called("restore_and_attach")
     assert kwargs["enable_return_routed_experts"] is True
     assert "router_replay_max_cache_bytes" not in kwargs
     assert env.called("router_replay_shm") == [("job-1",)]
     assert env.called("router_replay_tx") == [(True,)]
+    assert worker._force_routes_enabled
+
+
+def test_semi_p_without_forced_route_support_captures_only(env, caplog):
+    env.forced_route_reason = "unsupported runner"
+    with caplog.at_level(logging.WARNING):
+        worker = _initialize(env, semi_p=True, enable_return_routed_experts=True)
+    assert env.called("collective_rpc") == [("forced_route_support",)]
+    assert worker.state == env.worker.WorkerLifecycleState.READY
+    assert not worker._force_routes_enabled
+    assert env.forced_route_reason in caplog.text
