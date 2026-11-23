@@ -252,7 +252,7 @@ def get_buffer(group: ProcessGroup, hidden_bytes: int) -> Buffer:
 
     _configure_backward_barrier(group)
     num_nvl_bytes, num_rdma_bytes = 0, 0
-    for config in (Buffer.get_dispatch_config(group.size()), Buffer.get_combine_config(group.size())):
+    for config in (Buffer.get_dispatch_config(group.size(), hidden_bytes), Buffer.get_combine_config(group.size())):
         num_nvl_bytes = max(config.get_nvl_buffer_size_hint(hidden_bytes, group.size()), num_nvl_bytes)
         num_rdma_bytes = max(config.get_rdma_buffer_size_hint(hidden_bytes, group.size()), num_rdma_bytes)
 
