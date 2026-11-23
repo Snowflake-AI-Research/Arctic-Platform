@@ -148,9 +148,7 @@ class MoEArgs:
     route_scale: float = 1.0
     score_before_experts: bool = True
     fp32_router_logits: bool = False
-    # BF16 experts multiply each row's FP32 down-projection accumulator by its routing weight and round once, and
-    # expert parallelism sums a token's rows once, in fp32, as vLLM's fused MoE kernel does; False rounds the expert
-    # output, then weights it, and the combine adds each expert owner's BF16 subtotal.
+    # Weight each BF16 expert's FP32 down-projection accumulator before rounding and sum routed slots in FP32.
     fp32_routed_weighting: bool = False
 
     # token-choice
@@ -958,8 +956,7 @@ class MoE(nn.Module):
 
         def dispatch(hidden, indices, scores):
             if self.fp32_routed_weighting:
-                # One row per routed slot: no expert owner or combine forwarder adds two of a token's expert rows
-                # in BF16, and fold_slots sums them once, in fp32, as vLLM's moe_sum does.
+                # A single destination per row keeps owner and node reductions from rounding a subtotal.
                 slots = torch.arange(hidden.shape[0], device=hidden.device).repeat_interleave(top_k)
                 hidden = gather_token_rows(hidden, slots)
                 indices, scores = indices.reshape(-1, 1), scores.reshape(-1, 1)
@@ -972,7 +969,9 @@ class MoE(nn.Module):
                 score_before_experts=self.score_before_experts,
             )
 
-        def fold_slots(rows):
+        def finish_chunk(rows):
+            # DeepEP and UCCL return before the communication stream has finished writing these rows.
+            sync_combine()
             if not self.fp32_routed_weighting:
                 return rows
             tokens = rows.shape[0] // top_k
@@ -998,9 +997,7 @@ class MoE(nn.Module):
             )
             # Keep combine outside the checkpointed routed-expert region so
             # selective AC only recomputes local expert matmuls.
-            return fold_slots(
-                combine_tokens(routed_output, replace(dispatch_state, permuted_scores=None), **combine_kwargs)
-            )
+            return combine_tokens(routed_output, replace(dispatch_state, permuted_scores=None), **combine_kwargs)
 
         # dispatch/combine are collectives over the EP group: every rank must issue the
         # same number of calls in both forward and backward or heavier ranks hang on
@@ -1026,9 +1023,7 @@ class MoE(nn.Module):
 
             def run_chunk(hidden, indices, scores):
                 pending = dispatch(hidden, indices, scores)
-                output = run_pending_chunk(pending)
-                sync_combine()
-                return output
+                return finish_chunk(run_pending_chunk(pending))
 
             for start, end in chunk_bounds:
                 # Complete recompute on every rank so all collective handles are consumed.
@@ -1046,14 +1041,16 @@ class MoE(nn.Module):
             pending_state = dispatch_chunk(*chunk_bounds[0])
             for chunk_start, chunk_end in chunk_bounds[1:]:
                 next_pending_state = dispatch_chunk(chunk_start, chunk_end)
-                routed_outputs.append(run_pending_chunk(pending_state))
-                if self.sync_combine_per_chunk:
-                    sync_combine()
+                output = run_pending_chunk(pending_state)
+                if self.sync_combine_per_chunk or self.fp32_routed_weighting:
+                    output = finish_chunk(output)
+                routed_outputs.append(output)
                 pending_state = next_pending_state
-            routed_outputs.append(run_pending_chunk(pending_state))
+            last_output = run_pending_chunk(pending_state)
 
         shared_output = self.shared_expert(x) if self.shared_expert is not None else None
-        sync_combine()
+        if not checkpoint_chunks:
+            routed_outputs.append(finish_chunk(last_output))
         routed_output = routed_outputs[0] if len(routed_outputs) == 1 else torch.cat(routed_outputs, dim=0)
         # Dummy padding chunks append their rows after the real tokens; drop them.
         routed_output = routed_output[: x.shape[0]]
@@ -1083,7 +1080,7 @@ class MoE(nn.Module):
                 -1, top_k
             )  # we have to reshape here because the original is non-contiguous
 
-        # top_scores and selected_experts_indices shape (bs*slen*top_k,)
+        # top_scores and selected_experts_indices shape (bs*slen, top_k)
         # num_tokens_per_expert shape (num_experts,)
         (
             top_scores,

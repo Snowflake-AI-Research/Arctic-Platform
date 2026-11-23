@@ -467,47 +467,55 @@ def test_flash_moe_weights_the_down_projection_accumulator_before_rounding(
 
 
 class _OwnerDispatch(_OneRankDispatch):
-    """Expert parallelism over ``owners`` ranks of equal expert blocks, in one process. Each owner folds its rows of a
-    token with ``sum_rows_by_token`` (fp32, rounded to BF16), as deepep/ucclep ``combine_tokens`` do, and the combine
-    adds the owners' BF16 subtotals in fp32 and rounds once, as the DeepEP/UCCL combine kernel does."""
+    """Two expert owners of two experts each. Each owner sums its rows of a token in fp32 and rounds to BF16, as
+    deepep/ucclep ``combine_tokens`` do; the combine adds the owners' subtotals in fp32 and rounds once, as the
+    DeepEP/UCCL combine kernel does. Like those kernels, the combine buffer is written only at ``sync_combine``."""
 
-    def __init__(self, owners):
+    def __init__(self):
         super().__init__()
-        self.owners, self.indices = owners, []
-
-    def dispatch_tokens_async(self, hidden, indices, scores, num_experts, group, *, score_before_experts):
-        self.indices.append(indices)
-        return super().dispatch_tokens_async(hidden, indices, scores, num_experts, group, score_before_experts=False)
+        self.pending = []
 
     def combine_tokens(self, rows, state):
-        assert state.permuted_scores is None  # the experts weighted the rows
-        self.received.append(SimpleNamespace(rows=rows, counts=state.counts))
-        owner = torch.repeat_interleave(torch.arange(len(state.counts)), state.counts) * self.owners // len(state.counts)
+        assert state.permuted_scores is None
+        self.received.append(rows.detach())
+        owner = torch.repeat_interleave(torch.arange(4) // 2, state.counts)
         subtotals = [
-            _fp32_sum_rows_by_token(rows[owner == o], state.permuted_indices[owner == o], state.num_recv_tokens)
-            for o in range(self.owners)
+            torch.zeros(state.num_recv_tokens, rows.shape[1])
+            .index_add_(0, state.permuted_indices[owner == rank], rows[owner == rank].float())
+            .to(rows.dtype)
+            for rank in range(2)
         ]
-        return torch.stack(subtotals).float().sum(0).to(rows.dtype)
+        combined = (subtotals[0].float() + subtotals[1].float()).to(rows.dtype)
+        buffer = torch.full_like(combined, torch.nan)
+        self.pending.append((buffer, combined))
+        return buffer
+
+    def sync_combine(self):
+        for buffer, combined in self.pending:
+            buffer.copy_(combined)
+        self.pending.clear()
 
 
-def _fp32_sum_rows_by_token(rows, token_indices, num_tokens):
-    """``sum_rows_by_token`` as CUDA's ``embedding_bag`` computes it: fp32 sums rounded once. CPU ``embedding_bag``
-    rounds BF16 bags differently, so the test substitutes this."""
+def _cuda_sum_rows_by_token(rows, token_indices, num_tokens):
+    """``sum_rows_by_token`` as CUDA's ``embedding_bag`` computes it: fp32 sums in row order, rounded once. CPU
+    ``embedding_bag`` rounds BF16 bags differently."""
     return torch.zeros(num_tokens, rows.shape[1]).index_add_(0, token_indices, rows.float()).to(rows.dtype)
 
 
-@pytest.mark.parametrize("fp32_routed_weighting", [True, False])
-def test_flash_moe_sums_a_tokens_expert_rows_once_under_expert_parallelism(monkeypatch, fp32_routed_weighting):
-    """With fp32_routed_weighting, the MoE output under expert parallelism is what vLLM's fused MoE kernel computes on
-    a rank that holds whole experts: the token's weighted BF16 expert rows summed once, in fp32 (``moe_sum``), then
-    the shared expert added. Four expert owners of two experts each, top 4 of 8. Without the option the combine adds
-    each owner's BF16 subtotal, which rounds a token's rows more than once."""
+@pytest.mark.parametrize(("fp32_routed_weighting", "checkpoint_chunks"), [(False, False), (True, False), (True, True)])
+def test_flash_moe_sums_a_tokens_expert_rows_once_under_expert_parallelism(
+    monkeypatch, fp32_routed_weighting, checkpoint_chunks
+):
+    """With fp32_routed_weighting, the expert-parallel MoE output is what vLLM's fused MoE kernel computes on a rank
+    holding whole experts: the token's weighted BF16 expert rows summed once in fp32, in slot order (``moe_sum``),
+    plus the shared expert. Without it, each expert owner's BF16 subtotal is added. Chunked dispatch with a dummy
+    chunk, with and without checkpointed chunks, and a backward pass."""
     from arctic_platform.model.implementations.glm53.modeling_glm5_next import Glm5NextForConditionalGenerationPrimeRL
     from arctic_platform.model.implementations.moe.distributed import expert_parallel
     from arctic_platform.model.implementations.moe.layers import moe
 
     config = _glm_tiny_config()
-    config.text_config.n_routed_experts, config.text_config.num_experts_per_tok = 8, 4
+    config.text_config.num_experts_per_tok = 4
     config.use_grouped_mm, config.fp32_routed_weighting = False, fp32_routed_weighting
     torch.manual_seed(0)
     model = Glm5NextForConditionalGenerationPrimeRL(config)
@@ -515,24 +523,31 @@ def test_flash_moe_sums_a_tokens_expert_rows_once_under_expert_parallelism(monke
     with torch.no_grad():
         for parameter in layer.parameters():
             parameter.normal_(std=0.5)
-    dispatch, shared = _OwnerDispatch(owners=4), []
+    layer.set_deepep_token_chunk_size(7)
+    layer.checkpoint_dispatch_chunks = checkpoint_chunks
+    dispatch, shared = _OwnerDispatch(), []
     histc = torch.histc
     monkeypatch.setattr(torch, "histc", lambda values, *args, **kwargs: histc(values.float(), *args, **kwargs))
-    monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda count, **kwargs: count.add_(1))  # one dummy chunk
     monkeypatch.setattr(expert_parallel, "get_ep_group", lambda experts: None)
     monkeypatch.setattr(moe, "get_ep_comm_module", lambda backend: dispatch)
-    monkeypatch.setattr(moe, "sum_rows_by_token", _fp32_sum_rows_by_token, raising=False)
-    layer.shared_expert.register_forward_hook(lambda module, args, output: shared.append(output))
+    monkeypatch.setattr(moe, "sum_rows_by_token", _cuda_sum_rows_by_token, raising=False)
+    layer.shared_expert.register_forward_hook(lambda module, args, output: shared.append(output.detach()))
 
-    with torch.no_grad():
-        output = layer(torch.randn(1, 512, config.text_config.hidden_size).to(torch.bfloat16))[0]
-    (received,), (indices,) = dispatch.received, dispatch.indices
-    routes = indices.reshape(len(output), 4)
-    # Rows arrive grouped by expert, each expert's rows in token order: name each row's token from the routes.
-    tokens = torch.cat([(routes == expert).any(-1).nonzero()[:, 0] for expert in range(len(received.counts))])
-    routed = torch.zeros(output.shape, dtype=torch.float64).index_add_(0, tokens, received.rows.double())
-    expected = (shared[0].float() + routed.to(torch.bfloat16).float()).to(torch.bfloat16)
-    assert torch.equal(output, expected) is fp32_routed_weighting
+    hidden = torch.randn(1, 17, config.text_config.hidden_size).bfloat16().requires_grad_()
+    routes = torch.tensor([2, 0, 3, 1]).expand(1, hidden.shape[1], 4)
+    output = layer(hidden, routed_experts=routes)[0]
+    once, by_owner = [], []
+    for rows in dispatch.received:
+        # Each expert sees every token in order, including in the final one-token dummy chunk.
+        e0, e1, e2, e3 = rows.float().reshape(4, -1, output.shape[-1])
+        once.append((e2 + e0 + e3 + e1).bfloat16())
+        by_owner.append(((e0 + e1).bfloat16().float() + (e2 + e3).bfloat16().float()).bfloat16())
+    expected_once, expected_owners = (shared[0] + torch.cat(parts)[: len(output)] for parts in (once, by_owner))
+    assert not torch.equal(expected_once, expected_owners)
+    torch.testing.assert_close(output, expected_once if fp32_routed_weighting else expected_owners, rtol=0, atol=0)
+    output.sum().backward()
+    assert hidden.grad.isfinite().all()
 
 
 def test_weighted_down_projection_backward_is_that_of_the_bf16_gemm_then_weighting():

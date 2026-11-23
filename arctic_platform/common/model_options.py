@@ -217,15 +217,14 @@ def register(registry: Registry) -> None:
         why=(
             "GLM-5.3-Flash and Qwen3.8-Flash-Next BF16 experts multiply the down projection's fp32 accumulator by the"
             " routing weight and round once, as vLLM's Triton fused MoE kernel does, instead of rounding the expert"
-            " output and then weighting it; under expert parallelism each routed slot is dispatched and combined as"
-            " its own row and a token's rows are summed once, in fp32, as that kernel's moe_sum does, instead of the"
-            " combine adding each expert owner's BF16 subtotal. Bit-identical to that kernel where a sampler rank"
-            " computes whole experts; under sampler tensor parallelism each rank rounds its own partial sum. Off by"
-            " default: it runs one fp32-output GEMM per local expert in place of the grouped GEMM, and on H200 the"
-            " routed experts' forward plus backward takes 16-19% longer; dispatch and combine move top_k rows per"
-            " token instead of one per expert-owning rank."
+            " output and then weighting it. Under expert parallelism each routed slot travels as its own row, and the"
+            " source sums a token's rows in routing-slot order in fp32 and rounds once, as that kernel's moe_sum does"
+            " over the same rows, instead of summing per expert owner first (DeepEP/UCCL round those subtotals to"
+            " BF16). Off by default: it runs one fp32-output GEMM per local expert in place of the grouped GEMM, and"
+            " on H200 the routed experts' forward plus backward takes 16-19% longer; dispatch and combine exchange"
+            " one row per active slot, and each chunk waits for its combine before the sum."
         ),
-        remove_when="a grouped GEMM with a weighted fp32 epilogue makes it cheap enough to fold into fp32_parity",
+        remove_when="the weighted GEMM and slot-wise combine are cheap enough to fold into fp32_parity",
         source="`loader_options.fp32_routed_weighting`",
         registry=registry,
     )
