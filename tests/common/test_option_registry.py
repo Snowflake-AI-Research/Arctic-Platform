@@ -41,7 +41,7 @@ from arctic_platform.common.option_registry import settle
 from arctic_platform.testing_utils import TestCasePlus
 from arctic_platform.testing_utils import execute_subprocess_async
 
-# The real registry: the 23 keys with where they run and their goal, and the registered loaders.
+# Expected scope and goal of each public option.
 EXPECTED_KEYS = {
     "checkpointing.mode": ("trainer", "memory"),
     "checkpointing.freq": ("trainer", "memory"),
@@ -62,8 +62,10 @@ EXPECTED_KEYS = {
     "attention.sparse_mla": ("trainer", "speed"),
     "numerics.reduce_dtype": ("trainer", "parity"),
     "numerics.fp32_parity": ("trainer", "parity"),
-    "numerics.fp32_residual": ("trainer", "parity"),
+    "numerics.fp32_residual": ("both", "parity"),
     "numerics.fp32_routed_weighting": ("trainer", "parity"),
+    "numerics.fp32_kda": ("trainer", "parity"),
+    "numerics.row_invariant_projections": ("trainer", "parity"),
     "numerics.optimization_dtype": ("trainer", "parity"),
     "compile.fullgraph": ("trainer", "speed"),
     "peft": ("trainer", "mode"),
@@ -535,7 +537,8 @@ class TestCommandLine(TestCasePlus):
     def test_check_passes_on_real_data(self):
         out = self._run("check")
         assert len(out) == 1
-        assert out[0].startswith("check passed: 25 options x 10 profiles = 250 cells, ")
+        keys, profiles = len(EXPECTED_KEYS), len(EXPECTED_PROFILES)
+        assert out[0].startswith(f"check passed: {keys} options x {profiles} profiles = {keys * profiles} cells, ")
 
     def test_matrix_write_reproduces_committed_file(self):
         tmp_dir = Path(self.get_auto_remove_tmp_dir())

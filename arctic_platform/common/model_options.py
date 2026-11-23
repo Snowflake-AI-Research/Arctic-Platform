@@ -197,17 +197,19 @@ def register(registry: Registry) -> None:
     )
     register_option(
         "numerics.fp32_residual",
-        runs_in="trainer",
+        runs_in="both",
         goal="parity",
         why=(
             "Experimental. With fp32_parity on, carry the residual stream of the stock dense Qwen3.5 family in fp32"
             " between decoder layers, from the embeddings on, instead of rounding it to the branch dtype after each"
             " fused add. Checked on CPU against a reference and under checkpointing, offload and compile; its effect"
             " on GPU training is not yet measured. Under full activation checkpointing each decoder layer after the"
-            " first holds an fp32 residual at its boundary, twice the bytes of a bf16 one."
+            " first holds an fp32 residual at its boundary, twice the bytes of a bf16 one. On Qwen3.8-Flash-Next it"
+            " carries the hyper-connection residual streams in fp32 between blocks; the sampler matches it under"
+            " ARCTIC_FP32_HC_RESIDUAL=1."
         ),
         remove_when="GPU runs show it does not bring training closer to vLLM, or it becomes part of fp32_parity",
-        source="`loader_options.fp32_residual`",
+        source="`loader_options.fp32_residual`; sampler `ARCTIC_FP32_HC_RESIDUAL` (Qwen3.8-Flash-Next)",
         registry=registry,
     )
     register_option(
@@ -224,6 +226,31 @@ def register(registry: Registry) -> None:
         ),
         remove_when="a grouped GEMM with a weighted fp32 epilogue makes it cheap enough to fold into fp32_parity",
         source="`loader_options.fp32_routed_weighting`",
+        registry=registry,
+    )
+    register_option(
+        "numerics.fp32_kda",
+        runs_in="trainer",
+        goal="parity",
+        why=(
+            "GLM-5.3-Flash normalizes q and k in fp32 as in vLLM's KDA decode, passes fp32 q, k and v to FLA, and"
+            " casts the chunk output back to v's dtype. For BF16 inputs, the saved q, k, v and chunk matrices each"
+            " take twice the bytes per element. Eligible fp32 matrix products can use TF32 on NVIDIA GPUs."
+        ),
+        remove_when="GPU runs show it does not bring training closer to vLLM, or it is cheap enough for fp32_parity",
+        source="`loader_options.fp32_kda`",
+        registry=registry,
+    )
+    register_option(
+        "numerics.row_invariant_projections",
+        runs_in="trainer",
+        goal="parity",
+        why=(
+            "Pad short standard linear projections to a common row count to avoid row-dependent split-K rounding."
+            " Off by default because the extra projection work grows with workspace size and narrower outputs."
+            " Full determinism also enables the pad."
+        ),
+        source="`loader_options.row_invariant_projections`",
         registry=registry,
     )
     register_option(

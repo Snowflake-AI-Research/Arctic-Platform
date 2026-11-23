@@ -17,6 +17,7 @@
 
 
 def apply_required_vllm_patches() -> None:
+    from arctic_platform.inference import envs
     from arctic_platform.inference.vllm.config import ensure_dflash_max_position_patch
     from arctic_platform.inference.vllm.deepseek_v41_lora import ensure_deepseek_v41_lora
     from arctic_platform.inference.vllm.dense_prompt_logprobs import ensure_dense_prompt_logprobs_patch
@@ -42,3 +43,7 @@ def apply_required_vllm_patches() -> None:
     ensure_mrope_yarn_fix()
     ensure_mamba_completion_refresh()
     ensure_deepseek_v41_lora()
+    if envs.ARCTIC_FP32_HC_RESIDUAL:
+        from arctic_platform.inference.vllm.fp32_hc_residual import apply_fp32_hc_residual_patches
+
+        apply_fp32_hc_residual_patches()

@@ -64,6 +64,8 @@ HUGGINGFACE_FIELDS: dict[str, str | None] = {
     "numerics.fp32_parity": "loader_options.fp32_parity",
     "numerics.fp32_residual": "loader_options.fp32_residual",
     "numerics.fp32_routed_weighting": None,
+    "numerics.fp32_kda": None,
+    "numerics.row_invariant_projections": None,
     "numerics.optimization_dtype": None,
     "compile.fullgraph": "patches.compile.fullgraph",
     "peft": "patches.peft",
@@ -94,6 +96,8 @@ LOADER_OPTION_FIELDS: dict[str, str | None] = {
     "numerics.fp32_parity": "fp32_parity",
     "numerics.fp32_residual": None,
     "numerics.fp32_routed_weighting": "fp32_routed_weighting",
+    "numerics.fp32_kda": "fp32_kda",
+    "numerics.row_invariant_projections": "row_invariant_projections",
     "numerics.optimization_dtype": "ModelSpec.dtype",
     "compile.fullgraph": None,
     "peft": None,
@@ -102,9 +106,11 @@ LOADER_OPTION_FIELDS: dict[str, str | None] = {
 
 
 # Per-loader entries that differ from ``LOADER_OPTION_FIELDS``. ``glm5_next`` picks its sparse MLA kernel through
-# ``attn_implementation``, which ``_validate_glm5_next`` requires to name a sparse MLA backend.
+# ``attn_implementation``, which ``_validate_glm5_next`` requires to name a sparse MLA backend. ``qwen4_exp`` is the
+# one custom loader with ``fp32_residual``.
 LOADER_FIELD_OVERRIDES: dict[str, dict[str, str | None]] = {
     "glm5_next": {"attention.sparse_mla": "ModelSpec.attn_implementation"},
+    "qwen4_exp": {"numerics.fp32_residual": "fp32_residual"},
     "inkling": {"peft": "ModelSpec.patches.peft", "checkpointing.targets": None},
 }
 

@@ -84,6 +84,7 @@ class Qwen3_5MoeOptions(BaseModel):
         None, description="Dir for the one-time HF<->Prime weight-conversion cache."
     )
     ac_config: ActivationCheckpointConfig | None = Field(None, description="Activation checkpointing config.")
+    row_invariant_projections: bool = Field(False, description="Pad short linear calls to a workspace-derived height.")
     debug: DebugModelOptions | None = Field(None, description="Test-only tiny-model overrides.")
 
     @model_validator(mode="after")

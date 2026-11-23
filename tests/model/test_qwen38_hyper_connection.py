@@ -46,18 +46,21 @@ def _sublayer(mix, inject, module, x, out_weight):
     return inject(hyper_input, out, inj), mixed, inj
 
 
-@pytest.mark.parametrize("fp32_parity", [False, True])
+@pytest.mark.parametrize(
+    "fp32_parity, stream_dtype", [(False, torch.bfloat16), (True, torch.bfloat16), (True, torch.float32)]
+)
 @pytest.mark.parametrize("tokens", [1, 257])
-def test_fused_hyper_connection_matches_the_module(tokens, fp32_parity):
+def test_fused_hyper_connection_matches_the_module(tokens, fp32_parity, stream_dtype):
+    """``stream_dtype`` float32 is ``fp32_residual``: the streams stay fp32 and the mix still feeds the block bf16."""
     from arctic_platform.model.implementations.qwen38 import modeling_qwen4_exp as qwen38
 
     module = _module()
     if fp32_parity:
         module.__class__ = qwen38.Qwen4ExpTextGatedResidualPrimeRL
     torch.manual_seed(1)
-    x = torch.randn(1, tokens, 4 * 2560, device="cuda").bfloat16()
+    x = torch.randn(1, tokens, 4 * 2560, device="cuda").to(stream_dtype)
     out_weight = (torch.randn(2560, 2560, device="cuda") * 0.02).bfloat16()
-    grad = torch.randn(1, tokens, 4 * 2560, device="cuda").bfloat16()
+    grad = torch.randn(1, tokens, 4 * 2560, device="cuda").to(stream_dtype)
 
     def reference_inject(hyper_input, out, inj):
         if fp32_parity:
@@ -73,6 +76,7 @@ def test_fused_hyper_connection_matches_the_module(tokens, fp32_parity):
         y, mixed, inj = _sublayer(mix, inject, module, leaf, out_weight)
         y.backward(grad)
         results[name] = (y.detach(), mixed.detach(), inj.detach(), leaf.grad)
+        assert y.dtype == leaf.grad.dtype == stream_dtype and mixed.dtype == torch.bfloat16, name
     for what, fused, reference in zip(("y", "mixed", "inj", "dx"), results["fused"], results["hf"]):
         assert fused.shape == reference.shape, what
         assert _rel(fused, reference) < 1e-2, (what, _rel(fused, reference))

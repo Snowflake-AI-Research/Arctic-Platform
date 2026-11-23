@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Callable
 if TYPE_CHECKING:
     ARCTIC_INFERENCE_SKIP_SPEC_MODEL_CHECK: bool = False
     ARCTIC_FP32_LM_HEAD: bool = False
+    ARCTIC_FP32_HC_RESIDUAL: bool = False
 
 
 def arctic_inference_effective_enabled(
@@ -54,6 +55,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ``--fp32-lm-head`` CLI flag.
     "ARCTIC_FP32_LM_HEAD":
     lambda: os.getenv("ARCTIC_FP32_LM_HEAD", "0") == "1",
+    # Carry Qwen3.8-Flash-Next's hyper-connection residual streams in fp32
+    # between blocks (vllm/fp32_hc_residual.py). Pairs with the trainer's
+    # ``loader_options.fp32_residual``.
+    "ARCTIC_FP32_HC_RESIDUAL":
+    lambda: os.getenv("ARCTIC_FP32_HC_RESIDUAL", "0") == "1",
     # Weight-sync correctness diagnostic (default off). When "1", each sampler
     # TP rank records full-model post-load L2 values in ``param_l2``, values for
     # only populated destinations in ``loaded_param_l2``, and source mappings.

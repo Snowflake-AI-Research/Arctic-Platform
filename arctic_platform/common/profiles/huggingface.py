@@ -60,6 +60,7 @@ def register(registry: Registry) -> None:
             "zorro_train",
         ],
         unsupported={
+            "numerics.row_invariant_projections": "this loader does not install the projection pad",
             "checkpointing.mode": (
                 "no equivalent option; `patches.gradient_checkpointing` always recomputes whole layers"
             ),
@@ -70,6 +71,7 @@ def register(registry: Registry) -> None:
             ),
             "numerics.reduce_dtype": "no equivalent option",
             "numerics.fp32_routed_weighting": "no equivalent option; only glm5_next and qwen4_exp have one",
+            "numerics.fp32_kda": "no equivalent option; only glm5_next has one",
             "numerics.optimization_dtype": (
                 "the key has no effect on this route: the job sets the model dtype, not this key"
             ),

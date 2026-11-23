@@ -22,6 +22,7 @@ Hugging Face iterator.
 from __future__ import annotations
 
 from pydantic import Field
+from pydantic import model_validator
 
 from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.implementations.glm53 import GLM53_ATTN_BACKEND
@@ -58,8 +59,43 @@ class FlashMoeOptions(GenericMoeOptions):
     )
 
 
+class Qwen38FlashMoeOptions(FlashMoeOptions):
+    """``FlashMoeOptions`` plus Qwen3.8-Flash-Next's ``fp32_residual``."""
+
+    fp32_residual: bool = Field(
+        False,
+        description=(
+            "With fp32_parity, carry the hyper-connection residual streams in fp32 between blocks, from the"
+            " embeddings to the final mixer, instead of rounding them to bf16 after every injection; each mix still"
+            " feeds its block bf16. The sampler must carry fp32 streams too (ARCTIC_FP32_HC_RESIDUAL=1), or the"
+            " two forwards differ by that rounding. Under full activation checkpointing each decoder layer boundary"
+            " holds an fp32 stream, twice the bytes of a bf16 one."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _fp32_residual_needs_fp32_parity(self) -> Qwen38FlashMoeOptions:
+        if self.fp32_residual and not self.fp32_parity:
+            raise ValueError("fp32_residual requires fp32_parity: only its mix and combine keep an fp32 stream")
+        return self
+
+
+class Glm5NextOptions(FlashMoeOptions):
+    """Validated ``loader_options`` for GLM-5.3-Flash."""
+
+    fp32_kda: bool = Field(
+        False,
+        description=(
+            "Normalize KDA q and k in fp32 as in vLLM's decode, run FLA with fp32 q, k and v, and cast the output "
+            "back to v's dtype. For BF16 inputs this doubles the storage for the saved q, k, v and chunk matrices."
+        ),
+    )
+
+
 class _FlashLoadOptions(Qwen3_5MoeOptions):
     fp32_routed_weighting: bool = False
+    fp32_residual: bool = False
+    fp32_kda: bool = False
 
 
 def _matches(family: str):
@@ -157,7 +193,7 @@ def _load(ctx: LoaderContext, load_model) -> LoadedModel:
 @register_loader(
     "glm5_next",
     matches=_matches("glm5_next"),
-    options=FlashMoeOptions,
+    options=Glm5NextOptions,
     validate_spec=_validate_glm5_next,
 )
 def load_glm5_next(ctx: LoaderContext) -> LoadedModel:
@@ -169,7 +205,7 @@ def load_glm5_next(ctx: LoaderContext) -> LoadedModel:
 @register_loader(
     "qwen4_exp",
     matches=_matches("qwen4_exp"),
-    options=FlashMoeOptions,
+    options=Qwen38FlashMoeOptions,
     validate_spec=_validate_qwen4_exp,
 )
 def load_qwen4_exp(ctx: LoaderContext) -> LoadedModel:

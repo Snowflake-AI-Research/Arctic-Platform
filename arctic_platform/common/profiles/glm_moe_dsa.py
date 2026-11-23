@@ -49,9 +49,11 @@ def register(registry: Registry) -> None:
             "numerics.optimization_dtype",
         ],
         unsupported={
+            "numerics.row_invariant_projections": "this loader does not install the projection pad",
             "numerics.fp32_parity": "no fp32_parity option; see qwen3_5_moe, huggingface, glm5_next, qwen4_exp",
-            "numerics.fp32_residual": "this loader has no fp32_residual option; only huggingface has one",
+            "numerics.fp32_residual": "this loader has no fp32_residual option; see huggingface, qwen4_exp",
             "numerics.fp32_routed_weighting": "no fp32_routed_weighting option; see glm5_next, qwen4_exp",
+            "numerics.fp32_kda": "no fp32_kda option; only glm5_next has one",
             "lm_head.vocab_chunk_size": "no equivalent option",
             "liger": "the loader rejects `patches.liger`; set `lm_head.cross_entropy` to liger instead",
             "compile.fullgraph": "the loader rejects `patches.compile`",
