@@ -1020,16 +1020,14 @@ class ReplicaPool:
 
         if is_token_tensor(prompts):
             if prompts.dim() == 1:
-                return [self._scheduler.submit(
-                    compact_token_tensor(prompts), _single_params(),
-                    routing_key=_single_key(), strict=strict, conversation=conversation,
-                )]
-            if prompts.dim() != 2:
+                prompts = [prompts]
+            elif prompts.dim() == 2:
+                prompts = list(prompts)
+            else:
                 raise ValueError(
                     "A token-id tensor must be 1-D (one prompt) or 2-D (a batch), "
                     f"got shape {tuple(prompts.shape)}"
                 )
-            prompts = list(prompts)
         if isinstance(prompts, str):
             return [self._scheduler.submit(
                 prompts, _single_params(), routing_key=_single_key(), strict=strict, conversation=conversation,
@@ -1038,7 +1036,6 @@ class ReplicaPool:
             return [self._scheduler.submit(
                 prompts, _single_params(), routing_key=_single_key(), strict=strict, conversation=conversation,
             )]
-        prompts = [compact_token_tensor(p) if is_token_tensor(p) else p for p in prompts]
         if isinstance(routing_key, list):
             if len(routing_key) != len(prompts):
                 raise ValueError(
@@ -1059,6 +1056,7 @@ class ReplicaPool:
             params_list = [params] * len(prompts)
         if conversation is not None:
             return self._scheduler.submit_turns(zip(prompts, params_list, keys), conversation, strict)
+        prompts = [compact_token_tensor(p) if is_token_tensor(p) else p for p in prompts]
         return [
             self._scheduler.submit(prompt, param, routing_key=key, strict=strict)
             for prompt, param, key in zip(prompts, params_list, keys)

@@ -222,4 +222,12 @@ def test_generate_api_and_pool_carry_the_conversation_to_the_scheduler(monkeypat
             await generate(prompts=[[4]], routing_key="never-started", conversation="append")
         assert missing.value.status_code == 404
 
+        with pytest.raises(scheduler_module.ConversationNotFound):
+            await pool.generate(torch.tensor([[7], [8]]), routing_key=["a", "missing"], conversation="append")
+        assert len(worker.prompts) == 4
+        await pool.generate(torch.empty((2, 0), dtype=torch.int32), routing_key=["a", "b"], conversation="append")
+        assert worker.prompts[-2:] == [[1, 2, 101, 201, 3, 103, 203], [5, 102, 202, 6, 104, 204]]
+        await pool.generate(torch.empty(0, dtype=torch.int32), routing_key="a", conversation="append")
+        assert worker.prompts[-1] == [1, 2, 101, 201, 3, 103, 203, 105, 205]
+
     asyncio.run(run())
