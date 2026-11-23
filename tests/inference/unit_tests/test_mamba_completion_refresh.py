@@ -95,6 +95,7 @@ def manager_methods(monkeypatch):
         ("deepseek_v41_lora", "ensure_deepseek_v41_lora"),
         ("kv_group_size", "ensure_kv_group_size_patch"),
         ("mrope_yarn", "ensure_mrope_yarn_fix"),
+        ("decoded_tail_prefix_hit", "ensure_decoded_tail_prefix_hit"),
     ]:
         stub = ModuleType(f"arctic_platform.inference.vllm.{name}")
         setattr(stub, entry, lambda: None)

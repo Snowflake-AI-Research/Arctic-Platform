@@ -1,4 +1,5 @@
 from arctic_platform.inference.vllm import config
+from arctic_platform.inference.vllm import decoded_tail_prefix_hit
 from arctic_platform.inference.vllm import deepseek_v41_lora
 from arctic_platform.inference.vllm import dense_prompt_logprobs
 from arctic_platform.inference.vllm import flashmla_sparse_dcp
@@ -20,6 +21,11 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         router_replay,
         "ensure_router_replay_vllm_patches",
         lambda: calls.append("router"),
+    )
+    monkeypatch.setattr(
+        decoded_tail_prefix_hit,
+        "ensure_decoded_tail_prefix_hit",
+        lambda: calls.append("decoded_tail_prefix_hit"),
     )
     monkeypatch.setattr(
         xgrammar_stop_mask,
@@ -83,6 +89,7 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
 
     assert calls == [
         "router",
+        "decoded_tail_prefix_hit",
         "xgrammar",
         "dense_prompt_logprobs",
         "flashmla_sparse_bf16_dcp",
