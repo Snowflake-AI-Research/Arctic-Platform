@@ -25,7 +25,8 @@ from arctic_platform.debug import weight_sync as evidence
 class _Model(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.weight = torch.nn.Parameter(torch.zeros(2, 3))
+        self.weight = torch.nn.Parameter(torch.zeros(3, 2, dtype=torch.float8_e4m3fn).T)
+        self.tied_weight = self.weight
         self.bias = torch.nn.Parameter(torch.zeros(2))
 
     def load_weights(self, weights):
@@ -41,9 +42,15 @@ def _vllm_digest(value):
 def test_verification_reports_the_installed_digest_of_every_parameter():
     model = _Model()
     verifier = evidence.ShadowVerifier(model, max_shadow_bytes=1024)
-    verifier.load("weight", torch.arange(6, dtype=torch.float32).reshape(2, 3) - 2.5)
+    wire = torch.arange(6, dtype=torch.float32).reshape(2, 3) - 2.5
+    verifier.load("weight", wire)
+    with torch.no_grad():
+        model.weight.copy_(wire.flip(1))
 
-    installed = verifier.finish()["installed"]
+    record = verifier.finish()
 
-    assert installed == {"weight": _vllm_digest(model.weight), "bias": _vllm_digest(model.bias)}
-    assert installed["weight"] != _vllm_digest(model.weight.flip(1))  # a permutation keeps the norm, not the digest
+    assert record["installed"] == {
+        "weight": _vllm_digest(wire.flip(1).to(model.weight.dtype)),
+        "bias": _vllm_digest(model.bias),
+    }
+    assert record["changed_after_verification"] == ["weight"]

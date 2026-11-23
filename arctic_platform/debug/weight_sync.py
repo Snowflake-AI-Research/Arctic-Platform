@@ -776,10 +776,14 @@ class ShadowVerifier:
     def finish(self):
         self._check_inventory()
         verify_sources(self.sources)
+        # Completed destinations already need a fresh manifest to detect later writes.
+        manifests = {
+            name: tensor_manifest(value)
+            for name, value in self.registered.items()
+            if name in self.parameters or self.storage_keys[name] in self.completed
+        }
         for digests in self.completed.values():
-            self.changed.update(
-                name for name, digest in digests.items() if tensor_manifest(self.registered[name]) != digest
-            )
+            self.changed.update(name for name, digest in digests.items() if manifests[name] != digest)
         for key in list(self.backings):
             if self.storage_names[key] & self.touched:
                 self._complete(key, digest=False)
@@ -795,9 +799,7 @@ class ShadowVerifier:
         return {
             "status": "ok",
             "received": self.received,
-            # The bytes of every parameter this rank now serves, hashed as vLLM's ``compute_weight_checksums`` hashes them,
-            # so the same TP rank can be compared across replicas and against an independently built shard.
-            "installed": {name: tensor_manifest(value)["sha256"] for name, value in self.parameters.items()},
+            "installed": {name: manifests[name]["sha256"] for name in self.parameters},
             "destinations": destinations,
             "unverifiable_destinations": [],
             "non_parameter_destinations": [],
