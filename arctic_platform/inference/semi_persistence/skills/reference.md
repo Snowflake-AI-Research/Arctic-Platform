@@ -41,7 +41,7 @@ pods and is `None` everywhere else; see
 | Primitive | Effect |
 |---|---|
 | `sleep()` | `llm.sleep(level=2)` — frees GPU memory for main and drafter weights |
-| `cuda_checkpoint()` | Save CUDA state to CPU via `cuCheckpointProcess`; `gpu` becomes `None`. At TP>1 also inserts `destroy_nccl` first |
+| `cuda_checkpoint()` | Save CUDA state to CPU via `cuCheckpointProcess`; `gpu` becomes `None`. At TP>1 also inserts `drop_graphs_if_nccl` (`drop_graphs` across nodes) and `destroy_nccl` first |
 | `cuda_restore(gpus=[...])` | Restore CUDA state onto specific GPU(s). Defaults to the placement recorded in the image; a scalar `gpu=` still works at TP=1 |
 | `wake_up_weights()` | Re-allocate weight tensors on GPU (main + drafter) |
 | `wake_up_kv_cache()` | Re-allocate the KV cache on GPU |
@@ -54,20 +54,20 @@ placement only and must have exactly that many entries. See
 
 | Primitive | Effect |
 |---|---|
-| `destroy_nccl()` | Tear down NCCL and CustomAllreduce IPC before a checkpoint, always via the graph-preserving unilateral abort. Also marks the worker's inet TCP sockets `SO_LINGER(1,0)` so their ports skip `TIME_WAIT` when the dump kills the tree (Complication 12) |
+| `destroy_nccl()` | Tear down NCCL and CustomAllreduce IPC before a checkpoint, always via the graph-preserving unilateral abort. Also marks the worker's inet TCP sockets `SO_LINGER(1,0)` so their ports skip `TIME_WAIT` when the dump kills the tree (Complication 12). **Raises** if an abort is still running at its 60 s deadline (a kept graph holds that comm's NCCL kernels), and the worker then refuses `cuda_checkpoint`/`criu_dump`: the image would fail `cuda_restore` with 801 |
 | `reinit_nccl()` | Rebuild NCCL on a fresh port. Must run after `cuda_restore` and before the model runs or a captured graph replays; `attach`/`load_weights` are CPU-only and unconstrained by it |
-| `rebind_graphs()` | Rewrite the preserved decode graphs' stale CustomAllreduce addresses, after `wake_up_kv_cache`. Takes no argument. **Raises at `nnodes > 1`** — there is nothing to rebind there. Was `recapture_graphs(graph_mode=...)` until 2026-09-24; `cleargraph` was retired with it |
+| `drop_graphs_if_nccl()` | Single-node gate, auto-inserted by `cuda_checkpoint` ahead of `destroy_nccl`. Every rank counts the NCCL kernel nodes in its graphs (child graphs included); any, or an incomplete count, runs `drop_graphs`. `commDestroySync` polls `while (comm->localPersistentRefs != 0)` until every graph that captured the comm is gone. Records `graphs_dropped`, `graphs_dropped_reason` (`nccl_in_graphs` / `census_incomplete`) and `graph_nccl_nodes` in `meta.json`. Skipped for graphless (eager) ranks |
+| `drop_graphs()` | Destroy every captured CUDA graph and empty the containers holding them, then refresh the shared graph pool. Run when the graphs hold NCCL kernels: unconditionally across nodes (`graphs_dropped_reason: multinode`), and through `drop_graphs_if_nccl` on one node |
+| `rebind_graphs()` | Rewrite the preserved decode graphs' stale CustomAllreduce addresses, after `wake_up_kv_cache`. Takes no argument. **Raises at `nnodes > 1`**, and in the child when the image's graphs were dropped — there is nothing to rebind there. Was `recapture_graphs(graph_mode=...)` until 2026-09-24; `cleargraph` was retired with it |
+| `recapture_graphs()` | `model_runner.capture_model()` on every rank, after `reinit_nccl` and `wake_up_kv_cache`. Unlocks the workspace first, since `capture_model()` leaves it locked, and captures on the CustomAllreduce copy path where one exists, as the cold start did. Replaces `rebind_graphs` when `meta.json` says `graphs_dropped` (always across nodes) |
 
 ### Multi-node (`nnodes > 1` only)
 
 One engine whose ranks span pods. The gate is the node boundary, not TP: two
 TP=8 replicas across two nodes are two single-node engines and use none of
-this. See [MULTINODE_TP16.md](MULTINODE_TP16.md).
-
-| Primitive | Effect |
-|---|---|
-| `drop_graphs()` | Destroy every captured CUDA graph and empty the containers holding them, then refresh the shared graph pool. Auto-inserted by `cuda_checkpoint` ahead of `destroy_nccl`: across nodes the graphs hold NCCL kernels, and `commDestroySync` polls `while (comm->localPersistentRefs != 0)` until they are gone |
-| `recapture_graphs()` | `model_runner.capture_model()` on every rank, after `reinit_nccl` and `wake_up_kv_cache`. Unlocks the workspace first, since `capture_model()` leaves it locked. Replaces `rebind_graphs` on this path |
+this. Across nodes the graphs always hold NCCL kernels, so `cuda_checkpoint`
+always drops them and the restore always recaptures. See
+[MULTINODE_TP16.md](MULTINODE_TP16.md).
 
 `Instance(vllm_config, model_dir, multinode=MultiNode(node_rank, master_addr,
 master_port, ifname))`. `nnodes` goes in `vllm_config` and is hashed into the
@@ -87,8 +87,10 @@ restoring job sets is visible there.
 | `detach()` | Free each worker's CPU buffer |
 | `repin()` / `unpin()` | `cudaHostRegister` / `cudaHostUnregister` each worker's buffer. Idempotent |
 | `stage()` | Snapshot main + drafter params GPU -> that worker's CPU buffer |
-| `save_weights()` | Write each worker's buffer to `<model_dir>/weights` as shards + `weights_meta.json`. Call after `stage()`, before `detach()`, so the image stays small |
-| `load_weights()` | Read those shards back into the buffer. Requires a prior `attach()` on the restore side |
+| `save_weights()` | Write each worker's buffer to `<model_dir>/weights` as shards + `weights_meta.json`. Call after `stage()`, before `detach()`, so the image stays small. The manifest records canonical names (a LoRA wrapper's `.base_layer.` dropped), so a LoRA config writes its full config's weight set; see [IMAGE_CACHE.md](IMAGE_CACHE.md) §1 |
+| `load_weights()` | Read those shards back into the buffer. Requires a prior `attach()` on the restore side. Checks size, and names (canonical on both sides), offsets, sizes and dtypes against the attached model |
+| `release_host_weights()` | After `save_weights()`: unregister the large pinned host parameters `SemipGPUWorker.load_model` moved into their own mappings (`host_weights.py`; DeepSeek-V4.1's Engram tables), drop their pages and make them PROT_NONE, so the image keeps an empty mapping at each address. One changed since load stays in the image, with a warning. No-op without such parameters or with `SEMIP_THIN_PINNED_PARAMS=0` |
+| `refill_host_weights()` | After `load_weights()`: read those parameters' shard ranges back into their mappings, re-register them and check their checksums. Until then the child refuses `generate`, `wake_up_kv_cache`, `rebind_graphs`, `recapture_graphs`, `serve_core` and `resume` |
 | `plan_restore_weights()` | Build and cache a chunk plan under a computed byte budget; if the buffer is pageable, also form a small pinned double buffer (`SEMIP_PINNED_BUFFER_*`) |
 | `restore_weights()` | Execute the cached plan: buffer -> (pinned double buffer, if formed) -> one reused GPU staging buffer -> scatter |
 
@@ -106,6 +108,30 @@ sizes. See [instance_DESIGN.md](instance_DESIGN.md).
 The drafter contributes extra parameter entries only when it exposes a `.model`
 (Eagle / Medusa / DraftModel / ArcticProposer). Ngram and Suffix drafters are
 skipped, collapsing the layout to main params only.
+
+### Host-resident parameters
+
+Large pinned CPU parameters (DeepSeek-V4.1-Flash's Engram tables, 23.6 GiB per
+rank) are moved at load into mappings semi_p empties at the dump and refills at
+the restore; the host copy leaves them out. Mechanism and rules in
+[instance_DESIGN.md](instance_DESIGN.md) *Host-Resident Parameters*. What the
+log shows, per rank unless noted:
+
+| When | Line |
+|---|---|
+| load (`SemipGPUWorker.load_model`) | `[semip-host] rank=R rehomed N param(s) X GiB in Ts (torch pinned A -> B GiB) skipped K [(name, reason), ...] uva_identity=ok` (the last field only when N > 0); `[semip-host] rank=R off (SEMIP_THIN_PINNED_PARAMS=0)` when disabled |
+| ... old blocks still allocated | the load line ends with `WARNING: torch pinned memory dropped by only Y of X GiB; an old storage is still referenced, so its pinned block stays in host memory and in the image` (drop < 90% of the rehomed bytes) |
+| end of `init`, once | `N host-resident parameter(s), X GiB across W worker(s), leave the image at the dump: [names]` |
+| `attach`, once | `besides it X GiB in N host-resident parameter(s), read and written in place` |
+| `release_host_weights` | `released host weights rank=R: N of M param(s), X GiB, dropped from the image in Ts; unchanged since load N/M` |
+| ... an entry changed since load | `WARNING rank=R: host-resident parameter(s) [names] CHANGED between load and dump, so they stay in the CRIU image (X GiB) instead of being refilled from the weight set` |
+| `refill_host_weights` | `refilled host weights rank=R: N param(s) X GiB read in Ts, N registered in Ts, checksums ok in Ts`, then `<<< refill_host_weights OK (Ts)` |
+| a refused command | `<cmd> refused: host-resident parameters are not registered (released at the dump, or unpinned); refill_host_weights after a restore, or repin, registers them` |
+
+`torch pinned A -> B` is torch's pinned-allocator total before and after the
+rehome (`reserved_bytes.current`, or `allocated_bytes.current` on torch 2.13,
+which has no `reserved_bytes` keys; `?` if neither). The drop is torch's old
+blocks going back to the driver.
 
 ### Serving
 
@@ -309,6 +335,9 @@ on reboot and lets `criu_restore` validate the image against the instance.
 | `SEMIP_UNPRIVILEGED=1` | Run dump and restore on a pod granting only `CAP_CHECKPOINT_RESTORE + CAP_SYS_PTRACE`. Adds `--unprivileged` to both, takes the no-namespace restore path, and sheds the child's capabilities so the image is portable to a low-cap node. Costs concurrent restore of images whose recorded task ids overlap; replicas dumped together in one pod have disjoint ids and restore concurrently (8 at TP=1, measured 2026-10-03). The serving adapter defaults it to `1` (`restore_and_wrap`) and records it in `meta.json` as `unprivileged`. See Complication 11 |
 | `SEMIP_IMAGE_CACHE` | Local image-cache root. Default `/data-fast/image-cache_neutrino` |
 | `SEMIP_IMAGE_SOURCE` | Read-only mirror of published skeletons. Default `/mnt/neutrino/base-models/image-cache`; `""` turns it off |
+| `SEMIP_GATHER_VERIFY=sha256` | Also hash every materialized file against the manifest (the raw sha256 for decoded pages). Default `size`: byte accounting and file sizes, plus every compressed frame's checksum and decoded length. The materialize is always the one local copy from the mirror; there is no knob selecting another. See IMAGE_CACHE.md §9 |
+| `SEMIP_GATHER_CHUNK`, `SEMIP_GATHER_THREADS`, `SEMIP_GATHER_DIRECT=0` | The materialize copy's range size (default 128 MiB), threads (32), and turning its O_DIRECT writes off |
+| `SEMIP_PUBLISH_COMPRESS=0` | Publish skeleton pages raw (same as `semip_publish.py --no-compress`). Default on: each non-empty `pages-<N>.img` directly under an image directory is published as `pages-<N>.img.zst` and decoded at materialize; the format is in IMAGE_CACHE.md §9. Read by `semip_publish.py` in the dump pod. A key already published in the other format is refused until unpublished |
 | `SEMIP_DUMP_PUBLISH=1` | Set by the job (`vllm_config.extra_env`). On a miss: cold-start, dump, restore, serve, then publish in the background (`_start_publish`, to the dev cluster's model bucket). Unset, a miss fails the job with a message to set `semi_p` to false or add this flag. Not published: a TP>1 pod that is not a whole node, any pod of a multi-pod job but the lowest-address one, a job with the mirror off, a key already published |
 | `SEMIP_CONCURRENT_DUMPS` | Most `criu dump`s at once in a pod, counted with flocks in the pod's `/data-fast/.semip-dump-slots`. Default 2; `0` is no limit. Without `CAP_SYS_RESOURCE` or `CAP_SYS_ADMIN`, criu's uid may hold 64 MiB of pipes across the node (`fs.pipe-user-pages-soft`); a dump holds 8 MiB, and once the budget is spent a dump fails with "Unable to set a pipe size" (CRIU_PLUMBING Complication 11) |
 | `SEMIP_REPLICA_ID`, `SEMIP_NUM_REPLICAS` | Set per worker by `ReplicaPool`: node-local slot and replicas on that node. With more than one, `model_dir` gains `/replica<K>`. Not a user flag |
@@ -317,7 +346,18 @@ on reboot and lets `criu_restore` validate the image against the instance.
 | `SEMIP_PINNED_BUFFER_BYTES` | Pinned bytes per worker for the double buffer `plan_restore_weights` forms when the host copy is pageable, split into two halves: one fills from the pageable copy while the other copies to the GPU. Default 1 GiB (2 x 512 MiB); `0` forms none, and `restore_weights` copies straight from pageable memory (slow). The copy is bound by the fill, so more halves or bigger ones copied no faster on GLM TP=8 or Qwen TP=1. Read by `Instance` at plan time, so a restore job's `extra_env` reaches it |
 | `SEMIP_PINNED_BUFFER_THREADS` | Threads filling each half from the pageable copy. Default 8. On Qwen3.6 TP=1 (65 GiB per worker, 16 CPUs per GPU), `restore_weights` took 4.9 s with 4, 2.8 s with 8 and 2.6 s with 16, and nothing was throttled |
 | `SEMIP_PIN_HOST_COPY=0` | Keep the host copy pageable. Default on: the first sleep of a `SemiPAsyncLLM` front end pins it (`repin`, which also frees the double buffer) in the background, and every later wake copies it to the GPU directly. Eight Qwen3.6 TP=1 replicas waking at once on one node took 7–12 s per `restore_weights` through the double buffer (bound by host memory bandwidth, whatever the thread count) and 2.3–3.1 s pinned. Pinning took 2.8 s for one replica and 10–16 s for eight at once; a wake that comes sooner waits for it. Read by the front end, in the job's own process |
+| `SEMIP_THIN_PINNED_PARAMS=0` | Leave large pinned host parameters where vLLM put them, inside the CRIU image (the old behaviour). Default on: at TP>1 `SemipGPUWorker.load_model` moves each qualifying one into a mapping the dump empties (`release_host_weights`) and the restore refills from the weight set (`refill_host_weights`). Only DeepSeek-V4.1-Flash's Engram tables qualify today. Needed for a weight sync that updates those parameters. Read by the vLLM workers at load, so it acts on a cold start only; it is in neither cache hash (`extra_env`), and a restore follows whatever the image did |
 | `_SEMIP_CHILD_DROP_CAPS=1` | Internal only, set by the worker across the child's spawn. Not a user flag |
+
+### Image-cache log lines
+
+| Line | Where | Says |
+|---|---|---|
+| `semi_p: materialized <model_dir> from <skeleton>: N file(s), G GiB in Ts (M MB/s); weights stay on the mirror; N range(s) over F flow(s)[, O_DIRECT]` | engine, worker-side INFO | A miss filled from the mirror. A compressed skeleton appends `; pages: X GiB stored -> R GiB raw in N file(s), Z GiB zero frames left unwritten, W GiB written, decode C core-s` |
+| `semi_p: <skeleton>: skeleton format N is newer than this engine, which reads format 1; cold-starting` | engine, WARNING | A miss, decided before any copy |
+| `- image/ hashed+compressed: N files, X GiB raw -> S GiB stored (Rx), P pages file(s), Z zero frame(s), in Ts (...)` | publisher | One per image directory whose pages were compressed; a raw one logs `- <sub>/ hashed: ...` |
+| `pages       : raw (...)`, `! pages published raw: ...` | publisher | Why the pages went up raw: the env var or `--no-compress`, a dry run, no libzstd, or too little staging disk |
+| `publish summary: {"compressed_files": ..., "format": "zstd1", "hash_compress_s": ..., "raw_bytes": ..., "stored_bytes": ..., "upload_s": ..., "zero_frames": ...}` | publisher, last line; in the engine's `semi_p: published` tail | `format` is `raw` for a raw publish. Recorded by `onboarding/publish.py`, plus `ratio` (raw / stored) |
 
 ---
 
