@@ -18,8 +18,10 @@
 
 def apply_required_vllm_patches() -> None:
     from arctic_platform.inference.vllm.config import ensure_dflash_max_position_patch
+    from arctic_platform.inference.vllm.decoded_tail_prefix_hit import ensure_decoded_tail_prefix_hit
     from arctic_platform.inference.vllm.deepseek_v41_lora import ensure_deepseek_v41_lora
     from arctic_platform.inference.vllm.dense_prompt_logprobs import ensure_dense_prompt_logprobs_patch
+    from arctic_platform.inference.vllm.flashmla_sparse_dcp import ensure_flashmla_sparse_bf16_dcp
     from arctic_platform.inference.vllm.glm5next_lora import ensure_glm5next_lora
     from arctic_platform.inference.vllm.hybrid_state_fixes import apply_hybrid_state_fixes
     from arctic_platform.inference.vllm.kv_group_size import ensure_kv_group_size_patch
@@ -31,8 +33,10 @@ def apply_required_vllm_patches() -> None:
     from arctic_platform.inference.vllm.xgrammar_stop_mask import ensure_xgrammar_stop_mask_fix
 
     ensure_router_replay_vllm_patches()
+    ensure_decoded_tail_prefix_hit()
     ensure_xgrammar_stop_mask_fix()
     ensure_dense_prompt_logprobs_patch()
+    ensure_flashmla_sparse_bf16_dcp()
     ensure_spec_decode_grammar_fix()
     apply_hybrid_state_fixes()
     ensure_tp_spec_decode_sync()
