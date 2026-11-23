@@ -144,8 +144,8 @@ semi_persistence/
                  (except imgdiff.py / pidcheck.py, which only need crit + root)
   reproduce/     example_full.py: the saved -> up sweep across TP1/2/4/8
   onboarding/    the model onboarding suite (semi_p vs plain jobs through the
-                 Cortex Training API), publish.py, and the root model configs
-                 with backends.json; see onboarding/README.md
+                 Cortex Training API) and publish.py, reading configs from
+                 the model catalog; see onboarding/README.md
   skills/        this skill (SKILL.md + reference.md) and every design doc
 ```
 
@@ -203,11 +203,15 @@ real GPUs and loads real weights, except `scripts/imgdiff.py` and
   `compilation/` (bound to the absolute `model_dir`; 6.7 GB at TP=1, 29 GiB at
   TP=4, 207 GiB for Flash-Next at TP=8) out of the read-only mirror
   (`SEMIP_IMAGE_SOURCE`, default `/mnt/neutrino/base-models/image-cache`; `""`
-  turns it off) and reads `weight/` (no baked path) in place. Every way it
-  declines — an unverified directory, a foreign `model_dir` or uid, a publish
-  that withheld the weights, a recorded size mismatch, any I/O failure — is a
-  cache miss, never an error, so the checks are strict on purpose. See
-  `IMAGE_CACHE.md` Section 9.
+  turns it off) and reads `weight/` (no baked path) in place. The copy is one
+  parallel local copy into `<model_dir>/.incoming`; the publisher stores
+  non-empty `pages-<N>.img` as checksummed 1 MiB zstd frames
+  (`pages-<N>.img.zst`), which the copy decodes, never writing all-zero frames.
+  Raw skeletons still restore. Every way it declines — an unverified
+  directory, a foreign `model_dir` or uid, a publish that withheld the
+  weights, a recorded size mismatch, a frame that fails its check, any I/O
+  failure — is a cache miss, never an error, so the checks are strict on
+  purpose. See `IMAGE_CACHE.md` Section 9.
 - **A miss fails the job unless it sets `SEMIP_DUMP_PUBLISH=1`.** There is no
   plain-engine fallback. Without the flag `restore_engine` raises, telling
   the user to set `semi_p` to false (or remove it) and resubmit, or to add the
@@ -472,7 +476,7 @@ real GPUs and loads real weights, except `scripts/imgdiff.py` and
 | [`semi-p_DESIGN.md`](semi-p_DESIGN.md) | The `model_dir` layout, what a re-dump touches, what binds an image — and why an image also has a warmth that nothing records |
 | [`async_generate_DETAILS.md`](async_generate_DETAILS.md) | Async generate, IPC protocol, drain points |
 | [`dss_integration.md`](dss_integration.md) | Restoring an image from a DSS sampling job: the cross-repo config contract, the worker hook, the `AsyncLLM` front end |
-| [`IMAGE_CACHE.md`](IMAGE_CACHE.md) | The derived two-hash cache key, the node model-cache pipeline an image rides, how a miss is filled from the mirror, the multi-replica layout (§1), and the 2026-10-03 multi-replica roll with timings (§11) |
+| [`IMAGE_CACHE.md`](IMAGE_CACHE.md) | The derived two-hash cache key, the node model-cache pipeline an image rides, how a miss is filled from the mirror and the compressed skeleton format (§9), the multi-replica layout (§1), and the 2026-10-03 multi-replica roll with timings (§11) |
 | [`INSTALL.md`](INSTALL.md) | CRIU install (PPA and from-source), draft model sync |
 
 ## Related skills
