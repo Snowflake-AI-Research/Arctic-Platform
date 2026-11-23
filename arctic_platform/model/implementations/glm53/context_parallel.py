@@ -357,9 +357,10 @@ def _fused_sparse_mla_backward_available() -> bool:
 
 
 def _use_flashmla(query: torch.Tensor, value_dim: int) -> bool:
-    # Allow Hopper (compute-capability major 9) and datacenter Blackwell (major 10), not SM12x.
+    # Allow Hopper (compute-capability major 9) and datacenter Blackwell (major 10), not SM12x. BF16 query only.
     return (
         _cuda_device_major(query.device) in (9, 10)
+        and query.dtype == torch.bfloat16
         and value_dim == 512
         and query.shape[-1] in (512, 576)
         and flash_mla_available()
@@ -382,7 +383,7 @@ def _select_sparse_mla_backend(requested: str, query: torch.Tensor, key_value: t
         return "flashmla"
     if requested == "flashmla":
         raise RuntimeError(
-            "Requested GLM-5.3 FlashMLA requires an installed kernel and supported Hopper/Blackwell layout"
+            "Requested GLM-5.3 FlashMLA requires an installed kernel, a BF16 query and a Hopper/Blackwell layout"
         )
     return "reference"
 

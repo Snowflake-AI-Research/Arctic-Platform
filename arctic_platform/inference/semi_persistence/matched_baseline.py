@@ -10,6 +10,9 @@ all-reduce workspace and forces CustomAllreduce's copy path while the CUDA
 graphs are captured. Each of those changes a reduction order, so a stock plain
 engine differs from a semi_p one in the last bits of its logits -- enough to
 flip near-tie greedy tokens, and nothing to do with checkpoint or restore.
+The same worker also routes TP all-gathers through CustomAllreduce
+(``ca_all_gather``); a gather is exact either way, but the worker class keeps
+the two engines on the same kernels.
 
 A plain job whose ``extra_env`` sets ``SEMIP_MATCH_COLLECTIVES=1`` gets the
 same setup from ``apply``, so a semi_p job can be compared against it token for
@@ -36,7 +39,10 @@ COLLECTIVE_ENV = {
     "VLLM_ALLREDUCE_USE_FLASHINFER": "0",
 }
 # ... and defaulted, so extra_env can still override it.
-COLLECTIVE_ENV_DEFAULTS = {"SEMIP_SUPPRESS_FI_AR_WORKSPACE": "1"}
+COLLECTIVE_ENV_DEFAULTS = {
+    "SEMIP_SUPPRESS_FI_AR_WORKSPACE": "1",
+    "SEMIP_SUPPRESS_INKLING2_AR_WORKSPACE": "1",
+}
 PASS_CONFIG = {"fuse_allreduce_rms": False}
 WORKER_CLS = "_semip_worker.SemipGPUWorker"
 SEMIP_DIR = os.path.dirname(os.path.abspath(__file__))
