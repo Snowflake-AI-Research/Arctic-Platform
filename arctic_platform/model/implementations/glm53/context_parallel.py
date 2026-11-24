@@ -96,6 +96,14 @@ def _normalize_cu_seqlens(
     return cu_seqlens
 
 
+def _replay_pools(own: torch.Tensor, own_valid: torch.Tensor, sampler: torch.Tensor) -> torch.Tensor:
+    """The sampler's complete, visible pool IDs for each query that captured any, else the trainer's own; -1 unused.
+
+    The chosen IDs then expand through the ordinary indexer path, with its boundaries, visibility and partial tail."""
+    own = own.to(torch.int32).masked_fill(~own_valid, -1)
+    return torch.where((sampler >= 0).any(-1, keepdim=True), sampler, own)
+
+
 def _unpadded_segment_indices(
     indexer: nn.Module,
     query: torch.Tensor,
@@ -103,6 +111,7 @@ def _unpadded_segment_indices(
     segment_states: torch.Tensor,
     query_positions: torch.Tensor,
     output_width: int,
+    replay: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``_select_sparse_indices`` for one segment without padding, minus its dense intermediates.
 
@@ -142,8 +151,13 @@ def _unpadded_segment_indices(
             width,
         )
         chosen = fp8_indexer.topk_indices(scores, min(select_k, width))
+        valid = chosen < visible[:, None]
+        if replay is not None:
+            sampler = replay[start:stop, : chosen.shape[-1]]
+            chosen = _replay_pools(chosen, valid, sampler.masked_fill(sampler >= visible[:, None], -1))
+            valid = chosen >= 0
         tokens = chosen[..., None] * kpool + pool_offsets
-        tokens = tokens.masked_fill((chosen >= visible[:, None])[..., None], -1).flatten(1)
+        tokens = tokens.masked_fill(~valid[..., None], -1).flatten(1)
         pieces = [F.pad(tokens, (0, select_k * kpool - tokens.shape[1]), value=-1)]
         if indexer.index_kpool_always_select_tail:
             seen = query_positions[start:stop] + 1
@@ -165,6 +179,7 @@ def _select_sparse_indices(
     *,
     cp_group,
     cp_rank: int,
+    replay: torch.Tensor | None = None,
 ) -> torch.Tensor:
     batch_size, local_length = hidden_states.shape[:2]
     hidden_shape = (batch_size, local_length, -1, indexer.head_dim)
@@ -217,6 +232,7 @@ def _select_sparse_indices(
                 segment_states,
                 torch.arange(local_start - start, local_end - start, device=hidden_states.device),
                 output_width,
+                replay[segment_queries] if replay is not None else None,
             )
             topk_indices[0, segment_queries] = torch.where(segment_topk >= 0, segment_topk + start, segment_topk)
             continue
@@ -249,6 +265,14 @@ def _select_sparse_indices(
             select_k = min(indexer.index_topk // indexer.index_kpool, index_scores.shape[-1])
             selected = index_scores.topk(select_k, dim=-1).indices
             selected_valid = valid_candidates.gather(-1, selected)
+            if replay is not None:
+                sampler = replay[query_slice, :select_k]
+                safe = sampler.clamp(0, valid_candidates.shape[-1] - 1).long()
+                usable = (sampler < valid_candidates.shape[-1]) & valid_candidates[0].gather(-1, safe)
+                usable &= attention_mask[0, query_slice, None]
+                selected = _replay_pools(selected[0], selected_valid[0], sampler.masked_fill(~usable, -1))
+                selected_valid = (selected >= 0)[None]
+                selected = selected.clamp_min(0)[None]
             selected_indices = pool_indices[batch_idx, selected]
             selected_indices.masked_fill_(
                 ~selected_valid[..., None].expand_as(selected_indices),
@@ -561,6 +585,7 @@ def _sparse_attention_forward(
     attention_mask: torch.Tensor | None,
     past_key_values=None,
     prev_topk_indices: torch.Tensor | None = None,
+    indexer_pools: torch.Tensor | None = None,
     **_kwargs,
 ):
     if past_key_values is not None:
@@ -600,6 +625,9 @@ def _sparse_attention_forward(
                 dtype=torch.int32,
                 device=hidden_states.device,
             )
+        replay = None
+        if indexer_pools is not None:  # one-based pool IDs; zero marks an empty slot
+            replay = indexer_pools[0].to(device=hidden_states.device, dtype=torch.int32) - 1
         topk_indices = _select_sparse_indices(
             self.indexer,
             hidden_states,
@@ -608,6 +636,7 @@ def _sparse_attention_forward(
             global_cu_seqlens,
             cp_group=self._cp_group,
             cp_rank=self._cp_rank,
+            replay=replay,
         )
     elif prev_topk_indices is None:
         raise ValueError("Shared DSA layers require top-k indices from a previous full indexer layer.")

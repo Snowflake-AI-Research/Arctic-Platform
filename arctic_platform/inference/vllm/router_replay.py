@@ -108,4 +108,7 @@ def ensure_router_replay_vllm_patches() -> None:
 
     if getattr(scheduler_mod.check_stop, "_arctic_router_replay_patch", False):
         return
+    from arctic_platform.inference.vllm.glm5next_indexer_replay import ensure_glm5next_indexer_replay
+
+    ensure_glm5next_indexer_replay()
     patch_scheduler_check_stop()
