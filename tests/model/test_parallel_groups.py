@@ -111,3 +111,47 @@ def test_orthogonal_setup_registers_every_replica(monkeypatch):
         ep_size,
     )
     assert ds_groups._EXPERT_DATA_PARALLEL_GROUP_RANKS["ep_size_2"] == [0, 1, 4, 5]
+
+
+def test_register_hf_ulysses_hands_deepspeed_the_text_config(monkeypatch):
+    from deepspeed.runtime.sequence_parallel.ulysses_sp import UlyssesSPAttentionHF
+    from transformers import AutoConfig
+
+    text_config = SimpleNamespace(num_attention_heads=8)
+    vlm_config = SimpleNamespace(get_text_config=lambda: text_config)
+    monkeypatch.setattr(AutoConfig, "from_pretrained", lambda path: vlm_config)
+    calls = []
+    mpu = SimpleNamespace(
+        get_sequence_parallel_group=lambda: "group",
+        get_sequence_parallel_world_size=lambda: 2,
+        get_sequence_parallel_rank=lambda: 1,
+    )
+
+    def register(**kwargs):
+        calls.append(kwargs)
+        return mpu
+
+    monkeypatch.setattr(UlyssesSPAttentionHF, "register_with_transformers", staticmethod(register))
+    groups = parallel_groups.register_hf_ulysses(
+        "some/vlm", core_attn_implementation="flash_attention_2", sp_size=2, micro_batch_size=1
+    )
+    assert groups == SPGroups(mpu, "group", 2, 1)
+    (call,) = calls
+    assert call.pop("model_name_or_path").config is text_config
+    assert call == dict(
+        core_attn_implementation="flash_attention_2",
+        sequence_parallel_size=2,
+        micro_batch_size=1,
+        seq_length_is_variable=True,
+    )
+
+
+def test_register_hf_ulysses_refuses_sp1_and_a_missing_mpu(monkeypatch):
+    from deepspeed.runtime.sequence_parallel.ulysses_sp import UlyssesSPAttentionHF
+
+    holder = SimpleNamespace(config=SimpleNamespace())
+    with pytest.raises(ValueError, match="sp_size > 1"):
+        parallel_groups.register_hf_ulysses(holder, core_attn_implementation="sdpa", sp_size=1, micro_batch_size=1)
+    monkeypatch.setattr(UlyssesSPAttentionHF, "register_with_transformers", staticmethod(lambda **kwargs: None))
+    with pytest.raises(RuntimeError, match="no sequence-parallel MPU"):
+        parallel_groups.register_hf_ulysses(holder, core_attn_implementation="sdpa", sp_size=2, micro_batch_size=1)

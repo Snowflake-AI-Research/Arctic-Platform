@@ -17,12 +17,14 @@
 Sequence parallelism of one registers replicated expert groups only. Above one, this module builds the
 DeepSpeed sequence-parallel model-parallel unit and the expert groups for the orthogonal, node-local,
 decoupled, and host-complete layouts. The caller supplies ``gpus_per_node``; this module does not read
-placement from the environment. The Hugging Face and Liger attention adapter stays with the caller.
+placement from the environment. :func:`register_hf_ulysses` registers DeepSpeed's Hugging Face Ulysses attention
+for sequence parallelism with expert parallelism off; the Liger adapter and Ulysses subclasses stay with the caller.
 """
 
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 from typing import Any
 from typing import NamedTuple
 
@@ -81,6 +83,41 @@ def sp_result(sp_mpu) -> "SPGroups":
         sp_mpu.get_sequence_parallel_world_size(),
         sp_mpu.get_sequence_parallel_rank(),
     )
+
+
+def register_hf_ulysses(
+    model_name_or_path: Any,
+    *,
+    core_attn_implementation: str,
+    sp_size: int,
+    micro_batch_size: int,
+) -> SPGroups:
+    """Register DeepSpeed's ``UlyssesSPAttentionHF`` with transformers and return its sequence-parallel groups.
+
+    ``model_name_or_path`` is a checkpoint path, whose text config gives the head shape (a vision-language
+    config's top level has none), or an object with a ``config``. Prefix sharing supports this registration and
+    refuses subclasses of ``UlyssesSPAttentionHF``.
+    """
+    from deepspeed.runtime.sequence_parallel.ulysses_sp import UlyssesSPAttentionHF
+
+    if sp_size <= 1:
+        raise ValueError(f"Hugging Face Ulysses needs sp_size > 1, got {sp_size}")
+    if isinstance(model_name_or_path, str):
+        from transformers import AutoConfig
+
+        model_name_or_path = SimpleNamespace(config=AutoConfig.from_pretrained(model_name_or_path).get_text_config())
+    provider_mpu = UlyssesSPAttentionHF.register_with_transformers(
+        model_name_or_path=model_name_or_path,
+        core_attn_implementation=core_attn_implementation,
+        sequence_parallel_size=sp_size,
+        micro_batch_size=micro_batch_size,
+        seq_length_is_variable=True,
+    )
+    if provider_mpu is None:
+        raise RuntimeError(
+            f"DeepSpeed UlyssesSPAttentionHF registration returned no sequence-parallel MPU for sp_size={sp_size}"
+        )
+    return sp_result(provider_mpu)
 
 
 def setup_parallel_groups(
