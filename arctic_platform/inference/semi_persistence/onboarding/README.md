@@ -224,7 +224,7 @@ one that waits for the nodes to verify the image. Then onboard the models with
 python -m arctic_platform.inference.semi_persistence.onboarding.semip_job cluster=qa6 \
     image_tag=release_20261119_163502_6ed8c6d2361-h max_gpus=16 tests=functional,correctness \
     configs=https://github.com/OWNER/cortex-training/blob/REF/model-catalog/semip_models/jobs.jsonl \
-    connection=qa6.config [dry_run=true] [env_hash=ENV12] [show_all=false] [out_dir=semip_job]
+    connection=qa6.config [dry_run=true] [show_all=false] [out_dir=semip_job]
 ```
 
 `cluster` (`qa6` or `prod`) sets `model_bucket` and the kubeconfig context the
@@ -247,12 +247,37 @@ replays dss, `ModelConfig`, the worker and the engine; `tests/test_keys.py`
 holds it to published keys). With `kubectl` able to reach the cluster's context,
 the node labels are read once, and `existing` lists each env12 with a skeleton
 of that model and cfg12 and on how many model-cache nodes it is verified
-(`fc37441c0c: 16/16 nodes`), or `none` when publish would dump. Pass
-`env_hash=` (the image's env12) to mark which one is this image's
-(`exists` / `exists for another image`); without it the env is unconfirmed.
+(`fc37441c0c: 16/16 nodes`), or `none` when publish would dump, and each is
+marked `exists` (this image's) or `exists for another image`.
 The plan ends with `skeletons: X will restore (all nodes), Y exist but not on
 all nodes, Z will dump`. Without `kubectl` (as in Jenkins today) the lookup is
-skipped with a note. Two things stay `?`: a job that names no
+skipped with a note.
+
+This image's env12 is derived from the same `get nodes` read, as the engine
+computes it: `sha256(<digest hex> + <driver>)[:12]`. The digest is the one the
+nodes' `status.images` list next to a name ending in `:<image_tag>` (any
+registry). A tag listed with several digests (it was moved) gives one env12
+candidate per digest, all counted as this image's, with a warning. A tag no
+node lists means no skeleton of the image can be on the cluster, so every job
+is `none (will dump; image not pulled on any node yet)`. The driver is read
+from GPU Feature Discovery labels (`nvidia.com/cuda.driver-version.full` or its
+parts) on the model-cache nodes. Neither QA6 nor prod has those labels today,
+and nothing else readable without write access names the driver: node labels,
+annotations and `nodeInfo` do not, and the logs of the NVIDIA device plugin, the
+DCGM exporter, its metrics collector, and the model cache never print it.
+Without a source, `DEFAULT_DRIVER_VERSION` (`580.159.03`, the H200 driver both
+clusters run) is assumed, and the plan warns. A skeleton label that carries the
+derived env12 confirms the driver. The plan's `env` line and `plan.json`'s `env`
+record the digests, the driver, its source and the confirmation:
+
+```
+env         fc37441c0c27 (digest a544c618585e from node images, driver 580.159.03 from DEFAULT_DRIVER_VERSION (assumed); a skeleton label carries it)
+```
+
+When the H200 driver changes, update `DEFAULT_DRIVER_VERSION`. Until then the
+warning says that no skeleton label confirms the env12.
+
+Two things stay `?`: a job that names no
 `reasoning_parser` gets one chat picks by the checkpoint's architecture, which
 only a matching label reveals, and labels cut by the 63-character limit before
 cfg12 (long model names such as `NVIDIA-Nemotron-3-Nano-30B-A3B-BF16`) cannot
@@ -262,10 +287,10 @@ That full lookup is only for the official catalog: `snowflakedb/cortex-training`
 at `main`, or at a commit on main (GitHub's compare API with main says
 `identical` or `ahead`; if the API fails, the list is not official). Any other
 list (a fork, a branch off main) is restricted so that it cannot reveal other
-users' dumps: with `env_hash=` each job gets only its own key under that env12,
+users' dumps: each job gets only its own key under this image's env12,
 `exists: N/M nodes` or `none (will dump)`, and nothing about other images,
-labels or reasoning_parser candidates; without `env_hash=` the node labels are
-not read (`not checked: pass env_hash= for this image`). The plan's
+labels or reasoning_parser candidates; without `kubectl` it says
+`not checked: <reason>`. `env_hash=` is no longer taken. The plan's
 `visibility` line and `plan.json` say which applies and why. `show_all=true`
 is for admins: it forces the full output for any list and is logged; it only
 changes what is printed, not who can read the node labels.

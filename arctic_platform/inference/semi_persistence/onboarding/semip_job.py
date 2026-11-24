@@ -18,7 +18,7 @@
     python -m arctic_platform.inference.semi_persistence.onboarding.semip_job \\
         cluster=qa6|prod image_tag=TAG configs=URL max_gpus=N \\
         [tests=functional,correctness,performance] [dry_run=false] [out_dir=semip_job] \\
-        [connection=CONN.json] [kube_context=CTX] [env_hash=ENV12] [show_all=false]
+        [connection=CONN.json] [kube_context=CTX] [show_all=false]
 
 The driver behind the semip-publish Jenkins job; it runs the same anywhere.
 
@@ -41,8 +41,6 @@ The driver behind the semip-publish Jenkins job; it runs the same anywhere.
   connection   Cortex Training connection file (default $SEMIP_CONNECTION_QA6 /
                $SEMIP_CONNECTION_PROD for the cluster, else $SEMIP_CONNECTION)
   kube_context default: the cluster's
-  env_hash     dry run only: the env12 that image_tag's skeleton keys carry, to
-               tell a skeleton of this image from one of another
   show_all     dry run only, for admins: report the full skeleton lookup for any
                list (default false); it changes what is printed, not access
 
@@ -70,20 +68,31 @@ requested test failed, or a config's tests could not run (they need more than
 which cancel their jobs.
 
 A dry run also computes each job's cfg12 offline (``keys``) and, when kubectl
-reaches the cluster's context, reads the node labels once to report which of
-those skeletons the model-cache nodes have verified: per env12, on how many of
-them. ``existing`` is ``none`` when publish would dump; with ``env_hash`` a
-skeleton is marked as this image's or another image's, and without it the env
-is unconfirmed. Without kubectl the lookup is skipped with a note.
+reaches the cluster's context, reads the nodes once (``kubectl get nodes``) to
+report which of those skeletons the model-cache nodes have verified: per env12,
+on how many of them. ``existing`` is ``none`` when publish would dump.
+
+The same read gives this image's env12, ``sha256(<digest hex> + <driver>)[:12]``
+as the engine computes it. The digest is the one the nodes list for
+``image_tag`` (any registry); a tag listed with several digests (tags can move)
+gives one env12 candidate each, and the plan says so. A tag no node lists means
+no skeleton of the image can be on the cluster: every job will dump. The driver
+comes from the model-cache nodes' GPU Feature Discovery labels when present;
+neither cluster has them today, nor any other read-only source of it (node
+annotations and ``nodeInfo``, the device plugin's, DCGM exporter's and model
+cache's logs), so ``DEFAULT_DRIVER_VERSION`` is assumed with a warning. Either
+way a skeleton label carrying the env12 confirms it. ``env`` in the plan holds
+the digests, the driver, its source and the env12s.
 
 That full lookup is for the official catalog only: configs in
 snowflakedb/cortex-training at ``main`` or at a commit on main (GitHub's compare
 API says main is ``identical`` or ``ahead``; if it cannot be asked, the list is
-not official). Any other list is restricted, so it cannot show other users'
-dumps: with ``env_hash`` each job gets only its own skeleton under that env12
-(``exists: N/M nodes`` or ``none (will dump)``), without it the node labels are
-not read. ``visibility`` in the plan says which, and ``show_all=true`` forces
-the full lookup.
+not official). There each skeleton is marked as this image's or another
+image's. Any other list is restricted, so it cannot show other users' dumps:
+each job gets only its own skeleton under this image's env12 (``exists: N/M
+nodes`` or ``none (will dump)``), and nothing about other images or labels.
+Without kubectl either lookup is skipped with a note. ``visibility`` in the
+plan says which, and ``show_all=true`` forces the full lookup.
 """
 
 from __future__ import annotations
@@ -143,10 +152,12 @@ CONFIGS_DIR = "model-catalog/semip_models/"
 OFFICIAL_OWNER = "snowflakedb"
 OFFICIAL_BRANCH = "main"
 COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
-ENV_HASH = re.compile(r"^[0-9a-f]{12}$")
 PUBLISHED = ("published", "already")
-# An env12 shown only this far is taken as env_hash's when no weight hash can confirm it.
+# An env12 shown only this far is taken as this image's when no weight hash can confirm it.
 ENV_PREFIX_CHARS = 6
+# The H200 driver both clusters run (publish logs); assumed when no cluster source names it.
+DEFAULT_DRIVER_VERSION = "580.159.03"
+NOT_PULLED = "none (will dump; image not pulled on any node yet)"
 
 
 @dataclass(frozen=True)
@@ -188,14 +199,6 @@ def parse_max_gpus(value: str | None) -> int:
     if not re.fullmatch(r"[1-9][0-9]*", (value or "").strip()):
         raise SystemExit(f"max_gpus= must be a positive integer, got {value!r}")
     return int(value)
-
-
-def parse_env_hash(value: str | None) -> str | None:
-    if not value:
-        return None
-    if not ENV_HASH.match(value):
-        raise SystemExit(f"env_hash= must be the 12 lowercase hex digits of a skeleton key's env12, got {value!r}")
-    return value
 
 
 def parse_tests(value: str | None) -> list[str]:
@@ -371,37 +374,75 @@ def env_text(found: keys.Found) -> str:
     return f"{found.env}.." if found.env else "env ?"
 
 
-def match_of(found: keys.Found, env_hash: str | None, weights_known: bool) -> str:
-    """Whether a skeleton is image ``env_hash``'s: ``exists``, ``exists for another image``,
-    ``unconfirmed`` (its label shows too little of env12), or ``env unconfirmed`` (no env_hash)."""
-    if not env_hash:
-        return "env unconfirmed"
-    if found.env_exact or not env_hash.startswith(found.env):
-        return "exists" if found.env == env_hash else "exists for another image"
+def derive_env(items: list[dict], image_tag: str, cache: keys.NodeCache) -> dict:
+    """This image's env12 candidates from one ``get nodes`` read: the digests the nodes list
+    for ``image_tag``, the driver (node labels, else ``DEFAULT_DRIVER_VERSION``), and whether
+    the skeleton labels in ``cache`` show each env12. Recorded as ``plan["env"]``."""
+    digests = keys.image_digests(items, image_tag)
+    drivers, label = keys.node_drivers(items)
+    if drivers:
+        source, assumed = f"node label {label}", False
+    else:
+        drivers, source, assumed = {DEFAULT_DRIVER_VERSION: 0}, "DEFAULT_DRIVER_VERSION", True
+    candidates = {keys.env_hash(d, v): {"digest": d, "driver": v} for d in digests for v in drivers}
+    for env, inputs in candidates.items():
+        inputs["confirmed"] = cache.shows_env(env, ENV_PREFIX_CHARS)
+    return {"derived": True, "image_tag": image_tag, "digests": digests, "drivers": drivers,
+            "driver_source": source, "driver_assumed": assumed, "env12": list(candidates),
+            "candidates": candidates, "ambiguous": len(candidates) > 1, "pulled": bool(digests)}
+
+
+def env_warnings(env: dict) -> list[str]:
+    if not env.get("pulled"):
+        return []
+    out = []
+    if len(env["digests"]) > 1:
+        out.append(f"{env['image_tag']} is listed with {len(env['digests'])} digests across the nodes (tags can "
+                   "move): " + ", ".join(f"{d[:12]} on {n} node(s)" for d, n in env["digests"].items())
+                   + f"; a skeleton under any of their env12s ({', '.join(env['env12'])}) counts as this image's")
+    if len(env["drivers"]) > 1:
+        out.append(f"the model-cache nodes' {env['driver_source']} names {len(env['drivers'])} drivers: "
+                   + ", ".join(f"{v} on {n} node(s)" for v, n in env["drivers"].items())
+                   + "; each gives an env12 candidate")
+    if env["driver_assumed"]:
+        whole = [e for e, c in env["candidates"].items() if c["confirmed"] == "whole"]
+        start = [e for e, c in env["candidates"].items() if c["confirmed"] == "start"]
+        why = (f"a skeleton label on the nodes carries the env12 it gives ({', '.join(whole)})" if whole
+               else f"a cut skeleton label on the nodes shows the start of the env12 it gives ({', '.join(start)})"
+               if start else f"no skeleton label confirms env12 {', '.join(env['env12'])}, so if the nodes run "
+                             "another driver this image's skeletons are reported missing")
+        out.append(f"GPU driver assumed to be {DEFAULT_DRIVER_VERSION} (DEFAULT_DRIVER_VERSION): no read-only "
+                   f"cluster source names it; {why}")
+    return out
+
+
+def match_of(found: keys.Found, envs: set[str], weights_known: bool) -> str:
+    """Whether a skeleton is this image's (env12 in ``envs``): ``exists``, ``exists for
+    another image`` or ``unconfirmed`` (its label shows too little of env12)."""
+    if found.env in envs:
+        return "exists"
+    if found.env_exact or not any(e.startswith(found.env) for e in envs):
+        return "exists for another image"
     if weights_known:
-        # The label was checked against env_hash with every weight hash shown on the nodes.
+        # The label was checked against envs with every weight hash shown on the nodes.
         return "exists for another image"
     return "exists" if len(found.env) >= ENV_PREFIX_CHARS else "unconfirmed"
 
 
-def own_nodes(cache: keys.NodeCache, slug: str, cfg12: str, env_hash: str) -> int:
-    """On how many nodes image ``env_hash``'s skeleton of ``slug`` with ``cfg12`` is verified."""
+def own_nodes(cache: keys.NodeCache, slug: str, cfg12: str, envs: set[str]) -> tuple[int, str | None, bool]:
+    """On how many nodes this image's skeleton of ``slug`` with ``cfg12`` is verified, its env12,
+    and whether a label of that cfg12 is cut too short to tell if it is this image's."""
     weights_known = bool(cache.weights(slug))
-    return max((f.nodes for f in cache.lookup(slug, cfg12).found
-                if match_of(f, env_hash, weights_known) == "exists"), default=0)
+    result = cache.lookup(slug, cfg12)
+    matches = [(f, match_of(f, envs, weights_known)) for f in result.found]
+    best = max(((f.nodes, f.env) for f, m in matches if m == "exists"), default=(0, None))
+    env = next((e for e in sorted(envs) if best[1] is not None and e.startswith(best[1])), None)
+    return best[0], env, bool(result.unreadable) or any(m == "unconfirmed" for _, m in matches)
 
 
-def confirmable(cache: keys.NodeCache, slug: str) -> bool:
-    """Whether a missing skeleton of ``slug`` means none, rather than labels cut too short to tell:
-    the node labels show its weight hash, or enough of every env12."""
-    return bool(cache.weights(slug)) or keys.label_shows(slug)[1] >= ENV_PREFIX_CHARS
-
-
-def skeleton_status(found: list[keys.Found], matches: list[str], nodes: int, env_hash: str | None) -> str:
-    """``restore`` (this image's skeleton is on every node), ``partial``, ``dump`` or
-    ``unknown``; without ``env_hash`` any env counts as this image's."""
-    targets = [f for f, m in zip(found, matches) if m in ("exists", "env unconfirmed")]
-    best = max((f.nodes for f in targets), default=0)
+def skeleton_status(found: list[keys.Found], matches: list[str], nodes: int) -> str:
+    """``restore`` (this image's skeleton is on every node), ``partial``, ``dump`` or ``unknown``."""
+    best = max((f.nodes for f, m in zip(found, matches) if m == "exists"), default=0)
     if nodes and best == nodes:
         return "restore"
     if best:
@@ -409,15 +450,12 @@ def skeleton_status(found: list[keys.Found], matches: list[str], nodes: int, env
     return "unknown" if "unconfirmed" in matches else "dump"
 
 
-def existing_text(found: list[keys.Found], nodes: int, env_hash: str | None, matches: list[str]) -> str:
+def existing_text(found: list[keys.Found], nodes: int, matches: list[str], pulled: bool = True) -> str:
     if not found:
-        return "none"
-    if not env_hash:
-        parts = [f"{env_text(f)}: {f.nodes}/{nodes} nodes" for f in found]
-        return ", ".join(parts) + (" (env unconfirmed)" if len(found) == 1 else "")
+        return "none" if pulled else NOT_PULLED
     mine = [f"{env_text(f)}: {f.nodes}/{nodes} nodes ({m})" for f, m in zip(found, matches) if m != "exists for another image"]
     other = [f"{env_text(f)} {f.nodes}/{nodes}" for f, m in zip(found, matches) if m == "exists for another image"]
-    parts = [", ".join(mine)] if mine else []
+    parts = [", ".join(mine)] if mine else ([] if pulled else [NOT_PULLED])
     if other:
         parts.append(f"exists for another image: {', '.join(other)}")
     return "; ".join(parts)
@@ -431,7 +469,9 @@ class SemipJob:
         self.tests = parse_tests(args.get("tests"))
         self.dry_run = as_bool(args.get("dry_run") or "false")
         self.configs = parse_configs_url(args.get("configs"))
-        self.env_hash = parse_env_hash(args.get("env_hash"))
+        if "env_hash" in args:
+            raise SystemExit("env_hash= is no longer taken: the dry run derives this image's env12 from the digest "
+                             "the nodes list for image_tag and the GPU driver; drop the argument")
         self.show_all = as_bool(args.get("show_all") or "false")
         self.nodes = nodes or cluster_nodes
         self.kube_context = args.get("kube_context") or CLUSTERS[self.cluster].kube_context
@@ -445,6 +485,7 @@ class SemipJob:
         self.get = get
         self.options = onboard_options(self.tests)
         self.warnings: list[str] = []
+        self.envs: set[str] = set()
 
     def fetch(self) -> list[ModelSpec]:
         """Resolve and fetch the configs, record where they came from, parse every line."""
@@ -507,7 +548,9 @@ class SemipJob:
                 logger.warning("show_all=true (admin override): reporting every skeleton the node cache has "
                                "for these jobs, of any image")
             full = official or self.show_all
-            skeletons = self.skeletons(specs, plan) if full else self.own_skeletons(specs, plan)
+            cache, note = self.node_cache(plan)
+            lookup = self.skeletons if full else self.own_skeletons
+            skeletons = lookup(specs, plan, cache, note)
         for s in specs:
             entry = {"name": s.name, "line": line_number(s), "model_name": s.sub_job.get("model_name"),
                      "max_seq_len": s.max_seq_len, "n_gpus": s.n_gpus, "tensor_parallel_size": s.tensor_parallel_size}
@@ -524,16 +567,30 @@ class SemipJob:
             logger.info("%s", line)
         return plan
 
-    def skeletons(self, specs: list[ModelSpec], plan: dict) -> dict[str, dict]:
-        """Each job's cfg12 and the skeletons the node cache verified for it, by job;
-        sets ``plan["node_cache"]``. Reads the node labels once, if kubectl can."""
-        keyings = {s.name: keys.keying(s.sub_job, json.loads(self.lines[s.name]).get("hardware")) for s in specs}
+    def node_cache(self, plan: dict) -> tuple[keys.NodeCache | None, str | None]:
+        """Read the nodes once, if kubectl can; derive this image's env12s from them into
+        ``plan["env"]`` and ``self.envs``, and return the node cache keyed with them (or the
+        note why there is none)."""
         try:
-            cache = keys.NodeCache(self.nodes(self.kube_context), self.env_hash)
-            note = None
+            items = self.nodes(self.kube_context)
         except NodesUnavailable as exc:
-            cache, note = None, f"not checked: {exc}"
+            note = f"not checked: {exc}"
             logger.info("node cache %s", note)
+            plan["env"] = {"derived": False, "image_tag": self.image_tag, "note": note}
+            return None, note
+        env = derive_env(items, self.image_tag, keys.NodeCache(items))
+        plan["env"] = env
+        self.warnings.extend(env_warnings(env))
+        self.envs = set(env["env12"])
+        logger.info("env %s", env_text_line(env))
+        return keys.NodeCache(items, env["env12"]), None
+
+    def skeletons(self, specs: list[ModelSpec], plan: dict, cache: keys.NodeCache | None,
+                  note: str | None) -> dict[str, dict]:
+        """Each job's cfg12 and the skeletons the node cache verified for it, by job;
+        sets ``plan["node_cache"]``."""
+        keyings = {s.name: keys.keying(s.sub_job, json.loads(self.lines[s.name]).get("hardware")) for s in specs}
+        pulled = bool(plan["env"].get("pulled"))
         lookups: dict[str, dict] = {}
         chosen: dict[str, set] = {}
         for s in specs:
@@ -573,16 +630,18 @@ class SemipJob:
             found = [f for result in lk.values() for f in result.found]
             unreadable = max((result.unreadable for result in lk.values()), default=0)
             weights_known = bool(cache.weights(k.slug))
-            pairs = sorted(((f, match_of(f, self.env_hash, weights_known)) for f in found),
+            pairs = sorted(((f, match_of(f, self.envs, weights_known)) for f in found),
                            key=lambda p: (p[1] != "exists", -p[0].nodes, p[0].env))
             found, matches = [f for f, _ in pairs], [m for _, m in pairs]
-            status = skeleton_status(found, matches, cache.nodes, self.env_hash)
-            if k.reason:
+            status = skeleton_status(found, matches, cache.nodes)
+            if not pulled:
+                text = existing_text(found, cache.nodes, matches, pulled=False)
+            elif k.reason:
                 status, text = "unknown", f"? ({k.reason})"
             elif not found and unreadable:
                 status, text = "unknown", f"? ({unreadable} skeleton label(s) of {k.slug} cut before cfg12)"
             else:
-                text = existing_text(found, cache.nodes, self.env_hash, matches)
+                text = existing_text(found, cache.nodes, matches)
             counts[status] += 1
             counts["other_image"] += status == "dump" and "exists for another image" in matches
             entry.update(skeleton=status, existing_text=text,
@@ -590,31 +649,26 @@ class SemipJob:
                                     "match": m} for f, m in zip(found, matches)])
             out[s.name] = entry
         plan["node_cache"] = {"checked": cache is not None, "note": note, "kube_context": self.kube_context,
-                              "env_hash": self.env_hash, "nodes": cache.nodes if cache else None,
+                              "nodes": cache.nodes if cache else None, "pulled": pulled,
                               "env_candidates": sorted(cache.envs) if cache else [],
                               "summary": counts if cache else None}
         return out
 
-    def own_skeletons(self, specs: list[ModelSpec], plan: dict) -> dict[str, dict]:
+    def own_skeletons(self, specs: list[ModelSpec], plan: dict, cache: keys.NodeCache | None,
+                      note: str | None) -> dict[str, dict]:
         """``skeletons`` for a list that is not the official catalog: only each job's own
-        skeleton under ``env_hash``, and without ``env_hash`` no node labels at all. Nothing
-        about other images, other cfg12 candidates or other labels is reported."""
+        skeleton under this image's env12. Nothing about other images, other cfg12
+        candidates or other labels is reported."""
         keyings = {s.name: keys.keying(s.sub_job, json.loads(self.lines[s.name]).get("hardware")) for s in specs}
-        cache, note = None, "not checked: restricted list, the lookup needs env_hash= for this image"
-        if self.env_hash:
-            try:
-                cache, note = keys.NodeCache(self.nodes(self.kube_context), self.env_hash), None
-            except NodesUnavailable as exc:
-                note = f"not checked: {exc}"
-        if note:
-            logger.info("node cache %s", note)
+        pulled = bool(plan["env"].get("pulled"))
         hits: dict[str, dict] = {}
         chosen: dict[str, set] = {}
         for s in specs:
             k = keyings[s.name]
             cfgs = {k.reasoning_parser: k.cfg12} if k.cfg12 else k.candidates
-            hits[s.name] = {r: own_nodes(cache, k.slug, c, self.env_hash) for r, c in cfgs.items()} if cache else {}
-            hit = [r for r, n in hits[s.name].items() if n]
+            hits[s.name] = ({r: own_nodes(cache, k.slug, c, self.envs) for r, c in cfgs.items()}
+                            if cache and pulled else {})
+            hit = [r for r, (n, _, _) in hits[s.name].items() if n]
             if not k.cfg12 and len(hit) == 1:
                 chosen.setdefault(s.sub_job.get("model_name"), set()).add(hit[0])
         reasoner = {m: next(iter(rs)) for m, rs in chosen.items() if len(rs) == 1}
@@ -637,29 +691,30 @@ class SemipJob:
                     entry["cfg12_note"] = ("the job names no reasoning_parser, so cfg12 depends on the one chat "
                                            "pairs with the checkpoint's architecture; "
                                            + ("no candidate's skeleton exists for this image" if cache
-                                              else "with env_hash= the node labels tell which"))
+                                              else "the node labels tell which"))
             if cache is None:
-                text = "not checked: pass env_hash= for this image" if not self.env_hash else "not checked"
-                entry.update(skeleton="not checked", existing=[], existing_text=text)
+                entry.update(skeleton="not checked", existing=[], existing_text=note)
                 out[s.name] = entry
                 continue
-            nodes = max(mine.values(), default=0)
-            if k.reason:
+            nodes, env, _ = max(mine.values(), key=lambda hit: hit[0], default=(0, None, False))
+            if not pulled:
+                status, text = "dump", NOT_PULLED
+            elif k.reason:
                 status, text = "unknown", f"? ({k.reason})"
             elif nodes:
                 status, text = "restore" if nodes == cache.nodes else "partial", f"exists: {nodes}/{cache.nodes} nodes"
-            elif not confirmable(cache, k.slug):
+            elif any(doubtful for _, _, doubtful in mine.values()):
                 status, text = "unknown", f"? (labels of {k.slug} are cut too short to confirm this image's skeleton)"
             else:
                 status, text = "dump", "none (will dump)"
             counts[status] += 1
             entry.update(skeleton=status, existing_text=text,
-                         existing=[{"env": self.env_hash, "nodes": nodes, "of": cache.nodes, "match": "exists"}]
+                         existing=[{"env": env, "nodes": nodes, "of": cache.nodes, "match": "exists"}]
                          if nodes else [])
             out[s.name] = entry
         plan["node_cache"] = {"checked": cache is not None, "restricted": True, "note": note,
-                              "kube_context": self.kube_context, "env_hash": self.env_hash,
-                              "nodes": cache.nodes if cache else None, "summary": counts if cache else None}
+                              "kube_context": self.kube_context, "nodes": cache.nodes if cache else None,
+                              "pulled": pulled, "summary": counts if cache else None}
         return out
 
     def run(self, specs: list[ModelSpec], run_child: Callable | None = None) -> int:
@@ -727,8 +782,9 @@ def plan_text(plan: dict) -> str:
         lines.append(f"visibility  {vis['reason']}" + ("; show_all=true (admin override)" if vis["show_all"] else ""))
     cache = plan.get("node_cache")
     if cache:
-        lines.append("node cache  " + (cache["note"] or f"{cache['nodes']} model-cache node(s) on {cache['kube_context']}, "
-                                       + (f"env_hash {cache['env_hash']}" if cache["env_hash"] else "no env_hash")))
+        lines.append(f"env         {env_text_line(plan['env'])}")
+        lines.append("node cache  " + (cache["note"]
+                                       or f"{cache['nodes']} model-cache node(s) on {cache['kube_context']}"))
     lines += [
         "",
         "| line | job | model_name | max_seq_len | n_gpus | TP |" + (" cfg12 | existing |" if cache else "")
@@ -764,7 +820,23 @@ def skeleton_summary(cache: dict) -> str:
         text += f" ({counts['other_image']} of them exist for another image)"
     if counts["unknown"]:
         text += f", {counts['unknown']} unknown"
-    return text + ("" if cache["env_hash"] else " (env unconfirmed: pass env_hash= to match this image)")
+    if not cache["pulled"]:
+        text += " (image not pulled on any node yet, so no skeleton of it is on the cluster)"
+    return text
+
+
+def env_text_line(env: dict) -> str:
+    """The plan header's ``env`` line: this image's env12(s) and where their inputs came from."""
+    if not env.get("derived"):
+        return f"not derived ({env['note'].removeprefix('not checked: ')})"
+    if not env["pulled"]:
+        return f"none: {env['image_tag']} is not pulled on any node yet, so no skeleton of it can be on the cluster"
+    how = {"whole": "a skeleton label carries it", "start": "a cut skeleton label shows its start",
+           None: "no skeleton label shows it"}
+    source = "DEFAULT_DRIVER_VERSION (assumed)" if env["driver_assumed"] else env["driver_source"]
+    parts = [f"{e} (digest {c['digest'][:12]} from node images, driver {c['driver']} from {source}; "
+             f"{how[c['confirmed']]})" for e, c in env["candidates"].items()]
+    return parts[0] if len(parts) == 1 else f"ambiguous, any of {len(parts)}: " + "; ".join(parts)
 
 
 def onboard_reports(out_dir: Path, since: str) -> dict[str, dict]:

@@ -206,6 +206,21 @@ def _node(*segments, value="ready", **other):
     return {"metadata": {"name": "n", "labels": {**labels, **other}}}
 
 
+TAG = "release_20261119_163502_6ed8c6d2361-h"
+OLD_TAG = "release_20261115_163548_99d52631769-h"
+# The digests QA6's nodes list for TAG and OLD_TAG; with driver 580.159.03 they give ENV and OLD.
+DIGEST = "a544c618585e5f020aef245387f5f6ec4206d696a4c6e3ca8787fee8d9aa3358"
+OLD_DIGEST = "437137899d34d1b7603dae5017be5fd422ac658d77db8475b0e18b40e926566d"
+QA6_REPO = "937559181915.dkr.ecr.us-west-2.amazonaws.com/neutrino/dss-backend"
+
+
+def _pulled(node, *images, repo=QA6_REPO):
+    """``node`` listing each ``(tag, digest)`` image the way kubelet reports it in status.images."""
+    listed = [{"names": [f"{repo}@sha256:{digest}", f"{repo}:{tag}"], "sizeBytes": 9252435633}
+              for tag, digest in images]
+    return {**node, "status": {"images": [*(node.get("status") or {}).get("images", []), *listed]}}
+
+
 def _label(slug, key, kind="skeleton"):
     return keys._publisher().sanitize_label_segment(f"image-cache/{slug}/{kind}/{key}")
 
@@ -214,9 +229,15 @@ QWEN, DS, INK, NEMO = "Qwen3-0.6B", "DeepSeek-V4.1-Flash-1017", "Inkling-2-Small
 ENV, OLD = "fc37441c0c27", "263a697cd91b"
 
 
-def _cluster():
-    """Four cache nodes and one without model labels. Every env12 is cut from the skeleton
-    labels below, except OLD's on GLM-5.3, so the others are confirmed through their digests."""
+def _cluster(images=((TAG, DIGEST), (OLD_TAG, OLD_DIGEST))):
+    """Four cache nodes and one without model labels; the first two list ``images``. Every
+    env12 is cut from the skeleton labels below, except on GLM-5.3, so the others are
+    confirmed through their weight hashes."""
+    nodes = _labelled_cluster()
+    return [_pulled(n, *images) if i < 2 else n for i, n in enumerate(nodes)]
+
+
+def _labelled_cluster():
     common = [_label(QWEN, "4aa63a1e185a", "weight"), _label(DS, "4008d4360385", "weight"),
               _label(INK, "1b4fc9b3215d", "weight"),
               _label("GLM-5.3", f"44c0d7a2a3c1_{OLD}_c65f56541db7"), _label("GLM-5.3", f"44c0d7a2a3c1_{ENV}_c65f56541db7")]
@@ -243,7 +264,51 @@ def test_lookup_confirms_cut_labels_and_counts_nodes():
     assert [(f.env, f.env_exact, f.nodes) for f in ink.found] == [("", False, 4)]
     nemo = cache.lookup(NEMO, "876cb6ac4a4f")
     assert nemo.found == [] and nemo.unreadable == 1
-    assert keys.NodeCache(_cluster(), env_hash="9" * 12).lookup(INK, "ef8257249a3c").found[0].env == "9" * 12
+    assert keys.NodeCache(_cluster(), envs=["9" * 12]).lookup(INK, "ef8257249a3c").found[0].env == "9" * 12
+    assert cache.shows_env(ENV, 6) == "whole" and cache.shows_env("9" * 12, 6) is None
+
+
+def test_env_hash_matches_the_engine_source_and_the_published_keys():
+    engine = _source(SERVER / "semip_engine.py", "_HASH_LEN", "_NVIDIA_VERSION_PROC", "_NVRM_VERSION_RE",
+                     "_driver_version", "_env_hash")
+    engine["_pod_image_ref"] = lambda: f"{QA6_REPO}@sha256:{DIGEST}"
+    engine["_read_text"] = lambda path: ("NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  580.159.03  "
+                                         "Release Build  (dvs-builder@U22-I3-AF03-09-1)  Thu Oct 16 2025")
+    assert engine["_env_hash"]() == (ENV, f"{QA6_REPO}@sha256:{DIGEST}", "580.159.03")
+    assert engine["_NVRM_VERSION_RE"].pattern.endswith(f"({keys.DRIVER_VERSION.pattern})")
+    assert keys.env_hash(DIGEST, "580.159.03") == ENV and keys.env_hash(OLD_DIGEST, "580.159.03") == OLD
+    assert semip_job.DEFAULT_DRIVER_VERSION == "580.159.03"
+
+
+def test_image_digests_come_from_the_tag_under_any_registry():
+    prod = "686874466970.dkr.ecr.us-west-2.amazonaws.com/neutrino/dss-backend"
+    nodes = [_pulled(_node(), (TAG, DIGEST), (OLD_TAG, OLD_DIGEST)), _pulled(_node(), (TAG, DIGEST), repo=prod),
+             _pulled(_node(), (TAG, "b" * 64)), _pulled(_node(), (TAG + "x", "c" * 64)), _node(),
+             {"metadata": {}, "status": {"images": [{"names": [f"{QA6_REPO}:{TAG}"]}]}}]
+    assert keys.image_digests(nodes, TAG) == {DIGEST: 2, "b" * 64: 1}
+    assert keys.image_digests(nodes, OLD_TAG) == {OLD_DIGEST: 1}
+    assert keys.image_digests(nodes, "release_20260101_000000_0123456789a-h") == {}
+
+
+@pytest.mark.parametrize("labels,want", [
+    ({"nvidia.com/cuda.driver-version.full": "580.159.03"}, ("580.159.03", "nvidia.com/cuda.driver-version.full")),
+    ({"nvidia.com/cuda.driver-version.major": "580", "nvidia.com/cuda.driver-version.minor": "159",
+      "nvidia.com/cuda.driver-version.revision": "03"}, ("580.159.03", "nvidia.com/cuda.driver-version.*")),
+    ({"nvidia.com/cuda.driver.major": "570", "nvidia.com/cuda.driver.minor": "86", "nvidia.com/cuda.driver.rev": ""},
+     ("570.86", "nvidia.com/cuda.driver.*")),
+    ({"nvidia.com/cuda.driver-version.full": "garbage"}, None),
+    ({"nvidia.com/gpu.product": "NVIDIA-H200"}, None),
+])
+def test_a_node_driver_comes_from_gpu_feature_discovery_labels(labels, want):
+    assert keys.node_driver(labels) == want
+
+
+def test_node_drivers_counts_model_cache_nodes_only():
+    gfd = {"nvidia.com/cuda.driver-version.full": "580.159.03"}
+    nodes = [_node("m", **gfd), _node("m", **gfd), _node("m", **{"nvidia.com/cuda.driver-version.full": "570.1.2"}),
+             {"metadata": {"labels": {**gfd, "workergroup": "cpu"}}}, {"metadata": {"labels": {"x": "1"}}}]
+    assert keys.node_drivers(nodes) == ({"580.159.03": 2, "570.1.2": 1}, "nvidia.com/cuda.driver-version.full")
+    assert keys.node_drivers(_cluster()) == ({}, None)
 
 
 def test_an_uncut_label_is_read_as_is():
@@ -284,8 +349,20 @@ def _dry_run(tmp_path, monkeypatch, nodes, configs=OFFICIAL, **extra):
     return json.loads((tmp_path / "out" / "plan.json").read_text()), (tmp_path / "out" / "plan.txt").read_text()
 
 
+ENV_LINE = (f"env         {ENV} (digest a544c618585e from node images, driver 580.159.03 from "
+            "DEFAULT_DRIVER_VERSION (assumed); a skeleton label carries it)\n")
+
+
 def test_a_dry_run_reports_existing_skeletons_for_this_image(tmp_path, monkeypatch):
-    plan, text = _dry_run(tmp_path, monkeypatch, lambda ctx: _cluster(), env_hash=ENV)
+    plan, text = _dry_run(tmp_path, monkeypatch, lambda ctx: _cluster())
+    assert ENV_LINE in text and "node cache  4 model-cache node(s) on sfc-or-dev-meta-k8s-2\n" in text
+    env = plan["env"]
+    assert (env["env12"], env["digests"], env["drivers"], env["driver_source"], env["driver_assumed"]) == (
+        [ENV], {DIGEST: 2}, {"580.159.03": 0}, "DEFAULT_DRIVER_VERSION", True)
+    assert env["candidates"] == {ENV: {"digest": DIGEST, "driver": "580.159.03", "confirmed": "whole"}}
+    assert plan["warnings"] == ["GPU driver assumed to be 580.159.03 (DEFAULT_DRIVER_VERSION): no read-only cluster "
+                                f"source names it; a skeleton label on the nodes carries the env12 it gives ({ENV})"]
+    assert "WARNING: GPU driver assumed to be 580.159.03" in text
     qwen, ds = plan["jobs"]
     assert (qwen["cfg12"], qwen["reasoning_parser"], qwen["reasoning_parser_from"]) == ("a65858a869ba", "qwen3",
                                                                                          "node labels")
@@ -294,25 +371,79 @@ def test_a_dry_run_reports_existing_skeletons_for_this_image(tmp_path, monkeypat
             "fc37441c0c: 4/4 nodes (exists); exists for another image: 263a697cd9 4/4 |") in text
     assert "| ed76d47780e3 | fc37441c0c: 2/4 nodes (exists); exists for another image: 263a697cd9 4/4 |" in text
     assert "skeletons: 1 will restore (all nodes), 1 exist but not on all nodes, 0 will dump\n" in text
-    assert "node cache  4 model-cache node(s) on sfc-or-dev-meta-k8s-2, env_hash fc37441c0c27" in text
     assert plan["node_cache"]["summary"] == {"restore": 1, "partial": 1, "dump": 0, "unknown": 0, "other_image": 0}
     assert "visibility  official catalog (snowflakedb/cortex-training main; ec015a7f4b95 is on main)\n" in text
     assert plan["visibility"] == {"official": True, "show_all": False,
                                   "reason": "official catalog (snowflakedb/cortex-training main; ec015a7f4b95 is on main)"}
 
 
-def test_a_dry_run_without_env_hash_leaves_the_env_unconfirmed(tmp_path, monkeypatch):
-    nodes = [_node(_label(QWEN, "4aa63a1e185a", "weight"), _label(QWEN, f"a65858a869ba_{OLD}_4aa63a1e185a"),
-                   _label("GLM-5.3", f"44c0d7a2a3c1_{OLD}_c65f56541db7"))]
+def test_a_skeleton_of_another_images_env_is_not_this_images(tmp_path, monkeypatch):
+    nodes = [_pulled(_node(_label(QWEN, "4aa63a1e185a", "weight"), _label(QWEN, f"a65858a869ba_{OLD}_4aa63a1e185a"),
+                           _label("GLM-5.3", f"44c0d7a2a3c1_{OLD}_c65f56541db7")), (TAG, DIGEST))]
     plan, text = _dry_run(tmp_path, monkeypatch, lambda ctx: nodes)
-    assert "| a65858a869ba | 263a697cd9: 1/1 nodes (env unconfirmed) |" in text
-    assert "| ed76d47780e3 | none |" in text and plan["jobs"][1]["skeleton"] == "dump"
-    assert text.count("skeletons: 1 will restore (all nodes), 0 exist but not on all nodes, 1 will dump "
-                      "(env unconfirmed: pass env_hash= to match this image)") == 1
-    plan, text = _dry_run(tmp_path, monkeypatch, lambda ctx: nodes, env_hash=ENV)
     assert plan["jobs"][0]["skeleton"] == "dump" and "0 will restore" in text
     assert "| a65858a869ba | exists for another image: 263a697cd9 1/1 |" in text
-    assert "2 will dump (1 of them exist for another image)" in text
+    assert "| ed76d47780e3 | none |" in text and plan["jobs"][1]["skeleton"] == "dump"
+    assert "2 will dump (1 of them exist for another image)\n" in text
+    assert f"{ENV} (digest a544c618585e from node images, driver 580.159.03 from DEFAULT_DRIVER_VERSION (assumed); " \
+           "no skeleton label shows it)" in text
+    assert plan["warnings"] == ["GPU driver assumed to be 580.159.03 (DEFAULT_DRIVER_VERSION): no read-only cluster "
+                                f"source names it; no skeleton label confirms env12 {ENV}, so if the nodes run "
+                                "another driver this image's skeletons are reported missing"]
+
+
+NOT_PULLED_SUMMARY = "(image not pulled on any node yet, so no skeleton of it is on the cluster)"
+
+
+def test_an_image_no_node_pulled_will_dump_every_job(tmp_path, monkeypatch):
+    plan, text = _dry_run(tmp_path, monkeypatch, lambda ctx: _cluster(images=((OLD_TAG, OLD_DIGEST),)))
+    assert (f"env         none: {TAG} is not pulled on any node yet, so no skeleton of it can be on the cluster\n"
+            in text)
+    assert plan["env"]["pulled"] is False and plan["env"]["env12"] == [] and plan["warnings"] == []
+    assert ("| a65858a869ba | none (will dump; image not pulled on any node yet); exists for another image: "
+            "263a697cd9 4/4, fc37441c0c 4/4 |") in text
+    assert [j["skeleton"] for j in plan["jobs"]] == ["dump", "dump"]
+    assert ("skeletons: 0 will restore (all nodes), 0 exist but not on all nodes, 2 will dump (2 of them exist for "
+            f"another image) {NOT_PULLED_SUMMARY}") in text
+
+
+def test_a_restricted_list_of_an_image_no_node_pulled_will_dump_every_job(tmp_path, monkeypatch):
+    plan, text = _dry_run(tmp_path, monkeypatch, lambda ctx: _cluster(images=()), configs=FORK)
+    assert text.count("| none (will dump; image not pulled on any node yet) |") == 2
+    assert ("skeletons: 0 will restore (all nodes), 0 exist but not on all nodes, 2 will dump "
+            f"{NOT_PULLED_SUMMARY}") in text
+    assert all(j["skeleton"] == "dump" and j["existing"] == [] for j in plan["jobs"])
+    for other in (ENV, OLD, ENV[:10], OLD[:10], "another image"):
+        assert other not in json.dumps(plan) and other not in text, other
+
+
+def test_a_tag_with_two_digests_gives_two_candidates(tmp_path, monkeypatch):
+    nodes = _labelled_cluster()
+    nodes[0], nodes[1] = _pulled(nodes[0], (TAG, DIGEST)), _pulled(nodes[1], (TAG, OLD_DIGEST))
+    plan, text = _dry_run(tmp_path, monkeypatch, lambda ctx: nodes, configs=FORK)
+    assert plan["env"]["ambiguous"] is True and set(plan["env"]["env12"]) == {ENV, OLD}
+    assert plan["env"]["digests"] == {OLD_DIGEST: 1, DIGEST: 1}
+    assert "env         ambiguous, any of 2: " in text and "digest 437137899d34 from node images" in text
+    assert any(w.startswith(f"{TAG} is listed with 2 digests across the nodes (tags can move): 437137899d34 on 1 "
+                            "node(s), a544c618585e on 1 node(s)") for w in plan["warnings"])
+    assert "| a65858a869ba | exists: 4/4 nodes |" in text and "| ed76d47780e3 | exists: 4/4 nodes |" in text
+
+
+GFD = "nvidia.com/cuda.driver-version.full"
+
+
+@pytest.mark.parametrize("driver,want", [("580.159.03", "exists: 4/4 nodes"), ("570.1.2", "none (will dump)")])
+def test_a_driver_from_node_labels_is_used_instead_of_the_default(tmp_path, monkeypatch, driver, want):
+    nodes = _cluster()
+    for n in nodes[:4]:
+        n["metadata"]["labels"][GFD] = driver
+    plan, text = _dry_run(tmp_path, monkeypatch, lambda ctx: nodes, configs=FORK)
+    env = keys.env_hash(DIGEST, driver)
+    assert (plan["env"]["drivers"], plan["env"]["driver_source"], plan["env"]["driver_assumed"]) == (
+        {driver: 4}, f"node label {GFD}", False)
+    assert f"env         {env} (digest a544c618585e from node images, driver {driver} from node label {GFD}; " in text
+    assert plan["warnings"] == [] and "assumed" not in text
+    assert f"| a65858a869ba | {want} |" in text if driver == "580.159.03" else f"| ? | {want} |" in text
 
 
 def test_a_failing_kubectl_skips_the_lookup_with_a_note(tmp_path, monkeypatch):
@@ -325,6 +456,8 @@ def test_a_failing_kubectl_skips_the_lookup_with_a_note(tmp_path, monkeypatch):
         semip_job.cluster_nodes("sfc-or-dev-meta-k8s-2", fail)
     plan, text = _dry_run(tmp_path, monkeypatch, lambda ctx: semip_job.cluster_nodes(ctx, fail))
     assert plan["node_cache"]["checked"] is False and "skeletons: not checked (kubectl --context=" in text
+    assert "env         not derived (kubectl --context=sfc-or-dev-meta-k8s-2 get nodes failed: " in text
+    assert plan["env"]["derived"] is False and plan["warnings"] == []
     assert plan["jobs"][1]["cfg12"] == "ed76d47780e3" and plan["jobs"][0]["cfg12"] is None
 
 
@@ -333,9 +466,9 @@ def _table(text):
 
 
 def test_a_restricted_dry_run_reports_only_this_images_own_skeletons(tmp_path, monkeypatch):
-    plan, text = _dry_run(tmp_path, monkeypatch, lambda ctx: _cluster(), configs=FORK, env_hash=ENV)
+    plan, text = _dry_run(tmp_path, monkeypatch, lambda ctx: _cluster(), configs=FORK)
     reason = f"restricted: o/cortex-training@{SHA} is not the official catalog on main"
-    assert f"visibility  {reason}\n" in text
+    assert f"visibility  {reason}\n" in text and ENV_LINE in text
     assert plan["visibility"] == {"official": False, "reason": reason, "show_all": False}
     qwen, ds = plan["jobs"]
     assert (qwen["cfg12"], qwen["reasoning_parser"], qwen["reasoning_parser_from"]) == ("a65858a869ba", "qwen3",
@@ -351,7 +484,8 @@ def test_a_restricted_dry_run_reports_only_this_images_own_skeletons(tmp_path, m
 
 
 def test_a_restricted_dry_run_says_none_for_another_env_and_never_names_the_others(tmp_path, monkeypatch):
-    plan, text = _dry_run(tmp_path, monkeypatch, lambda ctx: _cluster(), configs=FORK, env_hash="123456789abc")
+    plan, text = _dry_run(tmp_path, monkeypatch, lambda ctx: _cluster(images=((TAG, "0" * 64),)), configs=FORK)
+    assert plan["env"]["env12"] == [keys.env_hash("0" * 64, "580.159.03")]
     assert "| ? | none (will dump) |" in text and "| ed76d47780e3 | none (will dump) |" in text
     assert [j["skeleton"] for j in plan["jobs"]] == ["dump", "dump"] and plan["jobs"][0]["existing"] == []
     assert "cfg12 ?: the job names no reasoning_parser and no candidate's skeleton was found for this image" in text
@@ -360,33 +494,44 @@ def test_a_restricted_dry_run_says_none_for_another_env_and_never_names_the_othe
         assert other not in json.dumps(plan) and other not in text, other
 
 
-def test_a_restricted_dry_run_without_env_hash_reads_no_labels(tmp_path, monkeypatch):
+def test_a_restricted_dry_run_without_kubectl_says_why_it_is_not_checked(tmp_path, monkeypatch):
     def nodes(context):
-        raise AssertionError("a restricted dry run without env_hash read the node labels")
+        raise semip_job.NodesUnavailable("kubectl is not on PATH")
 
     plan, text = _dry_run(tmp_path, monkeypatch, nodes, configs=FORK)
-    assert "| a65858a869ba |" not in text and text.count("| not checked: pass env_hash= for this image |") == 2
-    assert "skeletons: not checked (restricted list, the lookup needs env_hash= for this image)" in text
-    assert "node cache  not checked: restricted list, the lookup needs env_hash= for this image" in text
+    assert "| a65858a869ba |" not in text and text.count("| not checked: kubectl is not on PATH |") == 2
+    assert "skeletons: not checked (kubectl is not on PATH)" in text
+    assert "node cache  not checked: kubectl is not on PATH" in text
+    assert "env         not derived (kubectl is not on PATH)" in text
     assert plan["node_cache"]["checked"] is False and plan["node_cache"]["summary"] is None
     assert all(j["existing"] == [] and j["skeleton"] == "not checked" for j in plan["jobs"])
     assert "cfg12 ?: the job names no reasoning_parser and the node labels were not checked" in text
 
 
 def test_a_restricted_dry_run_cannot_confirm_a_label_cut_too_short(tmp_path, monkeypatch):
-    nodes = [_node(_label(DS, f"ed76d47780e3_{OLD}_4008d4360385"))]
-    plan, text = _dry_run(tmp_path, monkeypatch, lambda ctx: nodes, configs=FORK, env_hash=ENV)
+    nodes = [_pulled(_node(_label(DS, f"ed76d47780e3_{OLD}_4008d4360385")), (TAG, DIGEST))]
+    plan, text = _dry_run(tmp_path, monkeypatch, lambda ctx: nodes, configs=FORK)
     assert plan["jobs"][1]["skeleton"] == "unknown" and OLD[:6] not in json.dumps(plan)
     assert f"| ed76d47780e3 | ? (labels of {DS} are cut too short to confirm this image's skeleton) |" in text
+
+
+def test_a_restricted_job_with_no_label_of_its_cfg12_will_dump(tmp_path, monkeypatch):
+    nodes = [_pulled(_node(_label(QWEN, "4aa63a1e185a", "weight"), _label(QWEN, f"a65858a869ba_{ENV}_4aa63a1e185a")),
+                     (TAG, DIGEST))]
+    plan, text = _dry_run(tmp_path, monkeypatch, lambda ctx: nodes, configs=FORK)
+    # DeepSeek's labels would show no env12 and no weight hash, but it has no label at all.
+    assert "| a65858a869ba | exists: 1/1 nodes |" in text and "| ed76d47780e3 | none (will dump) |" in text
+    assert plan["env"]["candidates"][ENV]["confirmed"] == "start" and "; a cut skeleton label shows its start)" in text
+    assert plan["warnings"][0].endswith("a cut skeleton label on the nodes shows the start of the env12 it gives "
+                                        f"({ENV})")
 
 
 def test_show_all_restores_the_full_output_for_a_restricted_list(tmp_path, monkeypatch, caplog):
     for run in ("a", "b"):
         (tmp_path / run).mkdir()
-    official, official_text = _dry_run(tmp_path / "a", monkeypatch, lambda ctx: _cluster(), env_hash=ENV)
+    official, official_text = _dry_run(tmp_path / "a", monkeypatch, lambda ctx: _cluster())
     with caplog.at_level(logging.WARNING, logger=semip_job.__name__):
-        plan, text = _dry_run(tmp_path / "b", monkeypatch, lambda ctx: _cluster(), configs=FORK, env_hash=ENV,
-                              show_all="true")
+        plan, text = _dry_run(tmp_path / "b", monkeypatch, lambda ctx: _cluster(), configs=FORK, show_all="true")
     assert _table(text) == _table(official_text) and "exists for another image: 263a697cd9 4/4" in text
     assert plan["node_cache"]["env_candidates"] == official["node_cache"]["env_candidates"] == sorted([ENV, OLD])
     assert plan["visibility"]["official"] is False and plan["visibility"]["show_all"] is True
@@ -404,9 +549,3 @@ def test_label_shows_the_cfg12_and_env12_characters_left_by_the_cut():
             shown = label.rsplit("-", 1)[0][len(keys._segment_prefix(f"image-cache/{slug}/skeleton/")):]
             assert shown == key[:cfg_chars] + (f"_{key[13:13 + env_chars]}" if env_chars else ""), label
 
-
-def test_env_hash_must_be_twelve_hex():
-    assert semip_job.parse_env_hash(ENV) == ENV and semip_job.parse_env_hash("") is None
-    for bad in ("fc37441c0c2", "FC37441C0C27", "fc37441c0c27x"):
-        with pytest.raises(SystemExit, match="env_hash="):
-            semip_job.parse_env_hash(bad)

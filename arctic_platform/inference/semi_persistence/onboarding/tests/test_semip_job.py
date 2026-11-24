@@ -332,15 +332,24 @@ def test_a_dry_run_records_the_configs_and_the_plan_and_submits_nothing(monkeypa
     assert any("2 of 3 config(s) need more than max_gpus=16" in w for w in plan["warnings"])
     text = (out / "plan.txt").read_text()
     assert f"@{SHA} model-catalog/semip_models/jobs.jsonl (requested ref mert/semip-jobs-sample)" in text
-    assert f"| 4 | {ONE} | org/one | 32768 | 1 | 1 | ? | not checked: pass env_hash= for this image | 2 | yes |" in text
+    assert f"| 4 | {ONE} | org/one | 32768 | 1 | 1 | ? | not checked: kubectl is not on PATH | 2 | yes |" in text
     assert (f"visibility  restricted: {OWNER}/cortex-training@mert/semip-jobs-sample is not the official catalog "
             "on main\n") in text
-    assert "node cache  not checked: restricted list, the lookup needs env_hash= for this image" in text
-    assert "skeletons: not checked (restricted list, the lookup needs env_hash= for this image)" in text
+    assert "env         not derived (kubectl is not on PATH)\n" in text
+    assert "node cache  not checked: kubectl is not on PATH" in text
+    assert "skeletons: not checked (kubectl is not on PATH)" in text
     assert plan["node_cache"]["checked"] is False and plan["jobs"][2]["skeleton"] == "not checked"
     assert set(plan["jobs"][2]["cfg12_candidates"]) == {"none", *keys.CHAT_REASONERS[1:]}
     assert f"publish: {pub}" in text and f"onboard: {onb}" in text
     assert "SECRET-PAT" not in text + json.dumps(plan) + capsys.readouterr().err
+
+
+@pytest.mark.parametrize("value", ["fc37441c0c27", ""])
+def test_env_hash_is_refused_now_that_it_is_derived(monkeypatch, tmp_path, connection, value):
+    run_child = _no_submission(monkeypatch)
+    with pytest.raises(SystemExit, match="env_hash= is no longer taken: the dry run derives this image's env12"):
+        semip_job.main(_args(tmp_path, connection, dry_run="true", env_hash=value), get=_GitHub(), run_child=run_child)
+    assert not (tmp_path / "out").exists()
 
 
 def test_a_publish_only_dry_run_plans_no_onboard(monkeypatch, tmp_path, connection):

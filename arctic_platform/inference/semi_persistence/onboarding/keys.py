@@ -30,8 +30,10 @@ the one chat pairs with the checkpoint's architecture (``chat.CHAT_MODELS``), or
 none. ``Keying.candidates`` then holds one cfg12 per possible reasoner, and the
 node labels pick the one that exists.
 
-``env12`` hashes the pod's image digest and GPU driver, and ``wt12`` the staged
-weights, so neither is computed. The model-cache DaemonSet labels each node
+``env12`` hashes the pod's image digest and GPU driver (``env_hash``): the digest
+is read from the nodes' image lists (``image_digests``), the driver from GPU
+Feature Discovery labels if a cluster has them (``node_drivers``). ``wt12``
+hashes the staged weights, so it is not computed. The model-cache DaemonSet labels each node
 ``model.neutrino.snowflake.com/<segment>=ready`` once it has verified a copy;
 ``<segment>`` is the directory under the bucket, sanitized and, past 63
 characters, cut to 55 plus ``-`` and 7 hex of the directory's sha256. A cut label
@@ -125,6 +127,17 @@ _HEX12 = re.compile(r"[0-9a-f]{12}")
 MIN_CFG_CHARS = 8
 # An env12 shown in full in any skeleton label: a candidate for confirming cut ones.
 _SHOWN_ENV = re.compile(r"\.skeleton\.[0-9a-f]{12}_([0-9a-f]{12})(?:_[0-9a-f]{0,12})?(?:-[0-9a-f]{7})?")
+# The start of an env12 a cut skeleton label shows after a whole cfg12.
+_SHOWN_ENV_START = re.compile(r"\.skeleton\.[0-9a-f]{12}_([0-9a-f]{1,11})-[0-9a-f]{7}")
+
+# semip_engine._NVRM_VERSION_RE: the driver version as the engine hashes it.
+DRIVER_VERSION = re.compile(r"\d+\.\d+(?:\.\d+)?")
+# GPU Feature Discovery's driver labels: the full version, or its parts (newer names first).
+DRIVER_FULL_LABEL = "nvidia.com/cuda.driver-version.full"
+DRIVER_PART_LABELS = (("nvidia.com/cuda.driver-version.major", "nvidia.com/cuda.driver-version.minor",
+                       "nvidia.com/cuda.driver-version.revision"),
+                      ("nvidia.com/cuda.driver.major", "nvidia.com/cuda.driver.minor", "nvidia.com/cuda.driver.rev"))
+_DIGEST = re.compile(r"[0-9a-f]{64}")
 
 
 class Unsupported(ValueError):
@@ -354,6 +367,56 @@ def label_shows(slug: str) -> tuple[int, int]:
     return min(HASH_LEN, max(0, room)), min(HASH_LEN, max(0, room - HASH_LEN - 1))
 
 
+def env_hash(digest: str, driver: str) -> str:
+    """``semip_engine._env_hash``: ``digest`` is the image's sha256 hex (what follows
+    ``sha256:`` in the pod's imageID), ``driver`` the NVRM version (``580.159.03``)."""
+    return hashlib.sha256(f"{digest}{driver}".encode()).hexdigest()[:HASH_LEN]
+
+
+def image_digests(items: list[dict], tag: str) -> dict[str, int]:
+    """The sha256 digests the nodes list for image tag ``tag`` (under any registry), each with
+    on how many nodes, most first. A node lists an image as its tag and digest names."""
+    counts: dict[str, int] = {}
+    for node in items:
+        seen = set()
+        for image in (node.get("status") or {}).get("images") or []:
+            names = image.get("names") or []
+            if any(n.endswith(f":{tag}") and "@" not in n for n in names):
+                seen.update(d for n in names if "@sha256:" in n
+                            for d in [n.rsplit("@sha256:", 1)[1]] if _DIGEST.fullmatch(d))
+        for digest in seen:
+            counts[digest] = counts.get(digest, 0) + 1
+    return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+
+
+def node_driver(labels: dict) -> tuple[str, str] | None:
+    """``(version, label)`` from a node's GPU Feature Discovery labels, or None."""
+    full = labels.get(DRIVER_FULL_LABEL) or ""
+    if DRIVER_VERSION.fullmatch(full):
+        return full, DRIVER_FULL_LABEL
+    for names in DRIVER_PART_LABELS:
+        version = ".".join(p for p in (labels.get(n) or "" for n in names) if p)
+        if labels.get(names[0]) and DRIVER_VERSION.fullmatch(version):
+            return version, names[0].rsplit(".", 1)[0] + ".*"
+    return None
+
+
+def node_drivers(items: list[dict]) -> tuple[dict[str, int], str | None]:
+    """The driver versions the model-cache nodes' labels name, each with on how many nodes
+    (most first), and the label they came from."""
+    counts: dict[str, int] = {}
+    source = None
+    for node in items:
+        labels = (node.get("metadata") or {}).get("labels") or {}
+        if not any(k.startswith(LABEL_PREFIX) for k in labels):
+            continue
+        found = node_driver(labels)
+        if found:
+            counts[found[0]] = counts.get(found[0], 0) + 1
+            source = source or found[1]
+    return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))), source
+
+
 @dataclass(frozen=True)
 class Found:
     """Skeleton labels for one model and cfg12 under one env12 (``env_exact``) or the start
@@ -373,16 +436,23 @@ class Lookup:
 class NodeCache:
     """The model-cache nodes' ``ready`` labels, read once from ``kubectl get nodes -o json``."""
 
-    def __init__(self, items: list[dict], env_hash: str | None = None):
+    def __init__(self, items: list[dict], envs: tuple[str, ...] | list[str] = ()):
         labels = [n.get("metadata", {}).get("labels") or {} for n in items]
         cache = [{k[len(LABEL_PREFIX):] for k, v in node.items() if k.startswith(LABEL_PREFIX) and v == "ready"}
                  for node in labels if any(k.startswith(LABEL_PREFIX) for k in node)]
         self.ready = cache
         self.nodes = len(cache)
         self.all = set().union(*cache) if cache else set()
-        self.envs = {m.group(1) for s in self.all for m in [_SHOWN_ENV.search(s)] if m}
-        if env_hash:
-            self.envs.add(env_hash)
+        self.shown_envs = {m.group(1) for s in self.all for m in [_SHOWN_ENV.search(s)] if m}
+        self.envs = self.shown_envs | set(envs)
+
+    def shows_env(self, env: str, min_chars: int) -> str | None:
+        """How a skeleton label shows ``env``: ``whole``, ``start`` (a cut label shows at
+        least ``min_chars`` of it), or None."""
+        if env in self.shown_envs:
+            return "whole"
+        starts = {m.group(1) for s in self.all for m in [_SHOWN_ENV_START.search(s)] if m}
+        return "start" if any(len(p) >= min_chars and env.startswith(p) for p in starts) else None
 
     def weights(self, slug: str) -> set[str]:
         """Weight hashes whose label for ``slug`` is short enough to show them whole."""
