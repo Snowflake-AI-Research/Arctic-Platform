@@ -330,18 +330,21 @@ def test_complete_library_path(choices):
 def test_early_delivery_abort_and_unrelated_request():
     async def check(driver, pool, actor):
         stream = driver.stream_generate(
-            "model", "blocked", "blocked", {"max_tokens": 8, "n": 2}
+            "model", "blocked", "blocked", {"max_tokens": 8, "n": 2}, routing_key="group"
         )
         assert (await anext(stream))["text"] == "x"
         assert (await actor.stats.remote())["active"] == 1
         other = [
             event
             async for event in driver.stream_generate(
-                "model", "other", "normal", {"max_tokens": 2}
+                "model", "other", "normal", {"max_tokens": 2}, routing_key="group"
             )
         ]
         assert other[-1]["type"] == "completed"
+        ws = pool._scheduler._workers[0]
+        assert ws.busy_keys == {"group": 1} and not ws.idle_keys
         assert (await driver.abort("model", "blocked"))["status"] == "aborted"
+        assert not ws.busy_keys and list(ws.idle_keys) == ["group"]
         assert (await actor.stats.remote())["active"] == 0
         assert (await actor.stats.remote())["aborted"] > 0
         with pytest.raises(StreamError):

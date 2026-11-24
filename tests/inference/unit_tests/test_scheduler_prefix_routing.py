@@ -17,10 +17,13 @@
 from __future__ import annotations
 
 import asyncio
+import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
+from arctic_platform.inference.server import scheduler as scheduler_module
 from arctic_platform.inference.server.scheduler import (
     Scheduler,
     _compute_prefix_hash,
@@ -328,6 +331,81 @@ class TestDispatch:
                 with pytest.raises(RuntimeError, match="cancelled for weight update"):
                     await asyncio.wait_for(future, 1.0)
             assert sch._workers[0].active_requests == 0
+            await sch.shutdown()
+
+        asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# Where a new sticky key goes
+# ---------------------------------------------------------------------------
+
+def _place(sch: Scheduler, key: str, idx: int) -> None:
+    """Send ``key``'s first turn to worker ``idx`` by making it the only worker available."""
+    others = [k for k in range(len(sch._workers)) if k != idx]
+    for k in others:
+        sch.mark_worker_unavailable(k)
+    sch.submit(f"{key} turn 1", {}, routing_key=key)
+    for k in others:
+        sch.mark_worker_available(k)
+    assert sch._keys[key] == idx
+
+
+async def _three_keys_between_turns_on_0_one_mid_turn_on_1(sch: Scheduler, workers: list[_Worker]) -> None:
+    for key in ("a", "b", "c"):
+        _place(sch, key, 0)
+    for call in workers[0].calls:
+        call.set_result({"text": "turn 1 done"})
+    await _settle()
+    _place(sch, "d", 1)
+
+
+class TestStickyPlacement:
+    def test_new_key_goes_to_worker_holding_fewest_keys(self):
+        async def run() -> None:
+            workers = [_Worker(), _Worker()]
+            sch = Scheduler(workers, capacity=8)
+            await _three_keys_between_turns_on_0_one_mid_turn_on_1(sch, workers)
+            # Strict has no affinity without a routing key or prefix routing.
+            unkeyed = sch.submit("unkeyed", {}, strict=True)
+            assert len(workers[0].calls) == 4
+            workers[0].calls[-1].set_result({})
+            await unkeyed
+            sch.submit("e turn 1", {}, routing_key="e")
+            assert sch._keys["e"] == 1
+            assert sch._workers[0].live_keys() == 3
+            sch.submit("a turn 2", {}, routing_key="a")
+            assert len(workers[0].calls) == 5
+            await sch.shutdown()
+
+        asyncio.run(run())
+
+    def test_key_stops_counting_at_idle_deadline(self, monkeypatch):
+        clock = [1000.0]
+        monkeypatch.setattr(scheduler_module, "time", SimpleNamespace(monotonic=lambda: clock[0], time=time.time))
+
+        async def run() -> None:
+            workers = [_Worker(), _Worker()]
+            sch = Scheduler(workers, capacity=8)
+            await _three_keys_between_turns_on_0_one_mid_turn_on_1(sch, workers)
+            sch.submit("before expiry", {}, routing_key="before")
+            assert sch._keys["before"] == 1
+            clock[0] += scheduler_module._KEY_IDLE_S
+            sch.submit("e turn 1", {}, routing_key="e")
+            assert sch._keys["e"] == 0
+            await sch.shutdown()
+
+        asyncio.run(run())
+
+    def test_burst_of_new_keys_spreads_evenly(self, monkeypatch):
+        monkeypatch.setattr(scheduler_module.random, "randrange", lambda n: 0)
+
+        async def run() -> None:
+            workers = [_Worker() for _ in range(4)]
+            sch = Scheduler(workers, capacity=64)
+            for i in range(32):
+                sch.submit(f"rollout {i} turn 1", {}, routing_key=f"r{i}")
+            assert [len(w.calls) for w in workers] == [8, 8, 8, 8]
             await sch.shutdown()
 
         asyncio.run(run())
