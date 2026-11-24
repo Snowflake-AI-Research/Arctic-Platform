@@ -127,6 +127,7 @@ export HARBOR_ENV="${HARBOR_ENV:-snowflake}"
 export HARBOR_ENV_KWARGS="${HARBOR_ENV_KWARGS:-}"
 export HARBOR_VERIFIER_ENV="${HARBOR_VERIFIER_ENV:-}"
 export HARBOR_SKILL="${HARBOR_SKILL:-}"
+export LM_HEAD_CHUNK_SIZE="${LM_HEAD_CHUNK_SIZE-8192}"
 export ARCTIC_CORTEX_JOB_COMMENT="${ARCTIC_CORTEX_JOB_COMMENT:-harbor rl ${MODEL} ${NUM_TRAIN_GPUS}+${NUM_SAMPLING_ENGINES}}"
 
 # run_engines_locally=false requires one external_server_url per engine. These

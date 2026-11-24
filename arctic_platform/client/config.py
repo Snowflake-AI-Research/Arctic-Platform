@@ -372,11 +372,8 @@ class ArcticClientConfig(BaseModel):
             )
         if provider:
             training["model_provider"] = provider
-        if "model_options" in worker:
-            training["model_options"] = deepcopy(worker["model_options"])
-        if worker.get("use_liger"):
-            options = dict(training.get("model_options") or {})
-            options["liger"] = True
+        options = _cortex_model_options(worker)
+        if options:
             training["model_options"] = options
         if worker.get("attn_implementation"):
             training["attn_implementation"] = worker["attn_implementation"]
@@ -413,6 +410,38 @@ class ArcticClientConfig(BaseModel):
         if self.seed is not None:
             sub["seed"] = self.seed
         return sub
+
+
+# ds_worker_config keys the on-prem loaders read, by the ``model_options`` path Cortex reads them from.
+# Cortex validates them against the training loader's option profile, so one a loader lacks is rejected.
+_WORKER_MODEL_OPTION_KEYS: dict[str, tuple[str, str]] = {
+    "fused_lm_head_token_chunk_size": ("lm_head", "token_chunk_size"),
+    "fused_lm_head_vocab_chunk_size": ("lm_head", "vocab_chunk_size"),
+    "fp32_lm_head": ("lm_head", "fp32"),
+    "tiled_mlp_token_chunk_size": ("tiled_mlp", "token_chunk_size"),
+}
+
+
+def _cortex_model_options(worker: dict[str, Any]) -> dict[str, Any]:
+    """``training_config.model_options`` for a Cortex training sub-job.
+
+    ``ds_worker_config.model_options``, plus ``use_liger`` and the keys in ``_WORKER_MODEL_OPTION_KEYS``
+    under their ``model_options`` names.
+    """
+    options = deepcopy(worker.get("model_options") or {})
+    for key, (group, name) in _WORKER_MODEL_OPTION_KEYS.items():
+        if worker.get(key) is None:
+            continue
+        section = options.setdefault(group, {})
+        if name in section and section[name] != worker[key]:
+            raise ValueError(
+                f"ds_worker_config.{key}={worker[key]!r} conflicts with "
+                f"ds_worker_config.model_options.{group}.{name}={section[name]!r}."
+            )
+        section[name] = worker[key]
+    if worker.get("use_liger"):
+        options["liger"] = True
+    return options
 
 
 def _neutrino_optimizer(ds_optimizer: Any) -> dict[str, Any] | None:

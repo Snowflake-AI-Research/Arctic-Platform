@@ -73,6 +73,21 @@ def harbor_verifier_env() -> dict[str, str]:
     return env
 
 
+def lm_head_worker_config() -> dict[str, int]:
+    """``LM_HEAD_CHUNK_SIZE`` as the trainer's chunked LM-head tile size; empty or ``0`` leaves the LM head unchunked.
+
+    Unchunked, the trainer holds the full [tokens, vocab] logits and their fp32 log-softmax: about 120 GB for
+    Qwen3.5's 248k vocab at 64k tokens, more than an H200 holds.
+    """
+    raw = os.environ.get("LM_HEAD_CHUNK_SIZE", "").strip()
+    size = int(raw) if raw else 0
+    if size < 0:
+        raise ValueError(f"LM_HEAD_CHUNK_SIZE must be positive or 0, got {raw!r}")
+    if not size:
+        return {}
+    return dict(fused_lm_head_token_chunk_size=size, fused_lm_head_vocab_chunk_size=size)
+
+
 def _prepare_task_fn() -> Any:
     return functools.partial(materialize_harbor_task_from_row, reward_file=Path(localization_reward_module.__file__))
 
@@ -282,6 +297,7 @@ def main() -> None:
         _run_remote,
         num_cpus=0,
         env_prefixes=("ARCTIC_", "WANDB_", "GIT_", "OPENHANDS_", "HARBOR_"),
+        ds_worker_config=lm_head_worker_config(),
     )
 
 

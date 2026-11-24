@@ -727,6 +727,73 @@ class TestCortexModelOptions:
         assert "prime_rl" not in training
 
 
+class TestCortexChunkedLMHead:
+    """Cortex reads the chunked LM head only from its own fields, so the loaders'
+    ds_worker_config keys must be lifted into ``model_options`` or they are dropped."""
+
+    _WORKER_KEYS = {
+        "fused_lm_head_token_chunk_size": 4096,
+        "fused_lm_head_vocab_chunk_size": 16384,
+        "fp32_lm_head": True,
+        "tiled_mlp_token_chunk_size": 2048,
+    }
+
+    @staticmethod
+    def _training(training: dict | None = None) -> dict:
+        cfg = ArcticClientConfig(model_name="m", training_gpus=8, training=training or {})
+        return cfg._cortex_training_sub_job()["training_config"]
+
+    def test_a_job_without_the_keys_sends_no_lm_head_options(self):
+        assert "model_options" not in self._training()
+
+    @pytest.mark.parametrize("loader", [{}, {"model_provider": "arctic"}, {"ep_size": 8}])
+    def test_worker_keys_use_the_model_options_channel_on_every_loader(self, loader):
+        training = self._training({"ds_worker_config": {**loader, **self._WORKER_KEYS}})
+        assert training["model_options"] == {
+            "lm_head": {"token_chunk_size": 4096, "vocab_chunk_size": 16384, "fp32": True},
+            "tiled_mlp": {"token_chunk_size": 2048},
+        }
+        assert "fused_lm_head_token_chunk_size" not in training
+
+    def test_a_worker_key_merges_with_model_options(self):
+        training = self._training(
+            {
+                "ds_worker_config": {
+                    "fused_lm_head_token_chunk_size": 1024,
+                    "model_options": {"lm_head": {"fp32": True}},
+                }
+            }
+        )
+        assert training["model_options"]["lm_head"] == {"fp32": True, "token_chunk_size": 1024}
+
+    def test_none_sends_nothing(self):
+        training = self._training({"ds_worker_config": {"fused_lm_head_token_chunk_size": None}})
+        assert "model_options" not in training
+
+    def test_conflicting_lm_head_settings_raise(self):
+        with pytest.raises(ValueError, match="conflicts"):
+            self._training(
+                {
+                    "ds_worker_config": {
+                        "fused_lm_head_token_chunk_size": 4096,
+                        "model_options": {"lm_head": {"token_chunk_size": 8192}},
+                    }
+                }
+            )
+
+    def test_does_not_mutate_the_client_config(self):
+        cfg = ArcticClientConfig(
+            model_name="m",
+            training_gpus=8,
+            training={
+                "ds_worker_config": {"model_options": {"lm_head": {"fp32": True}}, "tiled_mlp_token_chunk_size": 1}
+            },
+        )
+        before = cfg.model_dump()
+        cfg._cortex_training_sub_job()
+        assert cfg.model_dump() == before
+
+
 class TestCortexNoopOffload:
     """``to_cortex`` drops ``offload_*: {device: none}`` from the forwarded
     ds_config. Cortex builds the optimizer from the lifted typed ``optimizer``
