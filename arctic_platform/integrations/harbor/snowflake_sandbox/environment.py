@@ -31,6 +31,7 @@ import asyncio
 import atexit
 import fnmatch
 import logging
+import os
 import random
 import re
 import shlex
@@ -138,6 +139,16 @@ _DEFAULT_EXEC_TIMEOUT_S = 7200
 # after the exec stream drops.
 _STREAM_SLACK_S = 120
 _MAX_REATTACH = 5
+# An exec stream can end while its command keeps running, so a long command may be re-attached many times. Only
+# drops within this long of attaching count toward _MAX_REATTACH; a stream that stayed up resets the count.
+_HEALTHY_STREAM_S = 60.0
+# While the sandbox is unreachable every re-attach fails at once. Keep trying for this long after the first quick
+# failure (and at least _MAX_REATTACH times) before giving up on a command that may still run.
+_REATTACH_BUDGET_S = 600.0
+_MAX_REATTACH_DELAY_S = 30.0
+# Packages whose errors escape the SDK when the multiplexed HTTP/2 connection under an exec stream fails,
+# e.g. httpcore's KeyError for a stream id the closed connection no longer tracks.
+_HTTP_STACK = tuple(f"{os.sep}{name}{os.sep}" for name in ("httpx", "httpcore", "h2"))
 # Sandbox create retries. A rate limit with no retry_after is the per-owner cap, which clears only as other sandboxes
 # end, so the waits grow to cover a rollout finishing. A create that failed after the request was sent may still have
 # started a sandbox; it is looked up by name after each of these delays and terminated.
@@ -211,6 +222,20 @@ def _warn_once(key: str, message: str, *args: Any) -> None:
     if key not in _warned:
         _warned.add(key)
         logger.warning(message, *args)
+
+
+def _is_stream_drop(exc: BaseException) -> bool:
+    """Whether ``exc`` means the exec stream was lost while the command may still be running."""
+    if isinstance(exc, SandboxExecError):
+        return getattr(exc, "exit_code", None) == -1
+    if isinstance(exc, SandboxTransportError):
+        return True
+    tb = exc.__traceback__
+    while tb is not None:
+        if any(part in tb.tb_frame.f_code.co_filename for part in _HTTP_STACK):
+            return True
+        tb = tb.tb_next
+    return False
 
 
 def _csv(value: Any) -> tuple[str, ...]:
@@ -894,20 +919,30 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
         exit_code = -1
         lost = False
         start_argv = argv
-        for attempt in range(_MAX_REATTACH + 1):
+        attempt = 0
+        failing_since = 0.0
+        while True:
+            attached_at = time.monotonic()
             try:
                 stdout, stderr, exit_code = await self._read_exec_stream(sandbox, argv, budget)
-            except (SandboxTransportError, SandboxExecError) as e:
-                if isinstance(e, SandboxExecError) and getattr(e, "exit_code", None) != -1:
+            except Exception as e:
+                if not _is_stream_drop(e):
                     raise
-                if attempt == _MAX_REATTACH:
+                now = time.monotonic()
+                if now - attached_at >= _HEALTHY_STREAM_S:
+                    attempt = 0
+                if attempt == 0:
+                    failing_since = now
+                if attempt >= _MAX_REATTACH and now - failing_since >= _REATTACH_BUDGET_S:
                     raise
-                logger.warning("Exec stream dropped (%s); re-attaching to %s", e, exec_id)
-                await asyncio.sleep(min(2**attempt, 10))
+                logger.warning("Exec stream dropped (%s: %s); re-attaching to %s", type(e).__name__, e, exec_id)
+                await asyncio.sleep(min(2**attempt, _MAX_REATTACH_DELAY_S))
+                attempt += 1
                 argv = build_exec_argv("", exec_id, reattach=True)
                 continue
             lost = exit_code == LOST_EXIT and f"{LOST_MARKER} {exec_id}" in stderr
             if lost and attempt < _MAX_REATTACH:
+                attempt += 1
                 # The stream dropped before the command started. Its start script runs it at most once per exec id.
                 logger.warning("Exec %s never started; sending it again", exec_id)
                 argv = start_argv
