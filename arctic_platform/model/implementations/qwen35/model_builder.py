@@ -69,6 +69,7 @@ from arctic_platform.model.implementations.moe.layers.checkpointing import (
     set_selective_activation_checkpointing,
     supports_selective_activation_checkpointing,
 )
+from arctic_platform.model.implementations.gpu.core_replay import install_core_replay
 from arctic_platform.model.implementations.moe.layers.moe import LatentMoE, MoE, install_combine_replay
 from arctic_platform.model.implementations.moe.parallel_dims import ParallelDims
 from arctic_platform.model.implementations.moe.vlm import get_language_model, is_vlm_architecture
@@ -688,6 +689,7 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
     selective_layers = 0
     full_layers = 0
     replay_wrapped_routers = 0
+    core_replays = 0
     fallback_layer_types: set[str] = set()
     model_supported_targets: set[str] = set()
 
@@ -730,6 +732,8 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
             # all-to-all again and drops the saved tensor.
             if ac_config.combine_replay:
                 install_combine_replay(transformer_block)
+            if ac_config.core_replay:
+                core_replays += install_core_replay(transformer_block, scans=ac_config.core_replay is True)
             transformer_block = checkpoint_wrapper(
                 transformer_block, preserve_rng_state=CHECKPOINT_PRESERVE_RNG_STATE, early_stop=False
             )
@@ -759,6 +763,6 @@ def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
     logger.info(
         f"Applied activation checkpointing (freq={ac_config.freq}, layers={ac_config.layers}, full_layers={full_layers}, "
         f"router_replay_recompute={ac_config.router_replay_recompute}, "
-        f"combine_replay={ac_config.combine_replay}, "
+        f"combine_replay={ac_config.combine_replay}, core_replay={ac_config.core_replay} ({core_replays} modules), "
         f"replay_wrapped_routers={replay_wrapped_routers})"
     )
