@@ -539,7 +539,9 @@ def execute(
             or (not set(select) <= {"e2e-sft-train-validate", "inference-checkpoint-loss"})
         ):
             raise ValueError("local full model requires one loopback Cortex backend and only full-model checks")
-        local_full_model_path = str(validate_local_full_model(client_backend, cfg, spec))
+        local_full_model_path = str(
+            validate_local_full_model(client_backend, cfg, spec, records_dir=reference_records_dir)
+        )
     if local_cortex_fixture and (not prepare_references):
         from arctic_platform.correctness.harness.cortex import load_local_fixture
 
