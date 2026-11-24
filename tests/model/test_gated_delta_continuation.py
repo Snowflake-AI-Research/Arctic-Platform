@@ -243,6 +243,35 @@ def test_plan_indices_seed_each_continuation_with_its_parents_tail():
     assert gated_delta_continuation(layout, KERNEL, "cpu") is plan
 
 
+def test_conv_carry_hands_causal_conv1d_a_channel_last_input():
+    """causal-conv1d takes ``seq_idx`` only with a channel-last ``[1, C, T]`` x, the layout the models pass in."""
+    lengths = [7, 8, 5]
+    hidden, mask, input_ids = _rows(lengths, [4], [[0, 1], [2]])
+    layout = PackedLayout.build(mask, [[0, 1], [2]], [4, 0], input_ids=input_ids)
+    plan = gated_delta_continuation(layout, KERNEL, "cpu")
+    weight = torch.randn(CHANNELS, KERNEL, dtype=torch.float64)
+    x = torch.randn(1, layout.num_tokens, CHANNELS, dtype=torch.float64).transpose(1, 2)
+    strides = []
+
+    def channel_last_conv(*, x, weight, bias, activation, seq_idx):
+        strides.append(x.stride(1))
+        counts = torch.unique_consecutive(seq_idx[0], return_counts=True)[1]
+        output = gated_delta_net._fallback_depthwise_causal_convolution(
+            x, weight=weight, bias=bias, activation=activation, global_cu_seqlens=F.pad(counts.cumsum(0), (1, 0))
+        )
+        return output.transpose(1, 2).contiguous().transpose(1, 2)
+
+    def run(kernel):
+        return packed_causal_convolution(
+            kernel, x, weight=weight, bias=None, activation="silu", cu_seqlens=layout.cu_seqlens, continuation=plan
+        )
+
+    got = run(channel_last_conv)
+    assert strides == [1]
+    assert got.stride(1) == 1
+    torch.testing.assert_close(got, run(None), rtol=0, atol=0)
+
+
 def test_rule_refuses_caller_state():
     lengths = [6, 7]
     hidden, mask, input_ids = _rows(lengths, [4], [[0, 1]])

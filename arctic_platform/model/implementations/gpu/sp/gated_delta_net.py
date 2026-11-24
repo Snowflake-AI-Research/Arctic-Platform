@@ -446,7 +446,8 @@ def packed_causal_convolution(
     inputs.
     """
     if continuation is not None:
-        x = x.index_select(-1, continuation.carry_index)
+        # causal-conv1d takes seq_idx only with a channel-last x; gathering along tokens of [1, T, C] keeps it so.
+        x = x.transpose(1, 2).index_select(1, continuation.carry_index).transpose(1, 2)
         cu_seqlens = continuation.carry_cu_seqlens
     if causal_convolution is not None:
         output = causal_convolution(
@@ -465,7 +466,7 @@ def packed_causal_convolution(
             global_cu_seqlens=cu_seqlens,
         )
     if continuation is not None:
-        output = output.index_select(-1, continuation.keep_index)
+        output = output.transpose(1, 2).index_select(1, continuation.keep_index).transpose(1, 2)
     return output
 
 

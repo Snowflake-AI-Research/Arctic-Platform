@@ -715,10 +715,12 @@ _GDN_FP32_GRADS = ("A_log", "in_proj_a.weight", "in_proj_ba.weight", "norm.weigh
 
 
 def _reference_conv(x, weight, bias=None, activation=None, seq_idx=None, **unused):
-    """causal-conv1d's contract: the convolution restarts wherever ``seq_idx`` ``[1, T]`` changes."""
+    """causal-conv1d's contract: the convolution restarts wherever ``seq_idx`` ``[1, T]`` changes, and ``seq_idx``
+    needs a channel-last ``x``."""
     if seq_idx is None:
         counts = torch.tensor([x.shape[-1]])
     else:
+        assert x.stride(1) == 1, "seq_idx is only supported for channel last layout"
         counts = torch.unique_consecutive(seq_idx[0], return_counts=True)[1]
     return gated_delta_net._fallback_depthwise_causal_convolution(
         x, weight=weight, bias=bias, activation=activation, global_cu_seqlens=F.pad(counts.cumsum(0), (1, 0))
