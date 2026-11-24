@@ -23,6 +23,7 @@ No gateway, SP, DeepEP, or 35B model is required.
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from contextlib import nullcontext
 from copy import deepcopy
 
@@ -709,6 +710,95 @@ def test_installed_offload_recycles_pruned_saved_tensors_into_auto_pinned_cache(
     assert manager.pinned_cache.auto_max_size_bytes is not None
     assert manager.pinned_cache.auto_max_size_bytes >= stale_bytes
     assert manager.stats.pinned_reuses > 0
+
+
+class _SimEvent:
+    def record(self, stream):
+        self.stream, self.mark = stream, len(stream.ops)
+
+    def synchronize(self):
+        self.stream.run_until(self.mark)
+
+
+class _SimStream:
+    """A CUDA stream stand-in: ops run in issue order, at issue time (eager) or only once something waits."""
+
+    def __init__(self, eager: bool):
+        self.ops, self.done, self.eager = [], 0, eager
+
+    def enqueue(self, op) -> None:
+        self.ops.append(op)
+        if self.eager:
+            self.run_until(len(self.ops))
+
+    def run_until(self, mark: int) -> None:
+        while self.done < mark:
+            self.done += 1
+            self.ops[self.done - 1]()
+
+    def wait_event(self, event: _SimEvent) -> None:
+        self.enqueue(event.synchronize)
+
+    def wait_stream(self, other: _SimStream) -> None:
+        event = _SimEvent()
+        event.record(other)
+        self.wait_event(event)
+
+
+class _PrunedFirstSavedTensorModule(nn.Module):
+    def forward(self, x):
+        _ = x.sin().sum()  # saves x first, then pruned: never unpacked
+        return x.cos().exp().sum()  # unpacking cos's saved x prefetches the pruned slot
+
+
+def test_pruned_prefetched_slot_keeps_its_pinned_buffer_until_its_reload_finishes(monkeypatch):
+    """A prefetched slot that backward never unpacks must not lend its pinned buffer to a D2H before its H2D.
+
+    Simulated streams on CPU: offload copies run as issued, reload copies only when something waits on them, a
+    legal CUDA schedule. The pruned slot's H2D must still read the bytes that slot offloaded.
+    """
+    compute = _SimStream(eager=True)
+    current = [compute]
+
+    @contextmanager
+    def use_stream(stream):
+        current.append(stream)
+        try:
+            yield
+        finally:
+            current.pop()
+
+    real_copy, real_empty = torch.Tensor.copy_, torch.empty
+
+    def copy_on_stream(dst, src, non_blocking=False):
+        if not non_blocking:
+            return real_copy(dst, src)
+        current[-1].enqueue(lambda: real_copy(dst, src))
+        return dst
+
+    monkeypatch.setattr(torch.cuda, "Event", _SimEvent)
+    monkeypatch.setattr(torch.cuda, "stream", use_stream)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: current[-1])
+    monkeypatch.setattr(torch.Tensor, "record_stream", lambda tensor, stream: None)
+    monkeypatch.setattr(torch.Tensor, "copy_", copy_on_stream)
+    monkeypatch.setattr(torch, "empty", lambda *args, pin_memory=False, **kwargs: real_empty(*args, **kwargs))
+
+    model = _PrunedFirstSavedTensorModule()
+    manager = install_activation_offload(
+        model, keep_last_n=1, use_streams=True, tensor_size_threshold=1, pin_memory_bucket_size_mib=1
+    )
+    monkeypatch.setattr(manager, "_eligible", lambda tensor: True)  # CPU tensors stand in for device tensors
+    manager._offload_stream, manager._reload_stream = _SimStream(eager=True), _SimStream(eager=False)
+
+    first = torch.randn(64, 64, requires_grad=True)
+    model(first).backward()
+    (pruned,) = manager._slots.values()
+    assert pruned.offloaded and pruned.gpu is not None  # prefetched by the cos slot's unpack, never pulled
+
+    model(torch.randn(64, 64, requires_grad=True))  # reset_pending recycles the pruned slot's pinned buffer
+    manager._reload_stream.run_until(len(manager._reload_stream.ops))
+
+    torch_assert_equal(pruned.gpu, first.detach())
 
 
 @pytest.mark.integration
