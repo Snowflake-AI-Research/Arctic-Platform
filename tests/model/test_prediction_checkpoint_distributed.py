@@ -75,7 +75,7 @@ class _CheckpointFixture(nn.Module):
                 linear_num_heads=2,
                 linear_head_dim=4,
                 hc_mult=2,
-                layer_types=["indexed_attention"],
+                layer_types=["deepseek_sparse_attention"],
                 mlp_layer_types=["sparse"],
             )
         self.model = nn.Module()
