@@ -96,8 +96,9 @@ class ReplicaSnapshot:
     timestamp: float
     kv_cache_usage: float
     num_running_reqs: int
-    num_waiting_reqs: int
+    num_waiting_reqs: int       # all waiting requests, including num_skipped_waiting_reqs
     num_tokens_in_step: int     # decode + prefill tokens scheduled this step
+    num_skipped_waiting_reqs: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -162,7 +163,7 @@ class WorkerMetricsCollector:
         self.min_interval_s = max(0.0, min_interval_s)
         self._snapshots = _BoundedDeque(max_items=max_snapshots)
         self._last_record_time: float = 0.0
-        # vLLM's waiting-queue length at the latest step, not throttled by min_interval_s.
+        # vLLM's waiting requests, skipped ones included, at the latest step; not throttled by min_interval_s.
         self.num_waiting_reqs = 0
         # Lifetime counters since engine start, summed over every step.
         # Speculative-decoding fields are also exposed via spec_decoding_totals().
@@ -182,7 +183,11 @@ class WorkerMetricsCollector:
                 self._totals.num_preempted_reqs += iteration_stats.num_preempted_reqs
         if scheduler_stats is None:
             return
-        self.num_waiting_reqs = int(scheduler_stats.num_waiting_reqs)
+        # vLLM reports a request that arrives with a structured-output grammar as skipped, not waiting, and
+        # keeps it there after the grammar compiles until the request runs.
+        skipped = int(getattr(scheduler_stats, "num_skipped_waiting_reqs", 0) or 0)
+        num_waiting = int(scheduler_stats.num_waiting_reqs) + skipped
+        self.num_waiting_reqs = num_waiting
         spec = scheduler_stats.spec_decoding_stats
         if spec is not None:
             with self._spec_lock:
@@ -217,8 +222,9 @@ class WorkerMetricsCollector:
             timestamp=now,
             kv_cache_usage=float(scheduler_stats.kv_cache_usage),
             num_running_reqs=int(scheduler_stats.num_running_reqs),
-            num_waiting_reqs=int(scheduler_stats.num_waiting_reqs),
+            num_waiting_reqs=num_waiting,
             num_tokens_in_step=int(tokens_in_step),
+            num_skipped_waiting_reqs=skipped,
         ))
 
     def totals(self) -> dict[str, Any]:
