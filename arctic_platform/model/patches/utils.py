@@ -19,6 +19,29 @@ from __future__ import annotations
 import torch.nn as nn
 
 
+def text_decoder(model: nn.Module, *, patch_name: str) -> nn.Module:
+    """The model's text decoder: the module holding the decoder layers (``layers``) and the input embedding.
+
+    ``get_decoder()`` when it returns one (a multimodal model such as Gemma 4 returns its language model), else the one
+    module with both a ``layers`` ModuleList and ``embed_tokens``.
+    """
+    get_decoder = getattr(model, "get_decoder", None)
+    decoder = get_decoder() if callable(get_decoder) else None
+    if decoder is not None and isinstance(getattr(decoder, "layers", None), nn.ModuleList):
+        return decoder
+    found = [
+        module
+        for module in model.modules()
+        if isinstance(getattr(module, "layers", None), nn.ModuleList) and hasattr(module, "embed_tokens")
+    ]
+    if len(found) != 1:
+        raise ValueError(
+            f"{patch_name}: found {len(found)} modules with decoder layers and an input embedding; the patch needs "
+            "the text decoder of a causal LM"
+        )
+    return found[0]
+
+
 def transformer_layers(model: nn.Module, *, patch_name: str):
     target = model
     for part in ("model", "layers"):
