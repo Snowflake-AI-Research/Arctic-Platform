@@ -133,6 +133,11 @@ class Qwen3MoePreTrainedModel(PreTrainedModelPrimeRL):
     _can_record_outputs = {
         "hidden_states": Qwen3MoeDecoderLayer,
     }
+    # The sampler's adapter pack (weight_export.save_peft_adapters) carries the routed experts' LoRA one expert at a
+    # time, as vLLM's Qwen3-MoE maps it (experts.{e}.gate_proj / down_proj / up_proj): PEFT's 3-D layout nests one
+    # wrapper per expert parameter, and vLLM reads only two of the three (experts.base_layer as gate_up, experts as
+    # down).
+    vllm_lora_expert_projections = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
 
     @classmethod
     def is_hf_state_dict(cls, state_dict: dict[str, Tensor]) -> bool:

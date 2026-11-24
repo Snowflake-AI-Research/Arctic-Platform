@@ -27,6 +27,7 @@ from typing_extensions import Self
 from arctic_platform.model.config import ActivationCheckpointConfig
 from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.implementations.moe.config_validation import validate_lm_head_fused_ce_config
+from arctic_platform.model.implementations.moe.runtime_options import MoeRuntimeOptions
 from arctic_platform.model.loader import LoadedModel
 from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.loader import register_loader
@@ -49,7 +50,7 @@ class GlmMoeDsaDebugOptions(BaseModel):
     full_determinism: bool = False
 
 
-class GlmMoeDsaOptions(BaseModel):
+class GlmMoeDsaOptions(MoeRuntimeOptions):
     """Validated ``loader_options`` for GLM-5.2/5.3 MoE models."""
 
     model_config = ConfigDict(extra="forbid", validate_default=True)

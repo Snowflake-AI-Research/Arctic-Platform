@@ -270,9 +270,21 @@ def dispatch_tokens_async(
         top_scores = top_scores.float()
 
     buffer = get_buffer(group, get_hidden_bytes(hidden_states))
-    num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert_dispatch, is_token_in_rank, _ = (
-        buffer.get_dispatch_layout(topk_idx=selected_experts_indices, num_experts=num_experts)
+    # Allocate the layout on DeepEP's comm stream, where its kernel writes it. Allocated on the current stream
+    # (DeepEP's default), torch.empty runs after DeepEP has made the comm stream wait for that stream, and under
+    # torch.use_deterministic_algorithms (debug.full_determinism) the uninitialized-memory fill it launches there
+    # races the layout kernel: is_token_in_rank comes back partly True, the dispatch sends tokens that its counts
+    # do not announce, and the EP ranks time out or receive garbage expert ids.
+    num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert_dispatch, is_token_in_rank, layout_event = (
+        buffer.get_dispatch_layout(
+            topk_idx=selected_experts_indices,
+            num_experts=num_experts,
+            previous_event=_new_event_overlap(),
+            async_finish=True,
+            allocate_on_comm_stream=True,
+        )
     )
+    layout_event.current_stream_wait()
 
     hidden_states, dispatched_indices, dispatched_expert_scores, num_tokens_per_expert, handle_id = (
         torch.ops.ap_deepep.dispatch(
