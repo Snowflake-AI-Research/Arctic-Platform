@@ -38,8 +38,10 @@ def stateless_init_nccl(master_addr, master_port, rank, world_size, device,
     TCP listener role from the NCCL rank — needed when the network only
     allows one direction of connectivity (e.g. training → inference).
     """
+    from vllm import envs
     from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
     from vllm.distributed.utils import StatelessProcessGroup, create_tcp_store
+    from vllm.utils.torch_utils import _current_stream_tls
 
     if is_server is None:
         pg = StatelessProcessGroup.create(
@@ -72,7 +74,28 @@ def stateless_init_nccl(master_addr, master_port, rank, world_size, device,
             data_expiration_seconds=3600,
         )
 
-    return PyNcclCommunicator(pg, device=device)
+    before = None
+    if world_size > 1 and not envs.VLLM_DISABLE_PYNCCL:
+        # The CUDA runtime can see a device after Ray clears an empty CUDA_VISIBLE_DEVICES even if NVML cannot.
+        count = getattr(torch._C, "_cuda_getDeviceCount", lambda: 0)()
+        if count:
+            target = torch.device(device)
+            if target.type == "cuda" and (target.index is None or target.index < count):
+                before = torch.cuda.current_stream(target)
+    seed = before is not None and getattr(_current_stream_tls, "value", None) is None
+    if seed:
+        # A cold vLLM lookup would select a new stream during warm-up.
+        _current_stream_tls.value = before
+    comm = None
+    try:
+        comm = PyNcclCommunicator(pg, device=device)
+        return comm
+    finally:
+        if seed and (comm is None or comm.disabled):
+            del _current_stream_tls.value
+        if before is not None:
+            logger.info("PyNccl rank=%d device=%s CUDA stream before=%#x after=%#x",
+                        rank, device, before.cuda_stream, torch.cuda.current_stream(target).cuda_stream)
 
 
 # ---------------------------------------------------------------------------
