@@ -328,6 +328,7 @@ class HarborTrialAdapter:
         agent_kwargs: dict[str, Any] | None = None,
         env_kwargs: dict[str, Any] | None = None,
         verifier_env: dict[str, str] | None = None,
+        eval_verifier_env: dict[str, str] | None = None,
         prepare_task_fn: Any | None = None,
         max_concurrency: int = 256,
     ) -> None:
@@ -340,6 +341,8 @@ class HarborTrialAdapter:
         self._agent_kwargs = dict(agent_kwargs or {})
         self._env_kwargs = dict(env_kwargs or {})
         self._verifier_env = dict(verifier_env or {})
+        # Merged over verifier_env for eval-phase rollouts, e.g. a different judge for held-out scoring.
+        self._eval_verifier_env = dict(eval_verifier_env or {})
         self._prepare_task_fn = prepare_task_fn
         self._max_concurrency = int(max_concurrency)
         self._lock = threading.Lock()
@@ -387,7 +390,9 @@ class HarborTrialAdapter:
             skills=self._skills,
             agent_kwargs=kw,
             env_kwargs=self._env_kwargs,
-            verifier_env=self._verifier_env,
+            verifier_env=(
+                {**self._verifier_env, **self._eval_verifier_env} if request.phase == "eval" else self._verifier_env
+            ),
         )
 
     def close(self, timeout_s: float = CLOSE_TIMEOUT_S) -> None:
@@ -410,6 +415,9 @@ class HarborTrialAdapter:
         if exc is None:
             self._store(rollout_id, "completed", future.result())
             return
+        # The rollout is scored 0 and its trial directory is gone, so this is the only record of why.
+        reason = str(exc).splitlines()[0][:500] if str(exc) else ""
+        logger.warning("Harbor rollout %s errored: %s: %s", rollout_id, type(exc).__name__, reason)
         self._store(
             rollout_id,
             "errored",

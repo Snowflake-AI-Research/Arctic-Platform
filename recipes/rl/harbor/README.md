@@ -55,6 +55,8 @@ export HARBOR_VERIFIER_ENV='{"REWARDKIT_JUDGE": "openai/claude-sonnet-4-6",
   "LITELLM_LOCAL_MODEL_COST_MAP": "True"}'
 ```
 
+`HARBOR_EVAL_VERIFIER_ENV` is merged over `HARBOR_VERIFIER_ENV` for eval rollouts only, so held-out tasks can be scored by a different judge than the one that gives the training reward, e.g. `'{"REWARDKIT_JUDGE": "openai/openai-gpt-5.4"}'`.
+
 A run makes one pass over the training tasks, so it trains for at most (number of tasks) / `BATCH_SIZE` steps, whatever `trainer.max_training_steps` says, and then ends with `Training done!`: 100 tasks at the default 8 per step give 12 steps. Append `trainer.epochs=N` to pass over them `N` times.
 
 To stop a run, press Ctrl-C or send the launcher `SIGTERM`. The driver cancels its Cortex jobs at once, then takes up to 2 minutes to stop the rollouts in flight and terminate their sandboxes. A driver killed with `kill -9` can't cancel them: they keep their GPUs until the server reclaims them after 30 idle minutes, unless you cancel them first with `cortex-training cancel`.
@@ -111,6 +113,15 @@ The agent's `terminal` tool and the verifier both run through the selected Harbo
 
 The agent itself runs on the driver, and only its commands go to the environment. `HARBOR_AGENT` must be such a driver-side agent: the default `harbor_rl.agent:OpenHandsHarborAgent` or your own Harbor `BaseAgent` subclass (`module:Class`), which receives the rollout's model endpoint and key as the `base_url` and `api_key` constructor arguments. Harbor's installed agents (`openhands-sdk`, `mini-swe-agent`, `claude-code`, ...) run inside the environment, where task code could read that key, so the launcher and the adapter refuse them.
 
+Your agent doesn't need to live in this repository. Put it in a package and list it in `HARBOR_AGENT_WITH`, one `uv --with` spec per line (a path, a wheel, or `name @ git+https://...`), and the launcher installs it on the driver next to Arctic Platform:
+
+```bash
+export HARBOR_AGENT=my_harness:MyHarborAgent
+export HARBOR_AGENT_WITH=/path/to/my-harness
+```
+
+uv caches the environment by that spec string, so after editing a local package, point `HARBOR_AGENT_WITH` at a freshly built wheel with a new path (or pass a new version) to pick up the change.
+
 `HARBOR_ENV=host` runs tasks as subprocesses on the driver machine with no isolation. Task `RUN` lines, verifiers, and agent commands can read anything the driver's user can, so it is only for tasks you trust. It needs `HARBOR_ALLOW_HOST_EXEC=1`. Host commands get an allowlisted environment (`PATH`, locale, `TERM`, `TMPDIR`, plus any names in `HARBOR_HOST_ENV_PASSTHROUGH`), never the driver's `ARCTIC_*`, `WANDB_*`, or other credentials. All task paths are resolved and must stay inside the trial directory or the task's `environment/`.
 
 A rollout whose trial ends without a verifier result (the sandbox never comes up, the Dockerfile fails to replay, the agent or the verifier crashes) is an error, not a reward of 0: it is saved as `$CKPT_DIR/trajectories/step_<n>/<phase>/<instance>_<n>.error` with Harbor's traceback and is masked out of the loss. If every rollout of a step errors, the step is rerun up to 3 times, after waits of 1, 2, and 4 minutes, so a brief sandbox outage doesn't end the run. If it still errors, the run stops with the first error.
@@ -153,8 +164,10 @@ Every harness setting, sandbox backend, model, and RL hyperparameter in `recipes
 | **Agent tools** | `OPENHANDS_TOOLS` | `terminal` (+ finish tool) | `terminal,task_tracker` |
 | **Agent system prompt** | `OPENHANDS_SYSTEM_PROMPT_FILE` | built-in prompt | `~/prompts/custom_agent.j2` |
 | **Harbor agent class** | `HARBOR_AGENT` | `harbor_rl.agent:OpenHandsHarborAgent` | `my_pkg:MyAgent` (a driver-side `BaseAgent`; see [Where Rollouts Run](#where-rollouts-run)) |
+| **Harbor agent packages** | `HARBOR_AGENT_WITH` | — | `/path/to/my-harness` (one `uv --with` spec per line) |
 | **Harbor environment (`--env`)** | `HARBOR_ENV` / `HARBOR_ENV_KWARGS` | `snowflake` / — | `host` (trusted tasks only) |
 | **Verifier env (`--ve`)** | `HARBOR_VERIFIER_ENV` | — | `{"JUDGE_CONCURRENCY": "4"}` |
+| **Eval verifier env** | `HARBOR_EVAL_VERIFIER_ENV` | — | `{"REWARDKIT_JUDGE": "openai/openai-gpt-5.4"}` |
 | **Base model** | `MODEL` | `Qwen/Qwen3.5-4B` | — |
 | **GPU allocation (train / sample)** | `NUM_TRAIN_GPUS` / `NUM_SAMPLING_ENGINES` | `4` / `4` | `8` / `8` |
 | **Rollout concurrency** | `BATCH_SIZE` $\times$ `N_ROLLOUTS` | `8` $\times$ `8` (`64`/step) | `16` $\times$ `8` (`128`/step) |
