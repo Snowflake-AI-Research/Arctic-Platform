@@ -765,13 +765,7 @@ def test_hf_checkpoint_export_of_a_peft_model_writes_the_unmerged_base(monkeypat
     from peft import LoraConfig
     from peft import get_peft_model
 
-    class AdapterBase(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.proj = nn.Linear(4, 4, bias=False)
-            self.config = dict(model_type="test")
-
-    model = get_peft_model(AdapterBase(), LoraConfig(r=2, target_modules=["proj"]))
+    model = get_peft_model(_AdapterBase(), LoraConfig(r=2, target_modules=["proj"]))
     base_weight = model.base_model.model.proj.base_layer.weight
 
     with pytest.raises(ValueError, match="weight_format='lora'"):

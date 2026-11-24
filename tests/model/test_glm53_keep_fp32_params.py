@@ -24,9 +24,9 @@ from arctic_platform.common.deepspeed_engine import TrainingEngineSpec
 from arctic_platform.common.deepspeed_engine import build_deepspeed_config
 from arctic_platform.common.deepspeed_engine import initialize_training_engine
 from arctic_platform.testing_utils import require_deepspeed
+from arctic_platform.testing_utils import tiny_glm5_next_config as _tiny_config
 from arctic_platform.testing_utils import torch_assert_close
 from arctic_platform.testing_utils import torch_assert_equal
-from tests.model.test_glm5_next import _tiny_config
 
 LR = 1e-3
 
