@@ -1833,6 +1833,11 @@ class InferenceWorker(StreamingWorkerMixin):
         results = maybe_collect_broadcast_verification(results, engine_only=engine_only, llm=self.llm, rank_offset=rank_offset)
         if not results:
             return {}
+        if not engine_only:
+            # Every rank receives and loads the whole model: rank 0's reply carries each rank's memory figures.
+            results[0]["rank_memory"] = [
+                {key: value for key, value in r.items() if key.startswith(("mem_", "device_"))} for r in results
+            ]
         from arctic_platform.inference import envs
         if not envs.ARCTIC_INFERENCE_DUMP_PARAM_L2:
             return results[0]

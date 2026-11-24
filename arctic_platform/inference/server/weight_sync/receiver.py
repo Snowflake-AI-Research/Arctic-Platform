@@ -428,6 +428,15 @@ def _ensure_engine_process_vllm_patches() -> None:
 _ensure_engine_process_vllm_patches()
 
 
+def _memory_before(device) -> dict[str, int]:
+    """Reset the peak counters and read this GPU's memory as a load starts (see ``_build_result``)."""
+    torch.cuda.reset_peak_memory_stats(device)
+    free, _ = torch.cuda.mem_get_info(device)
+    return dict(
+        allocated=torch.cuda.memory_allocated(device), reserved=torch.cuda.memory_reserved(device), free=free,
+    )
+
+
 class WeightSyncExtension:
     """vLLM worker extension for NCCL weight sync.
 
@@ -495,11 +504,16 @@ class WeightSyncExtension:
 
         return engine
 
-    def _build_result(self, start: float, mem_before: int, path: str, loaded: int) -> dict:
-        """Synchronize CUDA and return timing / memory metrics."""
+    def _build_result(self, start: float, mem_before: dict[str, int], path: str, loaded: int) -> dict:
+        """Synchronize CUDA and return timing / memory metrics.
+
+        Allocated and reserved bytes come from PyTorch's caching allocator; the device's free bytes also count
+        memory outside it (CUDA context, NCCL, other processes). Free bytes at the peak are not sampled.
+        """
         torch.cuda.synchronize(self.device)
         peak_mem = torch.cuda.max_memory_allocated(self.device)
         mem_after = torch.cuda.memory_allocated(self.device)
+        free_after, total = torch.cuda.mem_get_info(self.device)
         elapsed = time.time() - start
 
         return {
@@ -507,10 +521,16 @@ class WeightSyncExtension:
             "params_loaded": loaded,
             "elapsed": elapsed,
             "update_path": path,
-            "mem_before_bytes": mem_before,
+            "mem_before_bytes": mem_before["allocated"],
             "mem_peak_bytes": peak_mem,
             "mem_after_bytes": mem_after,
-            "mem_extra_bytes": peak_mem - mem_before,
+            "mem_extra_bytes": peak_mem - mem_before["allocated"],
+            "mem_reserved_before_bytes": mem_before["reserved"],
+            "mem_reserved_peak_bytes": torch.cuda.max_memory_reserved(self.device),
+            "mem_reserved_after_bytes": torch.cuda.memory_reserved(self.device),
+            "device_free_before_bytes": mem_before["free"],
+            "device_free_after_bytes": free_after,
+            "device_total_bytes": total,
         }
 
     # ------------------------------------------------------------------
@@ -556,8 +576,7 @@ class WeightSyncExtension:
 
         start = time.time()
         model = self.model_runner.model
-        torch.cuda.reset_peak_memory_stats(self.device)
-        mem_before = torch.cuda.memory_allocated(self.device)
+        mem_before = _memory_before(self.device)
 
         tp = get_tensor_model_parallel_world_size()
 
@@ -720,9 +739,11 @@ class WeightSyncExtension:
     ) -> tuple[int, float, float, dict[str, list[str]], list[str]]:
         """Batched path for TP>1 models (including FP8+TP>1) and HF-named sync.
 
-        Each received tensor is a full (un-sharded) weight.  Most params are
-        handed to ``model.load_weights``, which does TP slicing, HF ->
-        vLLM-internal name/shape conversion, and quantization.
+        Each received tensor is a full (un-sharded) weight, except that a fused
+        MoE tensor larger than the bucket arrives in consecutive blocks of whole
+        experts, so no rank allocates it whole.  Most params are handed to
+        ``model.load_weights``, which does TP slicing, HF -> vLLM-internal
+        name/shape conversion, and quantization.
 
         The vLLM-*fused* families that ``model.load_weights`` cannot place when
         fed already-fused names (Gated DeltaNet ``in_proj_qkvz``/``in_proj_ba``
@@ -742,7 +763,6 @@ class WeightSyncExtension:
         verifier = maybe_current_broadcast_verifier()
         maybe_bind_broadcast_loader(verifier, writer)
         duplicating_mappers = _shard_duplicating_mappers(model)
-        loaded = 0
         source_to_destinations: dict[str, list[str]] = {}
         skipped_source_names: list[str] = []
         param_names = {pname for pname, _ in model.named_parameters()}
@@ -750,14 +770,17 @@ class WeightSyncExtension:
         applied_source_l2_sq = torch.zeros(
             (), dtype=torch.float64, device=self.device
         )
-        for name, tensor in engine.receive_weights():
+        rows_received: dict[str, int] = {}
+        for name, tensor in engine.receive_weights(writer.loads_row_blocks):
             source_l2_sq = _tensor_l2_sq(tensor)
             recv_l2_sq.add_(source_l2_sq)
             destination = writer.destination_name(name)
             copies = 1
             if destination is not None:
+                first_row = rows_received.get(name, 0)
+                rows_received[name] = first_row + tensor.shape[0]
                 with maybe_observe_broadcast_tensor(verifier, writer.feed, name, tensor):
-                    writer.feed(name, tensor)
+                    writer.feed(name, tensor, first_row)
                 destinations = [destination]
             else:
                 copies = _loaded_copies(duplicating_mappers, name)
@@ -773,8 +796,8 @@ class WeightSyncExtension:
                 applied_source_l2_sq.add_(source_l2_sq * copies)
             else:
                 skipped_source_names.append(name)
-            loaded += 1
             del tensor  # a rebuilt oversized tensor must not outlive its load
+        loaded = len(source_to_destinations) + len(skipped_source_names)
         if skipped_source_names:
             logger.warning(
                 "Weight sync skipped %d/%d received source tensor(s) because "
@@ -865,8 +888,7 @@ class WeightSyncExtension:
 
         start = time.time()
         model = self.model_runner.model
-        torch.cuda.reset_peak_memory_stats(self.device)
-        mem_before = torch.cuda.memory_allocated(self.device)
+        mem_before = _memory_before(self.device)
 
         # Opt-in weight-sync correctness diagnostic, env-gated (default off).
         from arctic_platform.inference import envs
@@ -1064,8 +1086,7 @@ class WeightSyncExtension:
             replaced = bool(adapter_manager.remove_adapter(lora_int_id))
             torch.cuda.empty_cache()
 
-        torch.cuda.reset_peak_memory_stats(self.device)
-        mem_before = torch.cuda.memory_allocated(self.device)
+        mem_before = _memory_before(self.device)
 
         # receive_weights() yields views into reusable NCCL buffers. Keep a
         # permanent copy before the next bucket reuses them. CPU staging avoids
@@ -1171,8 +1192,7 @@ class WeightSyncExtension:
             return {"status": "engine_ready", "rank": 1, "world_size": 2}
 
         start = time.time()
-        torch.cuda.reset_peak_memory_stats(self.device)
-        mem_before = torch.cuda.memory_allocated(self.device)
+        mem_before = _memory_before(self.device)
 
         all_weights = [(n, t.cpu()) for n, t in engine.receive_weights()]
         loaded = len(all_weights)
@@ -1247,8 +1267,7 @@ class WeightSyncExtension:
 
         start = time.time()
         model = self.model_runner.model
-        torch.cuda.reset_peak_memory_stats(self.device)
-        mem_before = torch.cuda.memory_allocated(self.device)
+        mem_before = _memory_before(self.device)
 
         names = ipc_payload["names"]
         self._validate_weight_sync_names(model, names, context="cuda_ipc")
@@ -1350,8 +1369,7 @@ class WeightSyncExtension:
         """``recv_l2_sq`` squares each full tensor on the GPU, before ``model.load_weights``."""
         start = time.time()
         model = self.model_runner.model
-        torch.cuda.reset_peak_memory_stats(self.device)
-        mem_before = torch.cuda.memory_allocated(self.device)
+        mem_before = _memory_before(self.device)
         self._validate_weight_sync_names(model, (name for name, _ in weights), context="cpu_to_gpu")
         self._offloaded_state = {}
 

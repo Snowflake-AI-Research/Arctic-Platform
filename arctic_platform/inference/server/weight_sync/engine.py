@@ -15,7 +15,7 @@ Two transfer modes:
 
 from __future__ import annotations
 
-from collections.abc import Generator, Iterable
+from collections.abc import Callable, Generator, Iterable
 import json
 import logging
 import time
@@ -37,6 +37,30 @@ def _bucket_meta_nbytes(entries: list[dict], *, is_last: bool) -> int:
     return len(
         json.dumps({"tensors": entries, "is_last": is_last}).encode("utf-8")
     )
+
+
+def _row_blocks(
+    name: str, chunk: torch.Tensor, tensor_offset: int, row: torch.Tensor,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Yield the whole rows completed by ``chunk``, the bytes of a tensor from ``tensor_offset`` on.
+
+    ``row`` is one row of that tensor: a row split across two chunks, or not aligned to the element size, is
+    assembled there and yielded from there.
+    """
+    row_bytes = row.view(-1).view(torch.uint8)
+    while chunk.numel():
+        filled = tensor_offset % row.nbytes
+        whole_bytes = chunk.numel() // row.nbytes * row.nbytes
+        if not filled and whole_bytes and chunk.storage_offset() % row.element_size() == 0:
+            size = whole_bytes
+            yield name, chunk[:size].view(row.dtype).reshape(-1, *row.shape)
+        else:
+            size = min(row.nbytes - filled, chunk.numel())
+            row_bytes[filled:filled + size].copy_(chunk[:size], non_blocking=True)
+            if filled + size == row.nbytes:
+                yield name, row.unsqueeze(0)
+        chunk = chunk[size:]
+        tensor_offset += size
 
 
 class NCCLEngine:
@@ -276,7 +300,9 @@ class NCCLEngine:
         self._send_events[idx].record(nccl_s)
 
     # Not @torch.no_grad(): its generator wrapper holds the last yield through the next rebuild (no autograd here).
-    def receive_weights(self) -> Generator[tuple[str, torch.Tensor], None, None]:
+    def receive_weights(
+        self, in_row_blocks: Callable[[str], bool] | None = None,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Pipelined receive: prefetch next bucket while caller processes current.
 
         The yielded tensors are views into one of two reusable NCCL receive
@@ -285,6 +311,12 @@ class NCCLEngine:
         the NCCL stream must wait for the caller's current stream; otherwise a
         later receive can overwrite the staging buffer before the parameter
         copy has actually read it.
+
+        A tensor larger than the bucket arrives in chunks and is rebuilt whole,
+        unless ``in_row_blocks(name)`` is true: then each chunk is yielded as it
+        arrives, as blocks of whole leading-dimension rows, each following the
+        previous one; only one row is ever buffered, and it is refilled on the
+        current stream after its yield.
         """
         assert not self.is_sender, "Only non-zero ranks can receive"
         self.ensure_staging_buffers()
@@ -339,6 +371,7 @@ class NCCLEngine:
                     continue
 
                 name = tm["name"]
+                in_rows = in_row_blocks is not None and in_row_blocks(name)
                 state = partial_tensors.get(name)
                 if state is None:
                     if tensor_offset != 0:
@@ -346,13 +379,14 @@ class NCCLEngine:
                             f"First chunk for {name!r} starts at byte "
                             f"{tensor_offset}, expected 0"
                         )
-                    tensor = torch.empty(shape, dtype=dtype, device=self.device)
-                    if tensor.nbytes != tensor_nbytes:
+                    if shape.numel() * dtype.itemsize != tensor_nbytes:
                         raise RuntimeError(
                             f"Chunk metadata for {name!r} declares "
                             f"{tensor_nbytes} bytes, but shape={list(shape)} "
-                            f"dtype={dtype} requires {tensor.nbytes}"
+                            f"dtype={dtype} requires {shape.numel() * dtype.itemsize}"
                         )
+                    # In row blocks only a row split across two chunks is held.
+                    tensor = torch.empty(shape[1:] if in_rows else shape, dtype=dtype, device=self.device)
                     state = (tensor, 0, tensor_nbytes)
                     partial_tensors[name] = state
 
@@ -369,12 +403,16 @@ class NCCLEngine:
                         f"Chunk for {name!r} ends at byte {end}, beyond "
                         f"tensor size {tensor_nbytes}"
                     )
-                tensor.view(-1).view(torch.uint8)[tensor_offset:end].copy_(
-                    chunk, non_blocking=True
-                )
+                if in_rows:
+                    yield from _row_blocks(name, chunk, tensor_offset, tensor)
+                else:
+                    tensor.view(-1).view(torch.uint8)[tensor_offset:end].copy_(
+                        chunk, non_blocking=True
+                    )
                 if end == tensor_nbytes:
                     del partial_tensors[name]
-                    yield name, tensor
+                    if not in_rows:
+                        yield name, tensor
                     # Holding the rebuilt tensor here would keep it alive through the next rebuild: two full copies.
                     tensor = state = None
                 else:
