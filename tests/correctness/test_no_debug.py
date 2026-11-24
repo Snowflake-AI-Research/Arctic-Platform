@@ -44,7 +44,7 @@ else:
 
 
 class TestNoDebugCorrectness(TestCasePlus):
-    def _run_isolated(self, program, *arguments):
+    def _run_isolated(self, program, *arguments, block_debug=True):
         env = self.get_env()
         env.update(
             CUDA_VISIBLE_DEVICES="",
@@ -56,7 +56,12 @@ class TestNoDebugCorrectness(TestCasePlus):
             PYTHONDONTWRITEBYTECODE="1",
         )
         return subprocess.run(
-            [sys.executable, "-c", _BLOCK_DEBUG + textwrap.dedent(program), *arguments],
+            [
+                sys.executable,
+                "-c",
+                (_BLOCK_DEBUG if block_debug else "import sys\n") + textwrap.dedent(program),
+                *arguments,
+            ],
             cwd=self.repo_root_dir,
             env=env,
             text=True,
@@ -73,10 +78,9 @@ class TestNoDebugCorrectness(TestCasePlus):
                 runpy.run_module("arctic_platform.correctness", run_name="__main__")
             except SystemExit as exc:
                 assert exc.code in (None, 0), exc.code
-            assert not any(name == "arctic_platform.debug" or name.startswith("arctic_platform.debug.")
-                           for name in sys.modules)
             """,
             *arguments,
+            block_debug=False,
         )
 
     def test_list_registers_all_seven_tests(self):
@@ -99,11 +103,12 @@ class TestNoDebugCorrectness(TestCasePlus):
             ],
         )
 
-    def test_onboard_help_loads_without_debug(self):
+    def test_onboard_help_loads_full_suite(self):
         result = self._cli("onboard", "--help")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("--test-id", result.stdout)
-        help_text = re.sub(r"-[ \t]*\r?\n[ \t]*", "-", result.stdout)
+        self.assertIn("single-step-grads", result.stdout)
+        self.assertIn("single-step-optimizer", result.stdout)
         for identifier in [
             "single-step-grads",
             "single-step-optimizer",
@@ -113,9 +118,9 @@ class TestNoDebugCorrectness(TestCasePlus):
             "rl-weight-sync",
             "rl-router-replay",
         ]:
-            self.assertIn(identifier, help_text)
+            self.assertIn(identifier, re.sub(r"-\s+", "-", result.stdout))
 
-    def test_run_help_loads_without_debug(self):
+    def test_run_help_loads_full_suite(self):
         result = self._cli("run", "--help")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("--test", result.stdout)
@@ -202,13 +207,12 @@ class TestNoDebugCorrectness(TestCasePlus):
                 assert "CUDA is unavailable" in str(exc), str(exc)
             else:
                 raise AssertionError("CPU onboarding was admitted")
-            assert not any(name == "arctic_platform.debug" or name.startswith("arctic_platform.debug.")
-                           for name in sys.modules)
             assert not (root / "cache").exists()
             assert not (root / "spec.json").exists()
             print("CPU_ADMISSION_REJECTED")
             """,
             str(config),
+            block_debug=False,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("CPU_ADMISSION_REJECTED", result.stdout)

@@ -1,0 +1,16 @@
+{
+  "combined_reference_error": null,
+  "config": "/code/users/stas/github/sf/stas-dss-repro/arctic-platform-correctness-testing/arctic_platform/correctness/configs/glm5.3-flash/h200/train-sft-lora-8gpus-sp8-256k.config",
+  "config_id": "glm5.3-flash-h200-train-sft-lora-8gpus-sp8-256k",
+  "results": {
+    "inference-checkpoint-loss": {
+      "reason": "gradient fixture onboarding failed",
+      "status": "failed"
+    },
+    "single-step-grads": {
+      "reason": "final 4-layer regression failed\nTarget process exited 2 without a reported failure reason.\nLast target output:\nCannot run: --inference-sampling-topology requires one config and only inference-checkpoint-loss\nReport: not written\nComplete log: /code/users/stas/github/sf/stas-dss-repro/arctic-platform-correctness-testing/work/reports/glm-lora-inference-pending-9JvS4Uly/logs/onboarding-qd70mtte/single-step-grads/validation/4-layers/run.log",
+      "status": "failed"
+    }
+  },
+  "test_spec": "/code/users/stas/github/sf/stas-dss-repro/arctic-platform-correctness-testing/arctic_platform/correctness/specs/glm5.3-flash-h200-train-sft-lora-8gpus-sp8-256k.json"
+}

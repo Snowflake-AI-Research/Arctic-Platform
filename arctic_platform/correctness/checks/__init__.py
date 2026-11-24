@@ -15,21 +15,20 @@
 
 """Correctness checks, registered by importing them."""
 
+from . import checkpoint_resume  # noqa: F401
+from . import e2e_sft_train_validate
 from . import fwd_bwd
 from . import fwd_bwd_step
-
-__all__ = [
-    "fwd_bwd",
-    "fwd_bwd_step",
-]
-
-from . import checkpoint_resume
-from . import e2e_sft_train_validate
 from . import inference_checkpoint_loss
-
-__all__ += ["checkpoint_resume", "inference_checkpoint_loss", "e2e_sft_train_validate"]
-
 from . import rl_router_replay
 from . import rl_weight_sync
 
-__all__ += ["rl_router_replay", "rl_weight_sync"]
+__all__ = [
+    "checkpoint_resume",
+    "e2e_sft_train_validate",
+    "fwd_bwd",
+    "fwd_bwd_step",
+    "inference_checkpoint_loss",
+    "rl_router_replay",
+    "rl_weight_sync",
+]

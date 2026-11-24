@@ -273,12 +273,10 @@ def _configure_fixture_target(args: argparse.Namespace, config, selection: list[
     if (
         getattr(args, "prepare_references", False)
         or getattr(args, "probe_layers", None) is not None
+        or (getattr(args, "local_gateway_full_model", False) and set(selection) != {"e2e-sft-train-validate"})
         or getattr(args, "backend", "onprem") not in {"cortex", "cortex-training"}
         or (config.is_rl and getattr(args, "test_id", None) != "checkpoint-resume-loss")
-        or not (
-            set(selection).intersection((*CALIBRATED_TEST_IDS, "checkpoint-resume-loss"))
-            or (getattr(args, "local_gateway_full_model", False) and selection == ["e2e-sft-train-validate"])
-        )
+        or not set(selection).intersection((*CALIBRATED_TEST_IDS, "checkpoint-resume-loss", "e2e-sft-train-validate"))
     ):
         return
     from arctic_platform.correctness.harness.execution import _client_backend
@@ -299,7 +297,9 @@ def _configure_fixture_target(args: argparse.Namespace, config, selection: list[
             "Remove hosted ARCTIC_CORTEX_HOST/PAT settings to use the automatically managed local gateway, "
             "or pass --base-url for an existing local gateway. Hosted local-model onboarding is unsupported."
         ) from exc
-    if args.test_id in (*CALIBRATED_TEST_IDS, "checkpoint-resume-loss"):
+    if args.test_id in (*CALIBRATED_TEST_IDS, "checkpoint-resume-loss") or (
+        args.test_id == "e2e-sft-train-validate" and not getattr(args, "local_gateway_full_model", False)
+    ):
         args.local_cortex_fixture = True
     if args.test_id == "checkpoint-resume-loss":
         args._automatic_checkpoint_bridge = True
@@ -332,6 +332,7 @@ def _validation_gateway(args: argparse.Namespace):
         if getattr(args, "_automatic_checkpoint_bridge", False):
             from arctic_platform.correctness.harness.cortex import local_checkpoint_bridge
 
+            # A configured loopback gateway still needs the bridge: its plain save has no durable catalog entry.
             with local_checkpoint_bridge():
                 yield None
             return
@@ -346,7 +347,7 @@ def _validation_gateway(args: argparse.Namespace):
         with _regression_gateway(SimpleNamespace(**{**vars(args), "out": directory})) as url:
             yield url
         return
-    with local_cortex_gateway(directory, gateway_module="arctic_platform.correctness.harness.gateway") as url:
+    with local_cortex_gateway(directory, gateway_module="arctic_platform.debug.training") as url:
         yield url
 
 
@@ -1470,6 +1471,7 @@ def _optimizer_validation_bootstrap(args: argparse.Namespace) -> dict | None:
         or args.test_id != "single-step-optimizer"
         or getattr(args, "prepare_references", False)
         or getattr(args, "probe_layers", None) is not None
+        or getattr(args, "local_gateway_full_model", False)
         or getattr(args, "reference_tests", None)
     ):
         raise ValueError("optimizer validation bootstrap requires only local Cortex Test 2 onboarding")
@@ -1510,9 +1512,9 @@ def _optimizer_validation_bootstrap(args: argparse.Namespace) -> dict | None:
 
 def _run_final_regression(args: argparse.Namespace, selected: dict, *, phase: str = "Validation") -> dict:
     """Run the frozen config exactly as future regression runs will execute it."""
-    automatic_gateway = getattr(args, "_automatic_cortex_gateway", False) and (
-        args.test_id in CALIBRATED_TEST_IDS
-        or (getattr(args, "local_gateway_full_model", False) and args.test_id == "e2e-sft-train-validate")
+    automatic_gateway = getattr(args, "_automatic_cortex_gateway", False) and args.test_id in (
+        *CALIBRATED_TEST_IDS,
+        "e2e-sft-train-validate",
     )
     bootstrap = _optimizer_validation_bootstrap(args)
     if bootstrap != getattr(args, "_admitted_optimizer_validation_bootstrap", bootstrap):
@@ -1801,7 +1803,6 @@ def _onboard_checkpoint_resume(args: argparse.Namespace, config) -> int:
             arms=arms,
             workdir=args.output_dir / "checkpoint-resume-calibration",
             attn_implementation=config.attention_implementation,
-            spec=spec,
             **transport_options,
         )
     gate = loss_range_gate(raw_range, where)
@@ -2095,7 +2096,7 @@ def _run_local_optimizer_calibration(args: argparse.Namespace, config, spec) -> 
                 "optimizer reference preparation returned target results instead of reference-only success"
             )
         paths = sorted(
-            (ctx.reference_records_dir / reference_config_subpath(config.path, config.config_id) / test_id).glob(
+            (ctx.reference_records_dir / reference_config_subpath(config.path, config.config_id) / test_id).rglob(
                 "*.json"
             )
         )
@@ -2139,6 +2140,7 @@ def _run_local_optimizer_calibration(args: argparse.Namespace, config, spec) -> 
                 "learning_rate": OPTIMIZER_LEARNING_RATE,
                 "gradient_clipping": config.training.get("gradient_clipping"),
                 "dtype": config.optimizer_dtype,
+                "compute_dtype": config.optimizer_compute_dtype(str(args.optimizer_model_path)),
             }
             if (
                 recipe.get("model") != expected_model
@@ -2333,10 +2335,11 @@ def _parent(args: argparse.Namespace) -> int:
         getattr(args, "backend", "onprem") != "cortex"
         or (config.is_rl and args.test_id != "checkpoint-resume-loss")
         or getattr(args, "local_gateway_full_model", False)
-        or args.test_id not in (*CALIBRATED_TEST_IDS, "checkpoint-resume-loss")
+        or args.test_id not in (*CALIBRATED_TEST_IDS, "checkpoint-resume-loss", "e2e-sft-train-validate")
     ):
         raise ValueError(
-            "local Cortex fixture onboarding requires supervised Cortex gradients or optimizer, or checkpoint-resume"
+            "local Cortex fixture onboarding requires supervised Cortex gradients, optimizer or E2E, "
+            "or checkpoint-resume"
         )
     if getattr(args, "backend", "onprem") == "cortex":
         from arctic_platform.correctness.harness.execution import _client_backend
@@ -3286,6 +3289,7 @@ def _run_optimizer_calibration(args: argparse.Namespace) -> Path:
             learning_rate=1e-2,
             gradient_clipping=config.training.get("gradient_clipping"),
             optimizer_dtype=config.optimizer_dtype,
+            optimizer_compute_dtype=config.optimizer_compute_dtype(str(model_path)),
             optimizer_output_dir=run_dir / "states",
             cuda_device=run_index % lanes,
             deterministic=False,

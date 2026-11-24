@@ -613,13 +613,11 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
         not remote
         or not args.config
         or args.all_configs
-        or (fixture_path is not None)
-        or (not args.test)
-        or (
-            not (
-                set(args.test) <= {"single-step-grads", "single-step-optimizer", "e2e-sft-train-validate"}
-                or set(args.test) == {"checkpoint-resume-loss"}
-            )
+        or fixture_path is not None
+        or not args.test
+        or not (
+            set(args.test) <= {"single-step-grads", "single-step-optimizer", "e2e-sft-train-validate"}
+            or set(args.test) == {"checkpoint-resume-loss"}
         )
     ):
         raise SystemExit(
@@ -630,9 +628,9 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
         or not args.config
         or args.all_configs
         or local_fixture
-        or (fixture_path is not None)
-        or (not args.test)
-        or (not set(args.test) <= {"e2e-sft-train-validate", "inference-checkpoint-loss"})
+        or fixture_path is not None
+        or not args.test
+        or not set(args.test) <= {"e2e-sft-train-validate", "inference-checkpoint-loss"}
     ):
         raise SystemExit("--local-gateway-full-model requires one Cortex config and only e2e/inference")
     if local_fixture or local_full_model:
@@ -656,13 +654,16 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
         raise SystemExit(f"unknown check(s): {', '.join(unknown)}")
     selected_ids = set(args.test or tests)
     first_two_ids = {"single-step-grads", "single-step-optimizer"}
-    first_two_selection = bool(selected_ids and selected_ids <= first_two_ids)
     automatic_first_two = bool(
         getattr(args, "_automatic_cortex_gateway", False)
         and args.test
-        and (selected_ids <= first_two_ids)
-        and (not getattr(args, "_automatic_checkpoint_bridge", False))
+        and selected_ids <= first_two_ids
+        and not getattr(args, "_automatic_checkpoint_bridge", False)
     )
+    automatic_e2e = bool(
+        getattr(args, "_automatic_cortex_gateway", False) and selected_ids == {"e2e-sft-train-validate"}
+    )
+
     for path in config_paths:
         automatic_allocation = None
         try:
@@ -711,15 +712,16 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                 if selected_gpus is not None
                 else (
                     [cfg.n_gpus]
-                    if local_fixture
-                    and (not first_two_selection)
-                    or local_full_model
-                    or topology is not None
-                    or (inference_export_allocation is not None)
+                    if (
+                        (local_fixture and not automatic_first_two)
+                        or local_full_model
+                        or topology is not None
+                        or inference_export_allocation is not None
+                    )
                     else placement_widths(cfg.n_gpus, pool)
                 )
             )
-            if automatic_first_two and (not cfg.is_rl):
+            if automatic_first_two and not cfg.is_rl:
                 for width in widths:
                     validate_reference_accumulation(cfg.at_gpu_width(width), automatically_owned_local=True)
                 import torch
@@ -727,6 +729,12 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                 if local_fixture and max(widths) > torch.cuda.device_count():
                     from .engine_admission import owned_allocation_admission
 
+                    automatic_allocation = owned_allocation_admission(cfg.at_gpu_width(max(widths)))
+            if automatic_e2e and local_fixture and not cfg.is_rl:
+                from .engine_admission import owned_allocation_admission
+                from .gateway import _allocation_hostfile
+
+                if _allocation_hostfile() is not None:
                     automatic_allocation = owned_allocation_admission(cfg.at_gpu_width(max(widths)))
         except (ValueError, KeyError) as exc:
             results.append(
@@ -857,8 +865,8 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                         cases=getattr(args, "case", None),
                         attn=args.attn[0] if args.attn else None,
                         client_backend=backend,
-                        **{"local_cortex_fixture": True} if local_fixture else {},
-                        **{"inference_sampling_topology": topology} if topology is not None else {},
+                        **({"local_cortex_fixture": True} if local_fixture else {}),
+                        **({"inference_sampling_topology": topology} if topology is not None else {}),
                         **(
                             {"inference_export_allocation": inference_export_allocation}
                             if inference_export_allocation is not None
@@ -970,7 +978,7 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                 **(
                     {"local_full_model_path": inference_initial_model_dir}
                     if inference_initial_model_dir is not None
-                    else {"local_full_model_path": local_full_model_path} if local_full_model else {}
+                    else ({"local_full_model_path": local_full_model_path} if local_full_model else {})
                 ),
             )
             for width in widths:
@@ -987,17 +995,18 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                     if (
                         run_dense_allocation is None
                         and "single-step-optimizer" in selected_ids
-                        and (selected_ids <= first_two_ids)
+                        and selected_ids <= first_two_ids
                         and supports_dense_checkpoint_allocation(run_cfg)
-                        and (sum((node["slots"] for node in automatic_allocation["nodes"])) == run_cfg.dp_size)
+                        and sum(node["slots"] for node in automatic_allocation["nodes"]) == run_cfg.dp_size
                     ):
                         run_dense_allocation = automatic_allocation
                 if (
                     local_fixture
                     and "single-step-optimizer" in selected_ids
-                    and (selected_ids <= first_two_ids)
-                    and (run_cfg.training.get("ep_size", 1) > 1)
+                    and selected_ids <= first_two_ids
+                    and run_cfg.training.get("ep_size", 1) > 1
                 ):
+                    # EP checkpoints shard optimizer state per expert rank; only the native layout decodes them.
                     from arctic_platform.correctness.harness.native_optimizer import owner_split_execution
 
                     native_optimizer = owner_split_execution(run_cfg)
@@ -1012,10 +1021,10 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                         select=args.test or None,
                         attn=args.attn[0] if args.attn else None,
                         client_backend=backend,
-                        **{"cortex_fixture": fixture_path} if fixture_path is not None else {},
-                        **{"local_cortex_fixture": True} if local_fixture else {},
-                        **{"local_gateway_full_model": True} if local_full_model else {},
-                        **{"inference_sampling_topology": topology} if topology is not None else {},
+                        **({"cortex_fixture": fixture_path} if fixture_path is not None else {}),
+                        **({"local_cortex_fixture": True} if local_fixture else {}),
+                        **({"local_gateway_full_model": True} if local_full_model else {}),
+                        **({"inference_sampling_topology": topology} if topology is not None else {}),
                         **(
                             {"inference_export_allocation": inference_export_allocation}
                             if inference_export_allocation is not None
@@ -1032,13 +1041,13 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
                             else {}
                         ),
                         **(
-                            {"peft_adapter": Path(args.peft_adapter)}
-                            if getattr(args, "peft_adapter", None) is not None
+                            {"dense_checkpoint_allocation": copy.deepcopy(run_dense_allocation)}
+                            if run_dense_allocation is not None
                             else {}
                         ),
                         **(
-                            {"dense_checkpoint_allocation": copy.deepcopy(run_dense_allocation)}
-                            if run_dense_allocation is not None
+                            {"peft_adapter": Path(args.peft_adapter)}
+                            if getattr(args, "peft_adapter", None) is not None
                             else {}
                         ),
                         **native_optimizer,
@@ -1363,6 +1372,7 @@ def add_connection_arguments(parser, *, default_backend="cortex-training"):
 
 
 def parse_args(argv=None):
+    argv = list(argv) if argv is not None else sys.argv[1:]
     parser = argparse.ArgumentParser(prog="arctic_platform.correctness")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -1503,10 +1513,11 @@ def parse_args(argv=None):
     s = sub.add_parser("selftest", help="check the harness itself; no GPU and no config needed")
     s.add_argument("runner_args", nargs="*", help="extra arguments forwarded to the runner")
     s.set_defaults(func=cmd_selftest)
-    from ..onboarding import add_arguments
-
     o = sub.add_parser("onboard", help="size, calibrate, and freeze one config")
-    add_arguments(o)
+    if argv and argv[0] == "onboard":
+        from ..onboarding import add_arguments
+
+        add_arguments(o)
     o.set_defaults(func=cmd_onboard)
     return parser.parse_args(argv)
 

@@ -425,8 +425,8 @@ def verify_final_runtime_request(cfg: dict, admission: dict, world_size: int, sp
 
 
 @contextlib.contextmanager
-def gateway_runtime_scope(gateway, hostfile: Path, *, first_two_only: bool = False):
-    """Bind final child requests; the full-suite gateway opts into marked first-two jobs only."""
+def gateway_runtime_scope(gateway, hostfile: Path, *, first_two_only: bool = False, local_fixture_e2e: bool = False):
+    """Bind final child requests only for the owned gateway's explicitly selected fixture tests."""
     raw_allocation = correctness_environment(RUNTIME_ADMISSION_ENV)
     allocation = json.loads(raw_allocation) if raw_allocation is not None else None
     if allocation is None:
@@ -438,10 +438,19 @@ def gateway_runtime_scope(gateway, hostfile: Path, *, first_two_only: bool = Fal
         if config.training_config is None:
             return await original(zone, config, job_id)
         if first_two_only:
-            marker = (config.training_config.debug or {}).get("correctness_first_two", False)
-            if type(marker) is not bool:
-                raise ValueError("correctness_first_two must be an explicit boolean")
-            if not marker:
+            debug = config.training_config.debug or {}
+            markers = (
+                ("correctness_first_two", "correctness_e2e_fixture")
+                if local_fixture_e2e
+                else ("correctness_first_two",)
+            )
+            enabled = False
+            for name in markers:
+                marker = debug.get(name, False)
+                if type(marker) is not bool:
+                    raise ValueError(f"{name} must be an explicit boolean")
+                enabled = enabled or marker
+            if not enabled:
                 return await original(zone, config, job_id)
         from dss.ray_dss.jobs.gpu import training
         from dss.ray_dss.stage_info import strip_stage_info_from_job_config

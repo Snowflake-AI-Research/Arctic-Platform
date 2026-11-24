@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
+from arctic_platform.debug.training import ReducedFixtureMTP
 from arctic_platform.model.config import ActivationCheckpointConfig
 from arctic_platform.model.implementations.moe.config import DISPATCH_EP_BACKENDS, EPCommBackend
 
@@ -20,6 +21,7 @@ class DebugModelConfig:
     num_layers: int | None = None
     gradient_sample_max_numel: int = 0
     full_determinism: bool = False
+    reduced_fixture_mtp: ReducedFixtureMTP | dict | None = None
 
 
 @dataclass

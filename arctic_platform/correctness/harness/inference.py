@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 """Inference exports and router-replay receipts."""
 
 from __future__ import annotations
@@ -602,7 +601,12 @@ def validate_glm53_full_config(source_config, export_config):
 
 
 def validate_glm53_full_schema(source_config, source_schema, export_schema):
-    """Admit only GLM's named active-parameter casts; preserve every other header."""
+    """Preserve every original GLM header, including the FP32 mHC base/scale and KDA ``A_log``/``dt_bias``.
+
+    The training model keeps those four parameter families in the checkpoint's FP32
+    (``Glm5NextForConditionalGeneration.keeps_fp32_parameter``) and the sampler serves them in FP32, so an export that
+    casts them no longer carries the trained model's tensors.
+    """
     validate_glm53_full_config(source_config, source_config)
     quantization = source_config.get("quantization_config")
     original_schema_bytes(source_schema, quantization)
@@ -617,17 +621,7 @@ def validate_glm53_full_schema(source_config, source_schema, export_schema):
         prefix = f"model.language_model.layers.{index}."
         if not {prefix + name for name in ("eh_proj.weight", "enorm.weight", "hnorm.weight")} <= source_schema.keys():
             raise ValueError("complete original GLM prediction-layer inventory required: " + prefix)
-    projected = {}
-    for name, (dtype, shape) in source_schema.items():
-        cast = re.fullmatch(
-            layer_pattern + r"(?:self_attn\.(?:A_log|dt_bias)|hc_(?:attn|ffn)_(?:base|scale))",
-            name,
-        )
-        # Native GLM loads these active parameters in the configured BF16 dtype.
-        # Inactive prediction tensors, FP8 weights and FP32 scales are retained.
-        if cast and int(cast[1]) < active_layers and dtype == "F32":
-            dtype = "BF16"
-        projected[name] = [dtype, shape]
+    projected = {name: [dtype, shape] for name, (dtype, shape) in source_schema.items()}
     if export_schema != projected:
         missing = sorted(set(projected) - set(export_schema))
         unexpected = sorted(set(export_schema) - set(projected))
@@ -635,7 +629,7 @@ def validate_glm53_full_schema(source_config, source_schema, export_schema):
             name for name in projected.keys() & export_schema.keys() if projected[name] != export_schema[name]
         )
         raise ValueError(
-            "exact original GLM inventory and supported active-parameter dtypes required: "
+            "exact original GLM inventory and dtypes required: "
             + "; ".join(
                 f"{key}={len(names)} {names[:8]!r}"
                 for key, names in (("missing", missing), ("unexpected", unexpected), ("differences", differences))
@@ -1036,12 +1030,16 @@ def _validate_local_allocation(admission, deadline, hostfile_identity=None):
             or not re.fullmatch(r"[0-9a-f]{64}", node.get("python_sha256", ""))
         ):
             raise ValueError("actual node hostname, boot, slots and executable pins required")
-    _validate_local_node(nodes[0], deadline)
+    local = [node for node in nodes if node["hostname"] == socket.gethostname()]
+    if len(local) != 1:
+        raise ValueError("exactly one admitted identity must match the live head")
+    _validate_local_node(local[0], deadline)
     if _local_hostfile_identity() != before:
         raise ValueError("allocation hostfile link or target changed during validation")
     if hostfile_identity is not None:
         hostfile_identity.update(before)
-    return nodes
+    # Hostfile order binds the admission; transfers need the actual head first.
+    return [local[0], *[node for node in nodes if node is not local[0]]]
 
 
 def validate_local_inference_allocation(admission):
@@ -1295,53 +1293,6 @@ def _ssh_trust_parent(path, deadline):
         yield fd, revalidate
 
 
-def _publish_ssh_trust(path, raw, deadline):
-    """Publish already-authenticated trust bytes; never acquire keys or replace a slot."""
-    path = Path(path)
-    require_data_fast_path(path)
-    if type(raw) is not bytes or not 0 < len(raw) <= 4 * 1024**2:
-        raise ValueError("bounded original strict SSH trust bytes required")
-    with _ssh_trust_parent(path, deadline) as (parent, revalidate), contextlib.ExitStack() as descriptors:
-        fd = os.open(path.name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
-        descriptors.callback(os.close, fd)
-        created = os.fstat(fd)
-        pending = memoryview(raw)
-        while pending:
-            _local_remaining(deadline)
-            count = os.write(fd, pending)
-            if count <= 0:
-                raise OSError("strict SSH trust publication made no progress")
-            pending = pending[count:]
-        os.fchmod(fd, 0o400)
-        os.fsync(fd)
-        held = os.fstat(fd)
-        if (
-            (held.st_dev, held.st_ino) != (created.st_dev, created.st_ino)
-            or held.st_size != len(raw)
-            or held.st_nlink != 1
-        ):
-            raise ValueError("strict SSH trust publication identity changed")
-        os.lseek(fd, 0, os.SEEK_SET)
-        digest = hashlib.sha256()
-        remaining = len(raw)
-        while remaining:
-            _local_remaining(deadline)
-            block = os.read(fd, min(remaining, 1024**2))
-            if not block:
-                raise ValueError("strict SSH trust publication truncated")
-            digest.update(block)
-            remaining -= len(block)
-        if os.read(fd, 1) or digest.hexdigest() != hashlib.sha256(raw).hexdigest():
-            raise ValueError("strict SSH trust publication bytes changed")
-        revalidate()
-        if _ssh_file_identity(os.fstat(fd)) != _ssh_file_identity(held) or _ssh_file_identity(
-            os.stat(path.name, dir_fd=parent, follow_symlinks=False)
-        ) != _ssh_file_identity(held):
-            raise ValueError("strict SSH trust publication slot or file identity changed")
-        _local_remaining(deadline)
-        return {"known_hosts": str(path), "known_hosts_sha256": digest.hexdigest()}
-
-
 @contextlib.contextmanager
 def _held_ssh_trust(transport, deadline):
     path = Path(transport.get("known_hosts", ""))
@@ -1461,8 +1412,13 @@ def _local_ssh_argv(admission, node, request, deadline):
         yield argv
 
 
-def distribute_local_inference_export(root, admission, *, timeout_s=1800.0):
-    """Publish exact step-save bytes on every admitted same-job sampling node."""
+def distribute_local_inference_export(root, admission, *, timeout_s=14400.0):
+    """Publish exact step-save bytes on every admitted same-job sampling node.
+
+    Every sampling node receives its copy concurrently, each over its own sender and SSH receiver. The default deadline
+    only bounds a hung transport: one stream moved 423 MB/s, so a 642.7 GB GLM-5.3-Flash export takes about 2,000 s per
+    node including the receiver's re-hash, and about 5,000 s if three concurrent streams share one stream's bandwidth.
+    """
     if type(timeout_s) not in (float, int) or not math.isfinite(timeout_s) or timeout_s <= 0:
         raise ValueError("finite positive inference export deadline required")
     deadline = time.monotonic() + timeout_s
@@ -1475,22 +1431,22 @@ def distribute_local_inference_export(root, admission, *, timeout_s=1800.0):
     manifest = saved["manifest"]
     manifest_sha = schema_sha(manifest)
     receipts = []
-    for node in nodes[1:]:
-        request = {
-            "root": str(root),
-            "node": node,
-            "allocation_id": admission["allocation_id"],
-            "manifest_sha256": manifest_sha,
-            "timeout_s": _local_remaining(deadline),
-            "deadline_epoch": time.time() + _local_remaining(deadline),
-        }
-        children = []
-        with (
-            _local_ssh_argv(admission, node, request, deadline) as argv,
-            tempfile.TemporaryFile() as sender_errors,
-            tempfile.TemporaryFile() as receiver_errors,
-        ):
-            try:
+    children = []
+    with contextlib.ExitStack() as transports:
+        try:
+            transfers = []
+            for node in nodes[1:]:
+                request = {
+                    "root": str(root),
+                    "node": node,
+                    "allocation_id": admission["allocation_id"],
+                    "manifest_sha256": manifest_sha,
+                    "timeout_s": _local_remaining(deadline),
+                    "deadline_epoch": time.time() + _local_remaining(deadline),
+                }
+                argv = transports.enter_context(_local_ssh_argv(admission, node, request, deadline))
+                sender_errors = transports.enter_context(tempfile.TemporaryFile())
+                receiver_errors = transports.enter_context(tempfile.TemporaryFile())
                 sender = subprocess.Popen(
                     _local_worker_argv(
                         sys.executable,
@@ -1511,6 +1467,10 @@ def distribute_local_inference_export(root, admission, *, timeout_s=1800.0):
                 )
                 children.append(receiver)
                 sender.stdout.close()
+                transfers.append((node, sender, receiver, sender_errors, receiver_errors))
+            # A receiver writes only its bounded JSON receipt to stdout, so collecting the receipts in node order
+            # cannot stall a transfer that is still streaming.
+            for node, sender, receiver, sender_errors, receiver_errors in transfers:
                 output, _ = receiver.communicate(timeout=_local_remaining(deadline))
                 sender.wait(timeout=_local_remaining(deadline))
                 _local_remaining(deadline)
@@ -1533,8 +1493,8 @@ def distribute_local_inference_export(root, admission, *, timeout_s=1800.0):
                 }:
                     raise ValueError("sampling node did not publish the exact inference export")
                 receipts.append(receipt)
-            finally:
-                _stop_local_children(children)
+        finally:
+            _stop_local_children(children)
     _validate_local_allocation(admission, deadline, hostfile_identity)
     if saved["head_files"] != {
         name: list(_fingerprint(path)) for name, path in _local_export_paths(Path(root)).items()
@@ -1893,3 +1853,50 @@ def export_checkpoint(
             except OSError:
                 raise CheckpointExportError("checkpoint export failed and snapshot cleanup failed") from None
     raise CheckpointExportError(failure) from None
+
+
+def _publish_ssh_trust(path, raw, deadline):
+    """Publish already-authenticated trust bytes; never acquire keys or replace a slot."""
+    path = Path(path)
+    require_data_fast_path(path)
+    if type(raw) is not bytes or not 0 < len(raw) <= 4 * 1024**2:
+        raise ValueError("bounded original strict SSH trust bytes required")
+    with _ssh_trust_parent(path, deadline) as (parent, revalidate), contextlib.ExitStack() as descriptors:
+        fd = os.open(path.name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
+        descriptors.callback(os.close, fd)
+        created = os.fstat(fd)
+        pending = memoryview(raw)
+        while pending:
+            _local_remaining(deadline)
+            count = os.write(fd, pending)
+            if count <= 0:
+                raise OSError("strict SSH trust publication made no progress")
+            pending = pending[count:]
+        os.fchmod(fd, 0o400)
+        os.fsync(fd)
+        held = os.fstat(fd)
+        if (
+            (held.st_dev, held.st_ino) != (created.st_dev, created.st_ino)
+            or held.st_size != len(raw)
+            or held.st_nlink != 1
+        ):
+            raise ValueError("strict SSH trust publication identity changed")
+        os.lseek(fd, 0, os.SEEK_SET)
+        digest = hashlib.sha256()
+        remaining = len(raw)
+        while remaining:
+            _local_remaining(deadline)
+            block = os.read(fd, min(remaining, 1024**2))
+            if not block:
+                raise ValueError("strict SSH trust publication truncated")
+            digest.update(block)
+            remaining -= len(block)
+        if os.read(fd, 1) or digest.hexdigest() != hashlib.sha256(raw).hexdigest():
+            raise ValueError("strict SSH trust publication bytes changed")
+        revalidate()
+        if _ssh_file_identity(os.fstat(fd)) != _ssh_file_identity(held) or _ssh_file_identity(
+            os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+        ) != _ssh_file_identity(held):
+            raise ValueError("strict SSH trust publication slot or file identity changed")
+        _local_remaining(deadline)
+        return {"known_hosts": str(path), "known_hosts_sha256": digest.hexdigest()}

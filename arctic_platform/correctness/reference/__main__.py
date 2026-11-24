@@ -77,6 +77,11 @@ def main() -> None:
     parser.add_argument("--learning-rate", type=float)
     parser.add_argument("--gradient-clipping", type=float)
     parser.add_argument("--optimizer-dtype", choices=("float32", "bfloat16"), default="float32")
+    parser.add_argument(
+        "--optimizer-compute-dtype",
+        choices=("float32", "bfloat16"),
+        help="precision the AdamW update is computed in; default the optimizer dtype",
+    )
     parser.add_argument("--optimizer-output-dir")
     parser.add_argument(
         "--deterministic",
@@ -120,6 +125,7 @@ def main() -> None:
         learning_rate=args.learning_rate,
         gradient_clipping=args.gradient_clipping,
         optimizer_dtype=args.optimizer_dtype,
+        optimizer_compute_dtype=args.optimizer_compute_dtype,
         optimizer_output_dir=args.optimizer_output_dir,
     )
     Path(args.out).write_text(

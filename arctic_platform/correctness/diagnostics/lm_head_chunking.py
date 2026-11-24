@@ -14,14 +14,14 @@
 # limitations under the License.
 
 # !/usr/bin/env python3
-"""First-two diagnostic that disables LM-head chunking through copied model options.
+"""Diagnostic that disables LM-head chunking through copied model options.
 
 The source config and reviewed specification are not edited. This altered workload
 still requires compatible prepared reference records; a canonical record must not
-be relabelled as an unchunked reference. Diagnostic results are not canonical verdicts.
+be reused as if its chunking identity matched the altered workload.
 
-Usage: ``python -m arctic_platform.correctness.diagnostics.lm_head_chunking
---config <external-path> --test single-step-grads``.
+Usage: ``python -m arctic_platform.correctness.diagnostics.lm_head_chunking --config <path> --test single-step-grads``; every
+argument is passed to ``run``.
 """
 
 from __future__ import annotations

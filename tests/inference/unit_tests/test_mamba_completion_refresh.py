@@ -114,10 +114,12 @@ def manager_methods(monkeypatch):
     vllm.__version__ = "0.33.0"
     monkeypatch.setitem(sys.modules, "vllm", vllm)
     # Loading the patch through the required entry point also covers vanilla vLLM.
+    from arctic_platform.inference import vllm as patches
     from arctic_platform.inference.vllm import required_patches
 
     for name, entry in [
         ("config", "ensure_dflash_max_position_patch"),
+        ("deepseek_v41_lora", "ensure_deepseek_v41_lora"),
         ("router_replay", "ensure_router_replay_vllm_patches"),
         ("xgrammar_stop_mask", "ensure_xgrammar_stop_mask_fix"),
         ("dense_prompt_logprobs", "ensure_dense_prompt_logprobs_patch"),
@@ -127,11 +129,11 @@ def manager_methods(monkeypatch):
         ("kv_group_size", "ensure_kv_group_size_patch"),
         ("mrope_yarn", "ensure_mrope_yarn_fix"),
         ("glm5next_lora", "ensure_glm5next_lora"),
-        ("deepseek_v41_lora", "ensure_deepseek_v41_lora"),
     ]:
         stub = ModuleType(f"arctic_platform.inference.vllm.{name}")
         setattr(stub, entry, lambda: None)
         monkeypatch.setitem(sys.modules, stub.__name__, stub)
+        monkeypatch.setattr(patches, name, stub, raising=False)
     patch_name = "arctic_platform.inference.vllm.mamba_completion_refresh"
     if importlib.util.find_spec(patch_name):
         from arctic_platform.inference.vllm import mamba_completion_refresh

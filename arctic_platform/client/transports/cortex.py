@@ -109,6 +109,16 @@ def _capacity_query(request: Request, body: dict) -> list[Send]:
     return _query(request, body)
 
 
+def _training_frame(body: dict) -> bytes:
+    """Keep replay coordination in the metadata the zone reads, outside the model batch."""
+    batch = dict(body)
+    metadata = dict(_CHUNKED_RESULTS)
+    replay = batch.pop("router_replay", None)
+    if replay is not None:
+        metadata["router_replay"] = replay
+    return wire.dumps(batch, metadata=metadata)
+
+
 def _octet(wire_op: str, *, force_chunk: bool = False) -> Callable[[Request, dict], list[Send]]:
     """DSSST1 octet bodies, one send per chunk; ``wire_op`` labels the chunk envelope."""
 
@@ -891,13 +901,3 @@ def _decode_result(result: dict, chunks: Sequence[bytes] = ()) -> Any:
     if "metrics" in result:
         decoded["metrics"] = {**decoded.get("metrics", {}), **result["metrics"]}
     return decoded
-
-
-def _training_frame(body: dict) -> bytes:
-    """Keep replay coordination in the metadata the zone reads, outside the model batch."""
-    batch = dict(body)
-    metadata = dict(_CHUNKED_RESULTS)
-    replay = batch.pop("router_replay", None)
-    if replay is not None:
-        metadata["router_replay"] = replay
-    return wire.dumps(batch, metadata=metadata)

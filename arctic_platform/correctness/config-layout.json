@@ -1,11 +1,75 @@
 {
+  "glm-5.3-flash-bf16/long/h200-training-full--legacy-flat-rl-32gpus-sp16-256k.json": {
+    "config_id": "train-rl-32gpus-sp16-256k",
+    "previous_path": "train-rl-32gpus-sp16-256k.config"
+  },
+  "glm-5.3-flash-bf16/long/h200-training-full--rl-32gpus-sp16-256k.json": {
+    "config_id": "glm5.3-flash-bf16-h200-train-rl-32gpus-sp16-256k",
+    "previous_path": "glm5.3-flash-bf16/h200/train-rl-32gpus-sp16-256k.config"
+  },
+  "glm-5.3-flash-bf16/long/h200-training-full.json": {
+    "config_id": "glm5.3-flash-bf16-h200-train-sft-16gpus-sp16-256k",
+    "previous_path": "glm5.3-flash-bf16/h200/train-sft-16gpus-sp16-256k.config"
+  },
+  "glm-5.3-flash/long/h200-training-lora--legacy-flat-rl-16gpus-sp8-256k.json": {
+    "config_id": "train-rl-lora-16gpus-sp8-256k",
+    "previous_path": "train-rl-lora-16gpus-sp8-256k.config"
+  },
+  "glm-5.3-flash/long/h200-training-lora--rl-16gpus-sp8-256k.json": {
+    "config_id": "glm5.3-flash-h200-train-rl-lora-16gpus-sp8-256k",
+    "previous_path": "glm5.3-flash/h200/train-rl-lora-16gpus-sp8-256k.config"
+  },
+  "glm-5.3-flash/long/h200-training-lora.json": {
+    "config_id": "glm5.3-flash-h200-train-sft-lora-8gpus-sp8-256k",
+    "previous_path": "glm5.3-flash/h200/train-sft-lora-8gpus-sp8-256k.config"
+  },
   "qwen3-8b/standard/h200-training-full.json": {
-    "config_id": "model-h200-train",
-    "previous_path": "model-h200-train.config"
+    "config_id": "qwen3-8b-h200-train-sft-full-4gpus-64k",
+    "previous_path": "qwen3-8b/h200/train-sft-full-4gpus-64k.config"
+  },
+  "qwen3-8b/standard/h200-training-lora.json": {
+    "config_id": "qwen3-8b-h200-train-sft-lora-4gpus-64k",
+    "previous_path": "qwen3-8b/h200/train-sft-lora-4gpus-64k.config"
+  },
+  "qwen3.6-35b-a3b/standard/h200-training-full--legacy-batch8.json": {
+    "config_id": "qwen3.6-35b-a3b-h200-train-sft-8gpus-64k",
+    "previous_path": "qwen3.6-35b-a3b/h200/train-sft-8gpus-64k.config"
+  },
+  "qwen3.6-35b-a3b/standard/h200-training-full--rl-16gpus-64k.json": {
+    "config_id": "qwen3.6-35b-a3b-h200-train-rl-16gpus-64k",
+    "previous_path": "qwen3.6-35b-a3b/h200/train-rl-16gpus-64k.config"
+  },
+  "qwen3.6-35b-a3b/standard/h200-training-full--sft-8gpus-sp8-64k.json": {
+    "config_id": "qwen3.6-35b-a3b-h200-train-sft-full-8gpus-sp8-64k",
+    "previous_path": "qwen3.6-35b-a3b/h200/train-sft-full-8gpus-sp8-64k.config"
+  },
+  "qwen3.6-35b-a3b/standard/h200-training-lora.json": {
+    "config_id": "qwen3.6-35b-a3b-h200-train-sft-lora-8gpus-sp8-64k",
+    "previous_path": "qwen3.6-35b-a3b/h200/train-sft-lora-8gpus-sp8-64k.config"
+  },
+  "qwen3.8-27b/standard/b200-training-full.json": {
+    "config_id": "qwen3.8-27b-b200-train-sft-8gpus-2k",
+    "previous_path": "qwen3.8-27b/b200/train-sft-8gpus-2k.config"
+  },
+  "qwen3.8-27b/standard/h200-training-full--sft-16gpus-64k.json": {
+    "config_id": "qwen3.8-27b-h200-train-sft-16gpus-64k",
+    "previous_path": "qwen3.8-27b/h200/train-sft-16gpus-64k.config"
+  },
+  "qwen3.8-27b/standard/h200-training-full.json": {
+    "config_id": "qwen3.8-27b-h200-train-sft-8gpus-2k",
+    "previous_path": "qwen3.8-27b/h200/train-sft-8gpus-2k.config"
+  },
+  "qwen3.8-flash-next/long/h200-training-full--rl-32gpus-sp16-256k.json": {
+    "config_id": "qwen3.8-flash-next-h200-train-rl-32gpus-sp16-256k",
+    "previous_path": "qwen3.8-flash-next/h200/train-rl-32gpus-sp16-256k.config"
+  },
+  "qwen3.8-flash-next/long/h200-training-full--sft-16gpus-sp16-256k.json": {
+    "config_id": "qwen3.8-flash-next-h200-train-sft-full-16gpus-sp16-256k",
+    "previous_path": "qwen3.8-flash-next/h200/train-sft-full-16gpus-sp16-256k.config"
   },
   "qwen3.8-flash-next/long/h200-training-full.json": {
-    "config_id": "h200-training-full",
-    "previous_path": "h200-training-full.json"
+    "config_id": "qwen3.8-flash-next-h200-train-sft-full-8gpus-sp8-256k",
+    "previous_path": "qwen3.8-flash-next/h200/train-sft-full-8gpus-sp8-256k.config"
   },
   "tiny-qwen3-129m/standard/h200-training-full.json": {
     "config_id": "tiny-qwen3-129m-one-h200",

@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Copyright 2025 Snowflake Inc.
-# SPDX-License-Identifier: Apache-2.0
 """CPU configuration checks for the on-prem expert-parallel worker spec."""
 
 import json
@@ -79,6 +77,35 @@ def test_worker_moe_spec_preserves_glm53_recipe_and_input(tmp_path, worker_confi
     assert worker_config == original
 
 
+@pytest.mark.parametrize(
+    ("sp_size", "lora"),
+    [(16, False), (8, False), (16, True), (8, True)],
+)
+def test_worker_moe_spec_isolated_glm_recipes(tmp_path, worker_config, sp_size, lora):
+    configured_worker = deepcopy(worker_config)
+    peft = configured_worker.pop("peft_config") if lora else None
+    configured_worker.pop("peft_config", None)
+    configured_worker.update(ep_size=sp_size, sp_size=sp_size)
+    config = {"training": {"ds_worker_config": configured_worker}}
+    if peft is not None:
+        config["training"]["peft"] = deepcopy(peft)
+    worker = deepcopy(config["training"]["ds_worker_config"])
+    peft = config["training"].get("peft")
+    if peft is not None:
+        worker["peft_config"] = deepcopy(peft)
+    spec = ds_worker_moe_model_spec(_model_path(tmp_path), worker)
+
+    assert spec.loader == "glm5_next"
+    assert spec.parallelism.expert_parallel == worker["ep_size"]
+    assert spec.parallelism.sequence_parallel == worker["sp_size"]
+    assert spec.patches.peft == peft
+    assert spec.patches.gradient_checkpointing is False
+    assert spec.loader_options["fused_cross_entropy"] == worker["prime_rl"]["fused_cross_entropy"]
+    assert spec.loader_options["ac_config"]["offload_config"]["enabled"] is True
+    for key, value in worker["prime_rl"].items():
+        assert spec.loader_options[key] == value
+
+
 def test_worker_moe_spec_glm52_still_rejects_sp(tmp_path, worker_config):
     with pytest.raises(ValueError, match="glm_moe_dsa does not support sequence parallelism"):
         ds_worker_moe_model_spec(_model_path(tmp_path, "glm_moe_dsa"), worker_config)
@@ -130,6 +157,14 @@ def test_worker_moe_spec_dense_bridge_keeps_generic_patches():
     assert spec.loader == "huggingface"
 
 
+def test_worker_moe_spec_alias_only_moe_options(tmp_path, worker_config):
+    worker_config["prime_rl"].pop("deepep_token_chunk_size")
+    worker_config["model_options"]["moe"] = {"comm_token_chunk": 2048, "grouped_mm": False}
+    spec = ds_worker_moe_model_spec(_model_path(tmp_path), worker_config)
+    assert spec.loader_options["deepep_token_chunk_size"] == 2048
+    assert spec.loader_options["moe_use_grouped_mm"] is False
+
+
 @pytest.mark.parametrize(
     "sp",
     [
@@ -165,14 +200,6 @@ def test_worker_moe_spec_rejects_conflicting_sp_aliases(worker_config, ep_size, 
     if ep_size > 1:
         with pytest.raises(ValueError, match="conflicting sequence-parallel degrees"):
             ds_worker_moe_model_spec("unused", worker_config)
-
-
-def test_worker_moe_spec_alias_only_moe_options(tmp_path, worker_config):
-    worker_config["prime_rl"].pop("deepep_token_chunk_size")
-    worker_config["model_options"]["moe"] = {"comm_token_chunk": 2048, "grouped_mm": False}
-    spec = ds_worker_moe_model_spec(_model_path(tmp_path), worker_config)
-    assert spec.loader_options["deepep_token_chunk_size"] == 2048
-    assert spec.loader_options["moe_use_grouped_mm"] is False
 
 
 def test_worker_moe_spec_requires_expert_parallelism(worker_config):

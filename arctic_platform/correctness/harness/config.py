@@ -129,7 +129,11 @@ class ArmSpec:
 
 @dataclass
 class ModelSpec:
-    """Prepared synthetic recipe or pinned original source; unmeasured reference-free metadata may be None."""
+    """A prepared reference recipe or metadata describing an original pretrained source.
+
+    Reference-free checks retain the original source directory as an input, not a regenerable fixture.
+    Unknown or unmeasured seed, parameter count and reference sizing remain None.
+    """
 
     source_checkpoint: str
     num_hidden_layers: int
@@ -291,7 +295,6 @@ class LoadedConfig:
     sub_jobs: List[Dict[str, Any]] = field(default_factory=list)
     native: ArcticClientConfig | None = None
     hardware: Literal["H200", "B200", "B300"] | None = None
-    placement_base_gpus: int | None = None
 
     @property
     def training(self) -> Dict[str, Any]:
@@ -375,6 +378,23 @@ class LoadedConfig:
                 f"got bf16_master_weights_and_grads={master_bf16} and bf16_optimizer_states={states_bf16}"
             )
         return "bfloat16" if master_bf16 else "float32"
+
+    def optimizer_compute_dtype(self, model_path: str) -> str:
+        """Resolve the precision the product's AdamW update is computed in, for the model at ``model_path``.
+
+        FusedAdam and the native CPUAdam kernel load masters and moments into float32, update from the unrounded
+        moments, and round only on store. The PyTorch implementations compute in the storage precision.
+        """
+        from arctic_platform.common.deepspeed_engine import optimizer_implementation
+        from arctic_platform.common.deepspeed_engine import resolve_optimizer_name
+        from arctic_platform.common.optimizer import OptimizerSettings
+
+        settings = OptimizerSettings.model_validate(self.training["optimizer"])
+        fused = settings.fused is not False
+        name = resolve_optimizer_name(settings.name, self.training.get("ds_config") or {}, fused=fused)
+        if optimizer_implementation(name, fused=fused) in ("fused_adam", "deepspeed_cpu_adam"):
+            return "float32"
+        return self.optimizer_dtype
 
     @property
     def n_gpus(self) -> int:
@@ -514,6 +534,8 @@ class LoadedConfig:
 
         return int((self.training.get("mb_spec") or {}).get("max_tokens_per_mb") or DEFAULT_MAX_TOKENS_PER_MB)
 
+    placement_base_gpus: int | None = None
+
 
 def normalize_ints(obj: Any) -> Any:
     """Integer-valued floats reach DeepSpeed directly, where ``stage: 2.0`` is not ``stage: 2``."""
@@ -527,6 +549,59 @@ def normalize_ints(obj: Any) -> Any:
 
 
 CONFIG_ROOT = "configs"
+
+
+def _config_root(path: Path) -> Path | None:
+    parents = path.resolve().parents
+    # Catalog variants can contain these directory names; keep the outer recipe root.
+    root = next((parent for parent in reversed(parents) if parent.name == CONFIG_ROOT), None)
+    if root is not None:
+        return root
+    # Hierarchical recipes also support an explicitly supplied root not named "configs".
+    return next((parent.parent.parent for parent in reversed(parents) if parent.name in {"standard", "long"}), None)
+
+
+def _layout_entries(root: Path) -> dict:
+    manifest = root.parent / "config-layout.json"
+    return json.loads(manifest.read_text()) if manifest.is_file() else {}
+
+
+def resolve_config_path(path: str | Path) -> Path:
+    """Resolve a pre-migration config locator without changing frozen specification bytes."""
+    path = Path(path).expanduser()
+    root = _config_root(path)
+    if not path.exists() and root is not None:
+        relative = path.resolve().relative_to(root).as_posix()
+        for destination, entry in _layout_entries(root).items():
+            if entry["previous_path"] == relative:
+                return root / destination
+    return path
+
+
+def config_paths(root: Path) -> List[Path]:
+    """Discover recipe JSON and legacy configs, excluding metadata and archived evidence."""
+    return sorted(
+        path
+        for path in root.rglob("*")
+        if path.is_file()
+        and path.suffix in {".config", ".json"}
+        and not any(part.startswith(".") or part in {"archive", "specs"} for part in path.relative_to(root).parts)
+        and path.name != "model.json"
+    )
+
+
+def reference_config_subpath(path: str | Path | None, identifier: str) -> Path:
+    """Mirror config placement, keeping numerical identity independent of filesystem placement."""
+    if path is not None:
+        source = resolve_config_path(path).resolve()
+        root = _config_root(source)
+        if source.is_file() and root is not None:
+            return source.relative_to(root).with_suffix("")
+    root = Path(__file__).resolve().parents[1] / CONFIG_ROOT
+    for relative, entry in _layout_entries(root).items():
+        if entry["config_id"] == identifier:
+            return Path(relative).with_suffix("")
+    return Path(identifier)
 
 
 def expected_attention_implementation(gpu_type: str | None) -> str | None:
@@ -545,6 +620,60 @@ def config_id(path: Path) -> str:
     relative = path.relative_to(root)
     entry = _layout_entries(root).get(relative.as_posix())
     return entry["config_id"] if entry is not None else "-".join(relative.with_suffix("").parts)
+
+
+def _path_gpu_type(path: Path) -> str | None:
+    for part in reversed(path.parts):
+        match = re.search(r"(?:^|[-_])(h\d+|b\d+|a\d+|l\d+)(?:[-_.]|$)", part.lower())
+        if match:
+            return match[1]
+    return None
+
+
+def _model_basename(name: str) -> str:
+    parts = Path(name.rstrip("/")).parts
+    if not parts:
+        raise ValueError(f"model_name does not have a usable model basename: {name!r}")
+    cached = next((part for part in parts if part.startswith("models--")), None)
+    basename = cached.split("--", 2)[-1] if cached is not None else parts[-1]
+    basename = basename.lower()
+    if re.fullmatch(r"[a-z0-9][a-z0-9_.-]*", basename) is None:
+        raise ValueError(f"model_name does not have a usable model basename: {name!r}")
+    return basename
+
+
+def config_import_subpath(config: LoadedConfig) -> Path:
+    """Catalog recipes retain their path; other recipes use model/sequence/hardware-mode-tuning."""
+    source = config.path.resolve()
+    for parent in source.parents:
+        if (
+            parent.name == "models"
+            and parent.parent.name == "model-catalog"
+            and parent.parent.parent.name == "cortex-training"
+        ):
+            relative = source.relative_to(parent)
+            if len(relative.parts) < 3 or relative.name == "model.json":
+                raise ValueError(f"expected a model-catalog recipe, not model metadata: {source}")
+            return relative
+    settings = config.training if config.has_training else config.sub_job["inference_config"]
+    budget = (settings.get("mb_spec") or {}).get("max_tokens_per_mb")
+    if budget is not None and (type(budget) is not int or budget <= 0):
+        raise ValueError(f"{source}: mb_spec.max_tokens_per_mb must be a positive integer")
+    sequence = "long" if budget is not None and budget >= 262144 else "standard"
+    gpu = config.gpu_type or local_gpu_type()
+    if gpu is None:
+        raise ValueError(
+            f"{source}: config placement requires explicit hardware, a GPU in the source path, or a GPU host"
+        )
+    mode = "training" if config.has_training else "inference"
+    tuning = "lora" if settings.get("peft_config") else "full"
+    variant = source.stem.partition("--")[2]
+    if variant and re.fullmatch(r"[a-z0-9][a-z0-9_.-]*", variant) is None:
+        raise ValueError(
+            f"{source}: recipe variant must contain lowercase letters, digits, dots, dashes or underscores"
+        )
+    suffix = f"--{variant}" if variant else ""
+    return Path(_model_basename(config.model_name), sequence, f"{gpu}-{mode}-{tuning}{suffix}.json")
 
 
 def local_config_path(path: str | Path, config_dir: Path | None = None) -> Path:
@@ -737,24 +866,6 @@ def config_checksum(config: LoadedConfig) -> str:
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
-def validate_first_two_model_dtype(config: LoadedConfig) -> None:
-    """Admit only BF16 model parameters, independently of accumulator and optimizer-state precision."""
-    # The declared model dtype and the first-two payload's training override are separate inputs.
-    for location, dtype in (
-        ("sub_job.dtype", config.sub_job.get("dtype")),
-        ("training_config.dtype", config.training.get("dtype")),
-    ):
-        if dtype is None:
-            continue
-        if not isinstance(dtype, str) or dtype.lower() not in {"bf16", "bfloat16"}:
-            raise ValueError(
-                f"{config.config_id}: first-two correctness onboarding, reference preparation and regression "
-                f"support only BF16 model dtype ('bfloat16' or 'bf16'); got {location}={dtype!r}. "
-                "Non-BF16 model execution is not admitted; the target and HF reference use BF16. "
-                "FP32 gradient accumulation is a separate setting and remains supported."
-            )
-
-
 def _sibling_for(path: Path, gpu_type: str) -> str:
     """Name the corresponding accelerator recipe, whether or not that recipe exists."""
     parts = list(path.parts)
@@ -910,108 +1021,19 @@ def arms_for(max_row_tokens: int, gpu_count: int) -> List[ArmDefinition]:
     return [ArmDefinition(f"gas{gas}", gpu_count * gas, row_tokens) for gas in GAS_VALUES]
 
 
-def _config_root(path: Path) -> Path | None:
-    parents = path.resolve().parents
-    # Catalog variants can contain these directory names; keep the outer recipe root.
-    root = next((parent for parent in reversed(parents) if parent.name == CONFIG_ROOT), None)
-    if root is not None:
-        return root
-    # Hierarchical recipes also support an explicitly supplied root not named "configs".
-    return next((parent.parent.parent for parent in reversed(parents) if parent.name in {"standard", "long"}), None)
-
-
-def _layout_entries(root: Path) -> dict:
-    manifest = root.parent / "config-layout.json"
-    return json.loads(manifest.read_text()) if manifest.is_file() else {}
-
-
-def resolve_config_path(path: str | Path) -> Path:
-    """Resolve a pre-migration config locator without changing frozen specification bytes."""
-    path = Path(path).expanduser()
-    root = _config_root(path)
-    if not path.exists() and root is not None:
-        relative = path.resolve().relative_to(root).as_posix()
-        for destination, entry in _layout_entries(root).items():
-            if entry["previous_path"] == relative:
-                return root / destination
-    return path
-
-
-def config_paths(root: Path) -> List[Path]:
-    """Discover recipe JSON and legacy configs, excluding metadata and archived evidence."""
-    return sorted(
-        path
-        for path in root.rglob("*")
-        if path.is_file()
-        and path.suffix in {".config", ".json"}
-        and not any(part.startswith(".") or part in {"archive", "specs"} for part in path.relative_to(root).parts)
-        and path.name != "model.json"
-    )
-
-
-def reference_config_subpath(path: str | Path | None, identifier: str) -> Path:
-    """Mirror config placement, keeping numerical identity independent of filesystem placement."""
-    if path is not None:
-        source = resolve_config_path(path).resolve()
-        root = _config_root(source)
-        if source.is_file() and root is not None:
-            return source.relative_to(root).with_suffix("")
-    root = Path(__file__).resolve().parents[1] / CONFIG_ROOT
-    for relative, entry in _layout_entries(root).items():
-        if entry["config_id"] == identifier:
-            return Path(relative).with_suffix("")
-    return Path(identifier)
-
-
-def _path_gpu_type(path: Path) -> str | None:
-    for part in reversed(path.parts):
-        match = re.search(r"(?:^|[-_])(h\d+|b\d+|a\d+|l\d+)(?:[-_.]|$)", part.lower())
-        if match:
-            return match[1]
-    return None
-
-
-def _model_basename(name: str) -> str:
-    parts = Path(name.rstrip("/")).parts
-    if not parts:
-        raise ValueError(f"model_name does not have a usable model basename: {name!r}")
-    cached = next((part for part in parts if part.startswith("models--")), None)
-    basename = cached.split("--", 2)[-1] if cached is not None else parts[-1]
-    basename = basename.lower()
-    if re.fullmatch(r"[a-z0-9][a-z0-9_.-]*", basename) is None:
-        raise ValueError(f"model_name does not have a usable model basename: {name!r}")
-    return basename
-
-
-def config_import_subpath(config: LoadedConfig) -> Path:
-    """Catalog recipes retain their path; other recipes use model/sequence/hardware-mode-tuning."""
-    source = config.path.resolve()
-    for parent in source.parents:
-        if (
-            parent.name == "models"
-            and parent.parent.name == "model-catalog"
-            and parent.parent.parent.name == "cortex-training"
-        ):
-            relative = source.relative_to(parent)
-            if len(relative.parts) < 3 or relative.name == "model.json":
-                raise ValueError(f"expected a model-catalog recipe, not model metadata: {source}")
-            return relative
-    settings = config.training if config.has_training else config.sub_job["inference_config"]
-    budget = (settings.get("mb_spec") or {}).get("max_tokens_per_mb")
-    if budget is not None and (type(budget) is not int or budget <= 0):
-        raise ValueError(f"{source}: mb_spec.max_tokens_per_mb must be a positive integer")
-    sequence = "long" if budget is not None and budget >= 262144 else "standard"
-    gpu = config.gpu_type or local_gpu_type()
-    if gpu is None:
-        raise ValueError(
-            f"{source}: config placement requires explicit hardware, a GPU in the source path, or a GPU host"
-        )
-    mode = "training" if config.has_training else "inference"
-    tuning = "lora" if settings.get("peft_config") else "full"
-    variant = source.stem.partition("--")[2]
-    if variant and re.fullmatch(r"[a-z0-9][a-z0-9_.-]*", variant) is None:
-        raise ValueError(
-            f"{source}: recipe variant must contain lowercase letters, digits, dots, dashes or underscores"
-        )
-    suffix = f"--{variant}" if variant else ""
-    return Path(_model_basename(config.model_name), sequence, f"{gpu}-{mode}-{tuning}{suffix}.json")
+def validate_first_two_model_dtype(config: LoadedConfig) -> None:
+    """Admit only BF16 model parameters, independently of accumulator and optimizer-state precision."""
+    # The declared model dtype and the first-two payload's training override are separate inputs.
+    for location, dtype in (
+        ("sub_job.dtype", config.sub_job.get("dtype")),
+        ("training_config.dtype", config.training.get("dtype")),
+    ):
+        if dtype is None:
+            continue
+        if not isinstance(dtype, str) or dtype.lower() not in {"bf16", "bfloat16"}:
+            raise ValueError(
+                f"{config.config_id}: first-two correctness onboarding, reference preparation and regression "
+                f"support only BF16 model dtype ('bfloat16' or 'bf16'); got {location}={dtype!r}. "
+                "Non-BF16 model execution is not admitted; the target and HF reference use BF16. "
+                "FP32 gradient accumulation is a separate setting and remains supported."
+            )

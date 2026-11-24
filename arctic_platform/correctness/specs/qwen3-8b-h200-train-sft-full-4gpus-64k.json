@@ -1,0 +1,97 @@
+{
+  "applicable_tests": [
+    "checkpoint-resume-loss",
+    "e2e-sft-train-validate",
+    "inference-checkpoint-loss",
+    "single-step-grads",
+    "single-step-optimizer"
+  ],
+  "arms": [
+    {
+      "active_tokens": 30442,
+      "dss_microbatches": 1,
+      "global_batch_size": 4,
+      "max_seq_len": 16384,
+      "name": "gas1",
+      "pad_fraction": 0.535491943359375,
+      "total_tokens": 65536
+    },
+    {
+      "active_tokens": 133124,
+      "dss_microbatches": 4,
+      "global_batch_size": 16,
+      "max_seq_len": 16384,
+      "name": "gas4",
+      "pad_fraction": 0.4921722412109375,
+      "total_tokens": 262144
+    }
+  ],
+  "attn_implementations": [
+    "flash_attention_3"
+  ],
+  "config_checksum": "f773ada8eaccdebd36159ed52d691282494cf95fe16157199b88cbd26d3cd756",
+  "config_id": "qwen3-8b-h200-train-sft-full-4gpus-64k",
+  "config_path": "arctic_platform/correctness/configs/qwen3-8b/h200/train-sft-full-4gpus-64k.config",
+  "inapplicable": {},
+  "model": {
+    "cache_path": "/data-fast/base-models/synthetic/Qwen3-8B-4L",
+    "content_hash": "ea50295f7d03ddc9",
+    "measured_reference_peak_gib": 10.693734169006348,
+    "num_hidden_layers": 4,
+    "param_count": 2016449536,
+    "seed": 0,
+    "sized_against_gib": 100.0,
+    "source_checkpoint": "Qwen/Qwen3-8B",
+    "vision_depth": 2
+  },
+  "notes": [
+    "Single-GPU reference uses flash_attention_3 with 4 complete-cycle layers and peaks at 10.694 GiB."
+  ],
+  "param_name_map": {},
+  "test_settings": {
+    "single-step-optimizer": {
+      "calibration_metric": "maximum pairwise full-tensor L2 delta across 16 runs",
+      "ce_chunk": 2048,
+      "learning_rate": 0.01,
+      "model_cache_path": "/data-fast/base-models/synthetic/Qwen3-8B-4L",
+      "num_hidden_layers": 4,
+      "optimizer_dtype": "float32",
+      "reference_token_budget": 10240
+    }
+  },
+  "test_tolerances": {
+    "checkpoint-resume-loss": {
+      "absolute": 40.249,
+      "calibration_runs": 3,
+      "computed_gate": 40.24879765510559,
+      "minimum_gate": 0.001,
+      "multiplier": 2.0,
+      "raw_max_same_tensor_range": 20.124398827552795,
+      "rounding_quantum": 0.001,
+      "status": "calibrated",
+      "worst_tensor": "gas1 loss at iteration 8"
+    },
+    "single-step-grads": {
+      "absolute": 0.005,
+      "calibration_runs": 16,
+      "computed_gate": 0.004128456115722656,
+      "minimum_gate": 0.001,
+      "multiplier": 2.0,
+      "raw_max_same_tensor_range": 0.002064228057861328,
+      "rounding_quantum": 0.001,
+      "status": "calibrated from 16 nondeterministic reference executions; 2x rounded upward in 1e-3 units",
+      "worst_tensor": "model.embed_tokens.weight"
+    },
+    "single-step-optimizer": {
+      "absolute": 8.804,
+      "calibration_runs": 16,
+      "computed_gate": 8.80379581451416,
+      "minimum_gate": 0.001,
+      "multiplier": 2.0,
+      "raw_max_same_tensor_range": 4.40189790725708,
+      "rounding_quantum": 0.001,
+      "status": "calibrated from 16 nondeterministic optimizer-reference executions; 2x the maximum pairwise full-tensor delta, rounded upward in 1e-3 units",
+      "worst_tensor": "embed_tokens.weight::parameter_update"
+    }
+  }
+}
