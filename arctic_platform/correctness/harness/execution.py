@@ -894,7 +894,9 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
         published_fixture = None
         local_full_model_path = None
         if local_full_model:
-            local_full_model_path = validate_local_full_model(backend, cfg, spec)
+            local_full_model_path = validate_local_full_model(
+                backend, cfg, spec, records_dir=args.reference_records_dir
+            )
             execution[cfg.config_id].update(
                 requested_model_name=cfg.model_name,
                 local_full_model_path=str(local_full_model_path),
