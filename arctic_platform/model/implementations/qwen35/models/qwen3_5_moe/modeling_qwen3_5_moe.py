@@ -24,6 +24,7 @@ from arctic_platform.common.packing.layout import get_stashed_layout
 from arctic_platform.common.packing.layout import layout_for_own_positions
 from arctic_platform.common.packing.layout import prefix_varlen_args
 from arctic_platform.common.packing.layout import register_native_prefix_attention
+from arctic_platform.common.packing.layout import register_prefix_sharing_model
 from arctic_platform.common.packing.layout import require_stash_inside_context
 from arctic_platform.model.implementations.debug.determinism import resolve_flash_attention_determinism
 from arctic_platform.model.implementations.fp8 import fp8_weight_block_size
@@ -878,6 +879,7 @@ class Qwen3_5MoePreTrainedModel(PreTrainedModelPrimeRL):
         return state_dict
 
 
+@register_prefix_sharing_model
 class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
     def __init__(self, config: Qwen3_5MoeConfig):
         super().__init__(config)

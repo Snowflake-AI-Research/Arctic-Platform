@@ -23,7 +23,8 @@ token-mean only.
 Lifetime: :func:`using_layout` is the only way to activate a layout. It must wrap forward,
 loss, and backward of one model call. Entering with a sharing layout validates every
 sequence mixer (:func:`require_prefix_continuation`) and the router-replay decision for
-MoE models, and raises before anything runs. Calling it per model call is the caller's
+MoE models, and raises before anything runs. A ``transformers`` model with Arctic-Platform attention must
+also be registered with :func:`register_prefix_sharing_model` once it is verified end to end. Calling it per model call is the caller's
 job. Training does not use this API yet: that is deliberate until the executor PR
 (``plan_calls`` / ``execute_calls``). PR1 users are the CPU tests and the on-prem GPU gate.
 
@@ -1083,6 +1084,7 @@ _HF_PREFIX_ATTENTION = {
     "Qwen3NextAttention",
 }
 _NATIVE_PREFIX_ATTENTION: set[type] = set()
+_PREFIX_SHARING_MODELS: set[type] = set()
 _SEQUENCE_MIXER_NEEDLES = (
     "Attention",
     "DeltaNet",
@@ -1106,6 +1108,27 @@ def register_native_prefix_attention(cls: _ModuleType) -> _ModuleType:
     """
     _NATIVE_PREFIX_ATTENTION.add(cls)
     return cls
+
+
+def register_prefix_sharing_model(cls: _ModuleType) -> _ModuleType:
+    """Accept registered native attention inside ``cls``, a model verified end to end with prefix sharing.
+
+    A ``transformers`` model whose mixers include a registered native attention class shares prefixes only if it
+    contains a module of a registered model type: the attention layer being verified does not cover the model's own
+    forward (positions, masks, boundaries). Matched by exact type.
+    """
+    _PREFIX_SHARING_MODELS.add(cls)
+    return cls
+
+
+def _unverified_native_model(model: torch.nn.Module, mixers: list[torch.nn.Module]) -> str | None:
+    from transformers import PreTrainedModel
+
+    if not isinstance(model, PreTrainedModel) or not any(type(m) in _NATIVE_PREFIX_ATTENTION for m in mixers):
+        return None
+    if any(type(module) in _PREFIX_SHARING_MODELS for module in model.modules()):
+        return None
+    return f"{type(model).__name__} (model not yet verified end to end with prefix sharing)"
 
 
 def _is_sequence_mixer(module: torch.nn.Module) -> bool:
@@ -1159,11 +1182,13 @@ def require_prefix_continuation(model: torch.nn.Module, layout: PackedLayout | N
     mixers = sequence_mixers(model)
     if not mixers:
         raise ValueError("zorro/prefix sharing found no sequence mixers to validate")
-    unsupported = sorted({reason for module in mixers if (reason := _prefix_continuation_blocker(module, layout))})
+    unsupported = {reason for module in mixers if (reason := _prefix_continuation_blocker(module, layout))}
+    if (reason := _unverified_native_model(model, mixers)) is not None:
+        unsupported.add(reason)
     if unsupported:
         raise ValueError(
             "zorro/prefix sharing needs prefix continuation in every sequence mixer; "
-            f"unsupported in this PR: {unsupported}"
+            f"unsupported in this PR: {sorted(unsupported)}"
         )
 
 

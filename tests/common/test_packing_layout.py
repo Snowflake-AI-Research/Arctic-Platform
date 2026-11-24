@@ -665,6 +665,41 @@ def test_require_prefix_continuation_rejects_unsupported_mixers():
         require_prefix_continuation(unknown)
 
 
+def test_native_attention_shares_only_inside_a_verified_model(monkeypatch):
+    from transformers import PretrainedConfig
+    from transformers import PreTrainedModel
+
+    class TinyModel(PreTrainedModel):
+        config_class = PretrainedConfig
+
+        def __init__(self, config):
+            super().__init__(config)
+            self.attn = FlashAttention()
+
+    class TinyForCausalLM(PreTrainedModel):
+        config_class = PretrainedConfig
+
+        def __init__(self, config):
+            super().__init__(config)
+            self.model = TinyModel(config)
+
+    model = TinyForCausalLM(PretrainedConfig())
+    with pytest.raises(ValueError, match="TinyForCausalLM .model not yet verified end to end"):
+        require_prefix_continuation(model)
+    # Harnesses that wrap the layer in a plain module are not models and keep the layer's own check.
+    require_prefix_continuation(nn.Sequential(FlashAttention()))
+    monkeypatch.setattr(layout_module, "_PREFIX_SHARING_MODELS", {TinyModel})
+    require_prefix_continuation(model)
+
+
+def test_custom_qwen3_5_moe_is_a_verified_prefix_sharing_model():
+    try:
+        from arctic_platform.model.implementations.qwen35.models.qwen3_5_moe import modeling_qwen3_5_moe
+    except Exception as exc:
+        pytest.skip(f"Qwen3.5-MoE model unavailable: {exc}")
+    assert modeling_qwen3_5_moe.Qwen3_5MoeModel in layout_module._PREFIX_SHARING_MODELS
+
+
 def test_sharing_refuses_state_space_and_conv_mixers():
     """Nemotron-H's Mamba-2 layers sit next to registered flash attention; their names carry no attention needle."""
     _, shared = _shared_layout()
