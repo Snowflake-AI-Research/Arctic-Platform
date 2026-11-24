@@ -41,15 +41,19 @@ one; another thread entering while any context is active raises. The active-layo
 and the Hugging Face registry override are process globals. Reads are not thread-checked:
 autograd runs backward, and checkpoint recompute, on its own device threads.
 
-Every model that runs while a context is active needs its own :func:`using_layout` (an
-unshared layout is fine). Arctic-Platform attention (flash or SDPA) with no stash raises while
-any context is active, because ``cu_seqlens_from_position_ids`` would hand it another call's
-segments, and SDPA also raises on a layout with several segments. Hugging Face attention that
-dispatches through ``transformers``' registry (every implementation but eager) raises with no
-stash while a sharing context is active. With nested
-contexts the loss and position-id guards fire if any layout in the stack shares, and
-``cu_seqlens_from_position_ids`` raises when the stack holds more than one layout, since it
-cannot tell which call it is serving.
+An unshared layout refuses nothing that runs packed today (padded calls, SP shards, SDPA, caches),
+and it only supplies the segments it knows where the call is exactly the layout's tokens:
+``cu_seqlens_from_position_ids`` returns them for the layout's own positions, and
+Arctic-Platform SDPA (:func:`dense_causal_attention`) attends within each segment instead of
+across the whole packed call. Other calls behave as they do with no layout.
+
+Every model that runs while a sharing context is active needs its own :func:`using_layout` (an
+unshared layout is fine). Arctic-Platform attention (flash or SDPA), the GatedDeltaNet adapters,
+and Hugging Face attention that dispatches through ``transformers``' registry (every
+implementation but eager) raise with no stash then, because ``cu_seqlens_from_position_ids``
+would hand them the sharing call's segments. With nested contexts the loss and position-id guards
+fire if any layout in the stack shares, and ``cu_seqlens_from_position_ids`` raises when a sharing
+stack holds more than one layout, since it cannot tell which call it is serving.
 
 Attention reads the layout stashed on its own module. Arctic-Platform ``FlashAttention``
 gathers K/V itself. Hugging Face flash attention gets the gather from a wrapper that
@@ -76,9 +80,11 @@ Under sequence parallelism the layout describes the whole packed call, identical
 and mixers apply it after their all-to-all, when they hold every token: DeepSpeed's
 ``UlyssesSPAttentionHF`` gets the prefix gather by having its inner attention swapped for the
 context (its subclasses are refused), and the GatedDeltaNet adapters read it after the head
-exchange. Not supported inside :func:`using_layout` until the executor PR: padded calls
+exchange. Not supported under a sharing layout until the executor PR: padded calls
 (``pad_packed_microbatch``), which fail the packed-token-count checks in
-``cu_seqlens_from_position_ids`` and :func:`prefix_varlen_args`.
+``cu_seqlens_from_position_ids`` and :func:`prefix_varlen_args`. Under SP, a backbone that rebuilds
+global boundaries passes its own stash to ``cu_seqlens_from_position_ids``, so another model's
+context is never read for them.
 
 MoE policy (documentation only; nothing here adjusts token counts): a shared root token goes
 through the router and experts once per call, so ``tokens_per_expert``, expert-bias updates,
@@ -419,6 +425,11 @@ class PackedLayout:
         return int(self.cu_seqlens[-1])
 
     @cached_property
+    def segment_bounds(self) -> list[tuple[int, int]]:
+        cu = self.cu_seqlens.tolist()
+        return list(zip(cu[:-1], cu[1:]))
+
+    @cached_property
     def root_tokens(self) -> int:
         return int(self.cu_seqlens[self.num_roots])
 
@@ -622,6 +633,12 @@ def get_stashed_layout(module: torch.nn.Module) -> PackedLayout | None:
     return getattr(module, LAYOUT_ATTR, None)
 
 
+def get_sharing_layout(module: torch.nn.Module) -> PackedLayout | None:
+    """``module``'s stash if it shares a prefix, else ``None``: an unshared layout leaves code on its no-layout path."""
+    layout = get_stashed_layout(module)
+    return layout if layout is not None and layout.has_sharing else None
+
+
 def get_active_packed_layout() -> PackedLayout | None:
     """Layout of the innermost :func:`using_layout`, for code that has no module to read."""
     return _ACTIVE_LAYOUTS[-1] if _ACTIVE_LAYOUTS else None
@@ -632,16 +649,34 @@ def prefix_sharing_active() -> bool:
     return any(layout is not None and layout.has_sharing for layout in _ACTIVE_LAYOUTS)
 
 
-def layout_for_position_ids() -> PackedLayout | None:
-    """The layout whose segments replace boundaries read from ``position_ids``, or ``None`` to read them.
+def layout_for_own_positions(layout: PackedLayout | None, flat_position_ids: Tensor) -> PackedLayout | None:
+    """``layout`` if its segments replace boundaries read from ``flat_position_ids``, else ``None``.
+
+    A sharing layout always does: its continuations do not restart at position 0. An unshared one does only for its
+    own positions, so a padded call or an SP shard reads its positions as before.
+    """
+    if layout is None or layout.has_sharing:
+        return layout
+    if flat_position_ids.numel() != layout.num_tokens:
+        return None
+    own = layout.position_ids.to(device=flat_position_ids.device, dtype=flat_position_ids.dtype)
+    return layout if torch.equal(own, flat_position_ids) else None
+
+
+def layout_for_position_ids(flat_position_ids: Tensor) -> PackedLayout | None:
+    """The layout whose segments replace boundaries read from ``flat_position_ids``, or ``None`` to read them.
 
     The caller has no module, so it cannot tell which context's model it serves. One layout
-    (possibly entered more than once) is unambiguous. With several, any choice can hand one
-    model's segments to another model's mixers, and the packed-token-count check only catches
-    that when the widths differ, so this raises instead.
+    (possibly entered more than once) is unambiguous. Under sharing, several raise: any choice can
+    hand one model's segments to another model's mixers, and the packed-token-count check only
+    catches that when the widths differ. An unshared layout replaces them only when it is the only
+    one active and the positions are its own, so a padded call, an SP shard, or another model's
+    batch reads its positions as before.
     """
-    if not _ACTIVE_LAYOUTS:
-        return None
+    if not prefix_sharing_active():
+        if not _ACTIVE_LAYOUTS or any(layout is not _ACTIVE_LAYOUTS[0] for layout in _ACTIVE_LAYOUTS):
+            return None
+        return layout_for_own_positions(_ACTIVE_LAYOUTS[0], flat_position_ids)
     if any(layout is not _ACTIVE_LAYOUTS[0] for layout in _ACTIVE_LAYOUTS):
         raise ValueError(
             "nested using_layout contexts with different layouts are active, so segments cannot be "
@@ -726,33 +761,77 @@ def using_layout(model: torch.nn.Module, layout: PackedLayout | None) -> Iterato
 
 def _unstashed_error(name: str) -> ValueError:
     return ValueError(
-        f"{name} ran with no PackedLayout stashed while a using_layout context is active in this process; "
+        f"{name} ran with no PackedLayout stashed while a prefix-sharing using_layout context is active in this "
+        "process; "
         "the active layout's segments may have reached it through cu_seqlens_from_position_ids. Wrap this "
         "model in its own using_layout (an unshared layout is fine)"
     )
 
 
 def require_stash_inside_context(name: str, layout: PackedLayout | None) -> None:
-    """Raise if mixer ``name`` has no stash while any context is active: its boundaries may be another call's."""
-    if layout is None and any(active is not None for active in _ACTIVE_LAYOUTS):
+    """Raise if mixer ``name`` has no stash while a sharing context is active: its boundaries may be another call's."""
+    if layout is None and prefix_sharing_active():
         raise _unstashed_error(name)
 
 
 def require_dense_attention_layout(name: str, layout: PackedLayout | None) -> None:
-    """Raise unless dense (non-varlen) attention ``name`` can run on a call with stash ``layout``.
+    """Raise if dense (non-varlen) attention ``name`` would run a prefix-sharing call.
 
-    It masks one causal rectangle per batch row, so a layout with several segments would let them
-    attend to each other, and with no stash inside a context it cannot tell whether it got a packed batch.
+    It masks one causal rectangle per batch row and has no K/V gather, so it cannot continue a shared root. With no
+    stash inside a sharing context it may be running another call's batch. An unshared stash changes nothing.
     """
     if layout is None:
-        if any(active is not None for active in _ACTIVE_LAYOUTS):
+        if prefix_sharing_active():
             raise _unstashed_error(name)
         return
-    if layout.num_segments > 1:
+    if layout.has_sharing:
         raise ValueError(
-            f"{name} has no varlen path, so its causal mask would span the layout's {layout.num_segments} "
-            "segments; packed layouts need FlashAttention"
+            f"{name} has no varlen path, so it cannot continue a shared prefix; prefix sharing needs FlashAttention"
         )
+
+
+def dense_causal_attention(
+    name: str,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    layout: PackedLayout | None,
+    scale: float | None = None,
+    dropout_p: float = 0.0,
+) -> Tensor:
+    """Causal SDPA over ``[B, H, T, D]`` that keeps a packed call's segments apart.
+
+    One causal rectangle over a packed call lets each segment attend to the ones before it. With an
+    unshared stash that describes the call (``[1, H, T, D]`` with the layout's ``T`` tokens), each
+    segment attends only to itself. Any other call (no stash, a padded call, an SP shard, ``B > 1``)
+    runs one causal rectangle as before. Refuses what :func:`require_dense_attention_layout` refuses.
+    """
+    require_dense_attention_layout(name, layout)
+    tokens = query.shape[2]
+    describes_call = (
+        layout is not None
+        and layout.num_segments > 1
+        and query.shape[0] == 1
+        and tokens == layout.num_tokens
+        and key.shape[2] == value.shape[2] == tokens
+    )
+    if not describes_call:
+        return F.scaled_dot_product_attention(query, key, value, dropout_p=dropout_p, is_causal=True, scale=scale)
+    assert layout is not None
+    return torch.cat(
+        [
+            F.scaled_dot_product_attention(
+                query[:, :, start:end],
+                key[:, :, start:end],
+                value[:, :, start:end],
+                dropout_p=dropout_p,
+                is_causal=True,
+                scale=scale,
+            )
+            for start, end in layout.segment_bounds
+        ],
+        dim=2,
+    )
 
 
 def prefix_varlen_args(
@@ -764,14 +843,14 @@ def prefix_varlen_args(
 ) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None, int | None, int | None]:
     """Return ``k, v, cu_q, cu_k, max_q, max_k`` for one varlen call over ``[T, H, D]`` K/V.
 
-    ``layout`` is the caller's own stash. Without one this is the caller's own ``cu_seqlens``,
-    unless some context is active: then those segments may be another call's, so this raises.
-    With one, segments come from the layout, and under sharing each continuation's K/V is its
+    ``layout`` is the caller's own stash. Without one, or with an unshared one, this is the caller's own
+    ``cu_seqlens``, unless a sharing context is active and there is no stash: then those segments may be another
+    call's, so this raises. With a sharing stash, segments come from the layout and each continuation's K/V is its
     parent root followed by itself.
     """
-    if layout is None:
-        if any(active is not None for active in _ACTIVE_LAYOUTS):
-            raise _unstashed_error("attention")
+    if layout is None and prefix_sharing_active():
+        raise _unstashed_error("attention")
+    if layout is None or not layout.has_sharing:
         return k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen
     if k.ndim != 3:
         raise ValueError(f"prefix K/V gather expects [T, H, D], got {tuple(k.shape)}")
@@ -782,8 +861,6 @@ def prefix_varlen_args(
             "or a padded call, which using_layout does not support until the executor PR)"
         )
     cu_q = layout.cu_seqlens.to(device=k.device, dtype=torch.int32)
-    if not layout.has_sharing:
-        return k, v, cu_q, cu_q, layout.max_len_q, layout.max_len_q
     idx = layout.kv_index.to(device=k.device)
     cu_k = layout.cu_seqlens_k.to(device=k.device, dtype=torch.int32)
     return k.index_select(0, idx), v.index_select(0, idx), cu_q, cu_k, layout.max_len_q, layout.max_len_k

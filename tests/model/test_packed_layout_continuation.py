@@ -321,8 +321,9 @@ def test_ap_sdpa_is_rejected_under_sharing():
         pass
 
 
-def test_sdpa_refuses_to_run_on_a_packed_layout():
-    """SDPA masks one causal rectangle per row, so packed segments would attend to each other."""
+def test_sdpa_keeps_segments_apart_and_refuses_only_prefix_sharing():
+    """SDPA has no K/V gather; an unshared stash keeps each packed segment to itself."""
+    set_seed(0)
     batch, groups, _ = _batch()
     shared, unshared = _layouts(batch, groups)
     afmoe = AfmoeSDPAAttention(
@@ -337,16 +338,33 @@ def test_sdpa_refuses_to_run_on_a_packed_layout():
     )
     # SDPAAttention repeats its 2 KV heads itself; AFMoE's SDPA core expects them already repeated.
     cases = ((SDPAAttention(_attention_config(use_qk_norm=False)), 2), (afmoe, 4))
+    tokens = unshared.num_tokens
+    assert unshared.num_segments > 1
     for module, kv_heads in cases:
-        q = torch.zeros(1, 4, unshared.num_tokens, HEAD_DIM)
-        k = torch.zeros(1, kv_heads, unshared.num_tokens, HEAD_DIM)
-        module._attention_core(q, k, k)
+        # AFMoE's core returns [B, H, T, D]; SDPAAttention's returns [B, T, H * D].
+        token_dim = 2 if module is afmoe else 1
+        q_pad = torch.randn(1, 4, tokens + 2, HEAD_DIM, dtype=torch.float64)
+        k_pad = torch.randn(1, kv_heads, tokens + 2, HEAD_DIM, dtype=torch.float64)
+        padded = module._attention_core(q_pad, k_pad, k_pad)
+        q, k = q_pad[:, :, :tokens], k_pad[:, :, :tokens]
+        rectangle = module._attention_core(q, k, k)
+        rows = torch.cat(
+            [module._attention_core(q[:, :, s:e], k[:, :, s:e], k[:, :, s:e]) for s, e in unshared.segment_bounds],
+            dim=token_dim,
+        )
+        assert not torch.allclose(rectangle, rows)
         with using_layout(module, unshared):
-            with pytest.raises(ValueError, match="no varlen path"):
-                module._attention_core(q, k, k)
+            torch_assert_close(module._attention_core(q, k, k), rows, atol=F64_ATOL, rtol=0)
+            # A call padded past the layout is not the layout's, so it runs one causal rectangle as before.
+            torch_assert_equal(module._attention_core(q_pad, k_pad, k_pad), padded)
         with using_layout(_ap_attention(), shared):
             with pytest.raises(ValueError, match="no PackedLayout stashed"):
                 module._attention_core(q, k, k)
+        # using_layout refuses SDPA under sharing; a sharing stash put there some other way still raises.
+        setattr(module, layout_module.LAYOUT_ATTR, shared)
+        with pytest.raises(ValueError, match="no varlen path"):
+            module._attention_core(q, k, k)
+        delattr(module, layout_module.LAYOUT_ATTR)
 
 
 def _reference_flash_fn(q, k, v, causal=True, softmax_scale=None, window_size=(-1, -1), **unused):
@@ -629,9 +647,9 @@ def test_qwen3_5_moe_segment_boundaries_come_from_the_stash():
         raise _PastSegmentGuard(cu_seqlens.tolist(), max_seqlen)
 
     # Only the code up to the first decoder layer runs: config, embedding, the segment split, rotary embeddings.
-    def fake(layout=None):
+    def fake(layout=None, impl="flash_attention_2"):
         model = SimpleNamespace(
-            config=SimpleNamespace(_attn_implementation="flash_attention_2"),
+            config=SimpleNamespace(_attn_implementation=impl),
             embed_tokens=lambda ids: torch.zeros(*ids.shape, 4),
             rotary_emb=lambda hidden, positions: None,
             layers=[first_layer],
@@ -642,21 +660,35 @@ def test_qwen3_5_moe_segment_boundaries_come_from_the_stash():
 
     batch, groups, _ = _batch()
     shared, unshared = _layouts(batch, groups)
-    for layout in (shared, unshared):
-        packed = pack_with_layout(batch, layout)
+    packed = pack_with_layout(batch, shared)
+    with using_layout(_ap_attention(), shared):
+        # position_ids == 0 would glue each continuation onto the root before it.
+        with pytest.raises(_PastSegmentGuard) as stopped:
+            Qwen3_5MoeModel.forward(fake(shared), input_ids=packed["input_ids"], position_ids=packed["position_ids"])
+        assert stopped.value.args == (shared.cu_seqlens.tolist(), shared.max_len_q)
+        with pytest.raises(ValueError, match="Qwen3.5-MoE segment boundaries ran with no PackedLayout stashed"):
+            Qwen3_5MoeModel.forward(fake(), input_ids=packed["input_ids"], position_ids=packed["position_ids"])
+    # Unshared, inside a context or not, the boundaries match the ones position_ids give today.
+    packed = pack_with_layout(batch, unshared)
+    for model, layout in ((fake(), None), (fake(unshared), unshared), (fake(), unshared)):
         with using_layout(_ap_attention(), layout):
-            # position_ids == 0 would glue each continuation onto the root before it.
+            with pytest.raises(_PastSegmentGuard) as stopped:
+                Qwen3_5MoeModel.forward(model, input_ids=packed["input_ids"], position_ids=packed["position_ids"])
+        assert stopped.value.args == (unshared.cu_seqlens.tolist(), unshared.max_len_q)
+    # An unshared stash that is this call gives its segments where position_ids give none (SDPA) or wrong ones
+    # (rows whose positions do not start at 0).
+    batch = {**batch, "position_ids": batch["position_ids"] + 3 * batch["attention_mask"]}
+    offset = PackedLayout.build(
+        batch["attention_mask"], *unshared_groups(len(batch["input_ids"])), batch["position_ids"]
+    )
+    packed = pack_with_layout(batch, offset)
+    for impl in ("sdpa", "flash_attention_2"):
+        with using_layout(_ap_attention(), offset):
             with pytest.raises(_PastSegmentGuard) as stopped:
                 Qwen3_5MoeModel.forward(
-                    fake(layout), input_ids=packed["input_ids"], position_ids=packed["position_ids"]
+                    fake(offset, impl), input_ids=packed["input_ids"], position_ids=packed["position_ids"]
                 )
-            assert stopped.value.args == (layout.cu_seqlens.tolist(), layout.max_len_q)
-            with pytest.raises(ValueError, match="Qwen3.5-MoE segment boundaries ran with no PackedLayout stashed"):
-                Qwen3_5MoeModel.forward(fake(), input_ids=packed["input_ids"], position_ids=packed["position_ids"])
-    with pytest.raises(_PastSegmentGuard) as stopped:
-        packed = pack_with_layout(batch, unshared)
-        Qwen3_5MoeModel.forward(fake(), input_ids=packed["input_ids"], position_ids=packed["position_ids"])
-    assert stopped.value.args[0] == unshared.cu_seqlens.tolist()
+        assert stopped.value.args == (offset.cu_seqlens.tolist(), offset.max_len_q)
 
 
 # GatedDeltaNet hybrids. The CPU references stand in for FLA's chunk rule and causal-conv1d (whose pinned
@@ -867,26 +899,32 @@ def test_custom_qwen3_5_moe_attention_reads_the_stash(monkeypatch):
 
     batch, groups, _ = _batch()
     shared, unshared = _layouts(batch, groups)
-    for layout in (shared, unshared):
-        stale = torch.tensor([0, layout.num_tokens], dtype=torch.int32)
-        q = torch.zeros(1, layout.num_tokens, 4, HEAD_DIM)
-        k = torch.zeros(1, layout.num_tokens, 2, HEAD_DIM)
-        stub = SimpleNamespace(_compute_attention=compute, **{layout_module.LAYOUT_ATTR: layout})
-        with using_layout(_ap_attention(), layout):
-            flash._attention_core(stub, q, k, k, stale, layout.num_tokens)
-            with pytest.raises(ValueError, match="no varlen path"):
-                sdpa._attention_core(stub, q, k, k)
-        assert calls.pop() == (
-            layout.kv_index.numel(),
-            layout.cu_seqlens.tolist(),
-            layout.cu_seqlens_k.tolist(),
-            layout.max_len_q,
-            layout.max_len_k,
-        )
-    unstashed = SimpleNamespace(_compute_attention=compute)
-    tokens = unshared.num_tokens
+
+    def tensors(tokens):
+        q = torch.zeros(1, tokens, 4, HEAD_DIM)
+        return q, torch.zeros(1, tokens, 2, HEAD_DIM), torch.tensor([0, tokens], dtype=torch.int32)
+
+    q, k, stale = tensors(shared.num_tokens)
+    stub = SimpleNamespace(
+        _compute_attention=compute, num_key_value_groups=1, scaling=None, **{layout_module.LAYOUT_ATTR: shared}
+    )
     with using_layout(_ap_attention(), shared):
+        flash._attention_core(stub, q, k, k, stale, shared.num_tokens)
+        with pytest.raises(ValueError, match="no varlen path"):
+            sdpa._attention_core(stub, q, k, k)
         with pytest.raises(ValueError, match="no PackedLayout stashed"):
-            flash._attention_core(unstashed, q, k, k, stale, tokens)
-    flash._attention_core(unstashed, q, k, k, stale, tokens)
-    assert calls.pop() == (tokens, stale.tolist(), stale.tolist(), tokens, tokens)
+            flash._attention_core(SimpleNamespace(_compute_attention=compute), q, k, k, stale, shared.num_tokens)
+    assert calls.pop() == (
+        shared.kv_index.numel(),
+        shared.cu_seqlens.tolist(),
+        shared.cu_seqlens_k.tolist(),
+        shared.max_len_q,
+        shared.max_len_k,
+    )
+    # Unshared, stashed or not, the call keeps the caller's own segments, padded past the layout or not.
+    tokens = unshared.num_tokens + 2
+    q, k, stale = tensors(tokens)
+    for stash in ({layout_module.LAYOUT_ATTR: unshared}, {}):
+        with using_layout(_ap_attention(), unshared):
+            flash._attention_core(SimpleNamespace(_compute_attention=compute, **stash), q, k, k, stale, tokens)
+        assert calls.pop() == (tokens, stale.tolist(), stale.tolist(), tokens, tokens)

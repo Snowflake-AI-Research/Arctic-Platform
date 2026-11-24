@@ -18,6 +18,7 @@ from transformers.modeling_outputs import (
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
+from arctic_platform.common.packing.layout import dense_causal_attention
 from arctic_platform.common.packing.layout import get_stashed_layout
 from arctic_platform.common.packing.layout import prefix_varlen_args
 from arctic_platform.common.packing.layout import register_native_prefix_attention
@@ -148,6 +149,17 @@ class AfmoeSDPAAttention(AfmoeAttentionBase):
         attention_mask: torch.Tensor | None = None,
         dropout_p: float = 0.0,
     ) -> torch.Tensor:
+        if attention_mask is None:
+            # Packed callers such as ``pad_packed_for_model`` pass no mask; the model's own mask separates packed rows.
+            return dense_causal_attention(
+                type(self).__name__,
+                query_states,
+                key_states,
+                value_states,
+                get_stashed_layout(self),
+                scale=self.scaling,
+                dropout_p=dropout_p,
+            )
         require_dense_attention_layout(type(self).__name__, get_stashed_layout(self))
         return F.scaled_dot_product_attention(
             query_states,
@@ -155,7 +167,6 @@ class AfmoeSDPAAttention(AfmoeAttentionBase):
             value_states,
             attn_mask=attention_mask,
             dropout_p=dropout_p,
-            is_causal=attention_mask is None,
             scale=self.scaling,
         )
 

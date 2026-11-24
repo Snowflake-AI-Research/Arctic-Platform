@@ -140,7 +140,9 @@ def _packed(mixer, layout, hidden, **kwargs):
     packed = layout.pack(hidden).unsqueeze(0)
     plan = gated_delta_continuation(layout, KERNEL, "cpu") if layout.has_sharing else None
     output = mixer(packed, layout.cu_seqlens, plan, **kwargs)[0]
-    return [output[layout.row_index[row, :length]] for row, length in enumerate(layout.row_index.ge(0).sum(1).tolist())]
+    return [
+        output[layout.row_index[row, :length]] for row, length in enumerate(layout.row_index.ge(0).sum(1).tolist())
+    ]
 
 
 def _loss(outputs, weights):
@@ -403,7 +405,7 @@ def test_sp1_adapter_keeps_the_stock_forward_without_a_layout(verified_kernels):
 
 
 @pytest.mark.parametrize("fused", [False, True], ids=["split", "fused"])
-def test_sp1_adapter_unshared_layout_matches_the_stock_packed_call(verified_kernels, fused):
+def test_sp1_adapter_gives_an_unshared_layout_its_segments(verified_kernels, fused):
     from arctic_platform.common.packing.layout import using_layout
 
     lengths = [6, 9]
@@ -411,10 +413,18 @@ def test_sp1_adapter_unshared_layout_matches_the_stock_packed_call(verified_kern
     layout = PackedLayout.build(mask, [[0], [1]], [0, 0])
     model = _hybrid(fused)
     packed = layout.pack(hidden).unsqueeze(0)
+    padded = torch.cat([packed, packed.new_zeros(1, 3, HIDDEN)], 1)
+    padded_cu = torch.tensor([0, 6, 15, 18], dtype=torch.int32)
     want = model(packed, cu_seq_lens_q=layout.cu_seqlens)
+    want_padded = model(padded, cu_seq_lens_q=padded_cu)
     with using_layout(model, layout):
+        # The layout's own call needs no boundaries from the caller.
         got = model(packed)
-    torch.testing.assert_close(got, want, rtol=1e-12, atol=1e-12)
+        # Any other call keeps the stock forward and the caller's boundaries.
+        got_padded = model(padded, cu_seq_lens_q=padded_cu)
+    assert model.linear_attn.stock_calls == 3
+    torch.testing.assert_close(got, want, rtol=1e-9, atol=1e-10)
+    torch.testing.assert_close(got_padded, want_padded, rtol=0, atol=0)
 
 
 def test_sharing_refuses_a_root_off_the_gdn_chunk(verified_kernels):
@@ -447,23 +457,119 @@ def test_sharing_refuses_fallback_kernels():
             pass
 
 
-def test_sp1_adapter_refuses_cached_state_under_a_layout(verified_kernels):
+def _sharing_rows():
+    hidden, mask, input_ids = _rows([70, 66], [64], [[0, 1]])
+    return hidden, PackedLayout.build(mask, [[0, 1]], [64], input_ids=input_ids)
+
+
+def test_sp1_adapter_refuses_cached_state_under_a_sharing_layout(verified_kernels):
     from arctic_platform.common.packing.layout import using_layout
 
-    hidden, mask, _ = _rows([6, 9], [0], [[0], [1]])
-    layout = PackedLayout.build(mask, [[0], [1]], [0, 0])
+    hidden, layout = _sharing_rows()
     model = _hybrid()
     with using_layout(model, layout):
         with pytest.raises(RuntimeError, match="cached recurrent"):
             model.linear_attn(layout.pack(hidden).unsqueeze(0), cache_params=object())
 
 
-def test_sp1_adapter_without_a_stash_refuses_inside_another_models_context(verified_kernels):
+def test_sp1_adapter_without_a_stash_refuses_inside_another_models_sharing_context(verified_kernels):
     from arctic_platform.common.packing.layout import using_layout
 
-    hidden, mask, _ = _rows([6, 9], [0], [[0], [1]])
-    layout = PackedLayout.build(mask, [[0], [1]], [0, 0])
+    hidden, layout = _sharing_rows()
+    unshared = PackedLayout.build(layout.row_index.ge(0).long(), [[0], [1]], [0, 0])
+    packed = unshared.pack(hidden).unsqueeze(0)
     other, model = _hybrid(), _hybrid()
     with using_layout(other, layout):
         with pytest.raises(ValueError, match="no PackedLayout stashed"):
-            model(layout.pack(hidden).unsqueeze(0), cu_seq_lens_q=layout.cu_seqlens)
+            model(packed, cu_seq_lens_q=unshared.cu_seqlens)
+        # Its own unshared layout, nested in the other model's sharing context, is accepted.
+        with using_layout(model, unshared):
+            model(packed)
+    with using_layout(other, unshared):
+        model(packed, cu_seq_lens_q=unshared.cu_seqlens)
+    assert model.linear_attn.stock_calls == 1
+
+
+def test_sp_boundary_wrapper_reads_its_own_stash_inside_another_sharing_context(verified_kernels, monkeypatch):
+    from arctic_platform.common.packing.layout import using_layout
+
+    def all_gather(gathered, tensor, group=None):
+        gathered[0].copy_(tensor)
+
+    monkeypatch.setattr(gated_delta_net.dist, "get_world_size", lambda group=None: 1)
+    monkeypatch.setattr(gated_delta_net.dist, "all_gather", all_gather)
+    _, sharing = _sharing_rows()
+    # Positions that do not start at 0, so only the stash gives the right segments.
+    own = PackedLayout.build(
+        torch.ones(2, 3, dtype=torch.long), [[0], [1]], [0, 0], torch.tensor([[5, 6, 7], [2, 3, 4]])
+    )
+    backbone, layer = torch.nn.Module(), torch.nn.Module()
+    backbone.forward = lambda **kwargs: None
+    gated_delta_net._install_global_boundary_wrapper(backbone, [layer], "sp-group")
+    positions = own.position_ids.unsqueeze(0)
+    with using_layout(_hybrid(), sharing):
+        with using_layout(backbone, own):
+            backbone.forward(position_ids=positions)
+        torch.testing.assert_close(layer._dss_sp_global_cu_seqlens, own.cu_seqlens.int(), rtol=0, atol=0)
+        with pytest.raises(ValueError, match="no PackedLayout stashed"):
+            backbone.forward(position_ids=positions)
+
+
+def _sp2_worker(rank, rendezvous, lengths, shared):
+    """SP=2 adapter vs the SP=1 adapter on the whole packed call: outputs and parameter gradients summed over ranks."""
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    from arctic_platform.common.packing.layout import using_layout
+
+    gated_delta_net.prefix_continuation_kernel_blocker = lambda conv, rule: None
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=120))
+    try:
+        groups = [list(range(len(lengths)))] if shared else [[row] for row in range(len(lengths))]
+        shared_lengths = [shared] * len(groups)
+        hidden, mask, input_ids = _rows(lengths, shared_lengths, groups)
+        layout = PackedLayout.build(mask, groups, shared_lengths, input_ids=input_ids)
+        assert layout.has_sharing == bool(shared) and layout.num_tokens % 2 == 0
+        packed = layout.pack(hidden).unsqueeze(0)
+        torch.manual_seed(2)
+        weight = torch.randn(1, layout.num_tokens, HIDDEN, dtype=torch.float64)
+
+        reference = _hybrid()
+        with using_layout(reference, layout):
+            want = reference(packed, cu_seq_lens_q=layout.cu_seqlens)
+            want_grads = _grads(reference, [want[0]], [weight[0]])
+
+        torch.manual_seed(1)
+        model = FakeHybrid().double()
+        group = dist.group.WORLD
+        gated_delta_net._adapt_gated_delta_net_module(model.linear_attn, group, fp32_beta=False, stock_numerics=True)
+        gated_delta_net._install_global_boundary_wrapper(model, [model.linear_attn], group)
+        window = slice(rank * layout.num_tokens // 2, (rank + 1) * layout.num_tokens // 2)
+        with using_layout(model, layout):
+            out = model(packed[:, window], position_ids=layout.position_ids.unsqueeze(0)[:, window])
+            model.zero_grad()
+            (out * weight[:, window]).sum().backward()
+        assert model.linear_attn.stock_calls == 0
+
+        gathered = [torch.empty_like(out) for _ in range(2)]
+        dist.all_gather(gathered, out.detach().contiguous())
+        torch.testing.assert_close(torch.cat(gathered, dim=1), want.detach(), rtol=1e-9, atol=1e-10)
+        for name, parameter in model.named_parameters():
+            grad = parameter.grad.clone()
+            dist.all_reduce(grad)
+            fp32 = name.endswith(("A_log", "in_proj_a.weight"))
+            tolerance = dict(rtol=1e-6, atol=1e-8) if fp32 else dict(rtol=1e-9, atol=1e-12)
+            torch.testing.assert_close(grad, want_grads[name], **tolerance, msg=lambda m: f"{name}: {m}")
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize(
+    "lengths, shared",
+    [([70, 66, 72], 64), ([104, 94], 64), ([70, 66], 0)],
+    ids=["root-crosses-ranks", "continuation-crosses-ranks", "unshared-row-crosses-ranks"],
+)
+def test_sp2_adapter_matches_sp1_with_segments_crossing_ranks(tmp_path, lengths, shared):
+    rendezvous = (tmp_path / "rendezvous").as_uri()
+    torch.multiprocessing.spawn(_sp2_worker, args=(rendezvous, lengths, shared), nprocs=2, join=True)

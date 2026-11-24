@@ -22,6 +22,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from arctic_platform.common.packing.layout import get_stashed_layout
 from arctic_platform.model.implementations.gpu.packing import cu_seqlens_from_position_ids
 from arctic_platform.model.implementations.gpu.sp.collectives import sequence_head_all_to_all
 
@@ -110,7 +111,7 @@ def _make_backbone_sp_forward(original_forward, sp_group, full_attn_modules, lin
             dist.all_gather(gathered_position_ids, position_ids.contiguous(), group=sp_group)
             # SP shards are contiguous in sp_rank order, so concatenation rebuilds global order.
             global_position_ids = torch.cat(gathered_position_ids, dim=1)
-            cu_seqlens = cu_seqlens_from_position_ids(global_position_ids)
+            cu_seqlens = cu_seqlens_from_position_ids(global_position_ids, get_stashed_layout(self))
             max_seqlen = int(cu_seqlens.diff().max().item())
             for module in full_attn_modules:
                 module._sp_cu_seqlens = cu_seqlens

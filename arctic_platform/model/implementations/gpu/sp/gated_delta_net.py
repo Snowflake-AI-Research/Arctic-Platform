@@ -32,6 +32,7 @@ from torch import nn
 
 from arctic_platform.common.packing.layout import PREFIX_CONTINUATION_ATTR
 from arctic_platform.common.packing.layout import PackedLayout
+from arctic_platform.common.packing.layout import get_sharing_layout
 from arctic_platform.common.packing.layout import get_stashed_layout
 from arctic_platform.common.packing.layout import require_stash_inside_context
 
@@ -1074,9 +1075,10 @@ def _adapt_gated_delta_net_module(
     ``fp32_beta`` is passed to :func:`head_parallel_gated_delta_net`: ``True`` evaluates the beta gate as a sigmoid of
     fp32 ``b``, ``False`` as ``b.sigmoid()`` in ``b``'s own dtype, which is what the stock transformers forward does.
 
-    ``process_group=None`` is SP=1. There a call with no stashed :class:`PackedLayout` runs the stock forward
-    unchanged; a stashed one runs the packed path with ``stock_numerics``, which repeats Q/K to the value heads as
-    the stock forward does.
+    ``process_group=None`` is SP=1. There a call with a sharing :class:`PackedLayout` stashed, or an unshared one
+    that is exactly this call (``[1, num_tokens]``, no cache), runs the packed path on the layout's segments with
+    ``stock_numerics``, which repeats Q/K to the value heads as the stock forward does. Any other call runs the stock
+    forward unchanged.
     """
     fused = all(hasattr(module, attribute) for attribute in _FUSED_PROJECTIONS)
     required_attributes = (
@@ -1112,21 +1114,31 @@ def _adapt_gated_delta_net_module(
     stock_forward = module.forward
 
     def forward(self, *args, **kwargs):
-        layout = get_stashed_layout(self)
-        if layout is None and process_group is None:
-            require_stash_inside_context(type(self).__name__, layout)
-            return stock_forward(*args, **kwargs)
         hidden_states = _hidden_states_from_call(args, kwargs)
         cache_params = kwargs.get("cache_params")
         if cache_params is None and len(args) > 1:
             cache_params = args[1]
+        layout = get_sharing_layout(self)
+        if layout is None:
+            stash = get_stashed_layout(self)
+            require_stash_inside_context(type(self).__name__, stash)
+            if process_group is None:
+                # The stock forward resets state only at cu_seq_lens_q the caller passes; an unshared stash that is
+                # exactly this call gives its own segments instead.
+                if (
+                    stash is None
+                    or cache_params is not None
+                    or tuple(hidden_states.shape[:2]) != (1, stash.num_tokens)
+                ):
+                    return stock_forward(*args, **kwargs)
+                layout = stash
         if cache_params is not None:
             raise RuntimeError(
-                "head-parallel GatedDeltaNet is a training path and does not support "
-                "cached recurrent or convolution state"
+                "the packed GatedDeltaNet path (sequence parallelism or prefix sharing) is a training path and "
+                "does not support cached recurrent or convolution state"
             )
-        # Under a layout the boundaries are the layout's; seq_idx / cu_seq_lens_* the caller passed describe the
-        # unshared rows and are not read.
+        # Under a sharing layout the boundaries are the layout's; seq_idx / cu_seq_lens_* the caller passed describe
+        # the unshared rows and are not read.
         global_cu_seqlens = None if layout is not None else getattr(self, _GLOBAL_CU_SEQLENS_ATTRIBUTE, None)
         if layout is None and not torch.is_tensor(global_cu_seqlens):
             raise RuntimeError(
@@ -1199,7 +1211,8 @@ def _install_global_boundary_wrapper(model: nn.Module, modules: list, process_gr
     original_forward = model.forward
 
     def forward(*args, **kwargs):
-        if get_stashed_layout(model) is not None:
+        stash = get_stashed_layout(model)
+        if stash is not None and stash.has_sharing:
             # The layers read the stashed global layout; this rank's positions cover only its window.
             return original_forward(*args, **kwargs)
         position_ids = kwargs.get("position_ids")
@@ -1213,7 +1226,7 @@ def _install_global_boundary_wrapper(model: nn.Module, modules: list, process_gr
         gathered = [torch.empty_like(position_ids) for _ in range(world_size)]
         dist.all_gather(gathered, position_ids.contiguous(), group=process_group)
         # SP shards are contiguous in rank order, so concatenation rebuilds the packed call's positions.
-        global_cu_seqlens = cu_seqlens_from_position_ids(torch.cat(gathered, dim=1))
+        global_cu_seqlens = cu_seqlens_from_position_ids(torch.cat(gathered, dim=1), stash)
         for module in modules:
             setattr(module, _GLOBAL_CU_SEQLENS_ATTRIBUTE, global_cu_seqlens)
         return original_forward(*args, **kwargs)
@@ -1262,10 +1275,10 @@ def apply_gated_delta_net_sequence_parallelism(model: nn.Module, process_group, 
 def apply_gated_delta_net_prefix_continuation(model: nn.Module) -> int:
     """Install the GatedDeltaNet adapter at SP=1 and return the count of adapted modules.
 
-    Calls without a stashed :class:`PackedLayout` still run each module's stock forward. Calls inside
-    ``using_layout`` run the packed path in stock numerics (Q/K repeated to the value heads, beta as
+    Calls without a sharing :class:`PackedLayout` stashed still run each module's stock forward. Calls under a
+    sharing layout run the packed path in stock numerics (Q/K repeated to the value heads, beta as
     ``b.sigmoid()`` in ``b``'s dtype, so an fp32 ``in_proj_b`` output hook still applies), with boundaries from
-    the layout and, under sharing, each continuation resuming its root.
+    the layout and each continuation resuming its root.
     """
     adapted = 0
     for name, module in model.named_modules():

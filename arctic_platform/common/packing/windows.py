@@ -23,7 +23,10 @@ from typing import List
 
 import torch
 
+from .layout import PackedLayout
+from .layout import layout_for_own_positions
 from .layout import layout_for_position_ids
+from .layout import require_stash_inside_context
 from .pack import PackMetadata
 from .walk import map_batch_values
 
@@ -98,7 +101,12 @@ def window_cu_seqlens(
     return boundaries
 
 
-def cu_seqlens_from_position_ids(position_ids: torch.Tensor) -> torch.Tensor:
+_FROM_ACTIVE_CONTEXT: Any = object()
+
+
+def cu_seqlens_from_position_ids(
+    position_ids: torch.Tensor, stash: PackedLayout | None = _FROM_ACTIVE_CONTEXT
+) -> torch.Tensor:
     """Varlen boundaries of a packed sequence, read back out of its ``position_ids``.
 
     Packing writes each row's positions starting from 0, so a 0 anywhere but the first token marks the start of
@@ -109,21 +117,37 @@ def cu_seqlens_from_position_ids(position_ids: torch.Tensor) -> torch.Tensor:
     Padding appended by ``pad_packed_microbatch`` carries position 0, so each pad token reads as its own
     single-token segment rather than extending the row it follows.
 
-    Inside ``using_layout`` the positions are not read for boundaries: the active ``PackedLayout`` segments are
-    returned, and ``position_ids`` must cover exactly that layout's packed tokens. Nested contexts with different
-    layouts raise, since this function cannot tell which call it serves.
+    Inside a prefix-sharing ``using_layout`` the positions are not read for boundaries: the active ``PackedLayout``
+    segments are returned, and ``position_ids`` must cover exactly that layout's packed tokens. Nested contexts with
+    different layouts raise, since this function cannot tell which call it serves. Inside one unshared context, the
+    layout's segments are returned for its own positions, which also covers rows whose positions do not start at 0;
+    any other positions (padded calls, SP shards) are read as above.
+
+    A caller that has a module passes its ``stash`` (``None`` when it has none). The active contexts are then not
+    searched: the stash decides as the single active layout would, and no stash inside a sharing context raises,
+    since the positions may belong to another model's call.
     """
     if not torch.is_tensor(position_ids) or position_ids.ndim < 1:
         raise ValueError(f"position_ids must be a tensor with at least one dimension, got {position_ids!r}")
     flat = position_ids[0] if position_ids.ndim == 3 else position_ids
     flat = flat.reshape(-1)
-    layout = layout_for_position_ids()
+    if stash is _FROM_ACTIVE_CONTEXT:
+        layout = layout_for_position_ids(flat)
+    else:
+        require_stash_inside_context("packed boundaries from position_ids", stash)
+        layout = layout_for_own_positions(stash, flat)
     if layout is not None:
         if flat.numel() != layout.num_tokens:
             raise ValueError(
                 f"active PackedLayout has {layout.num_tokens} packed tokens but position_ids has {flat.numel()}; "
-                "sequence-parallel shards (SP >= 2) and padded calls (pad_packed_microbatch) are not supported "
-                "inside using_layout until the GatedDeltaNet / executor PRs define them"
+                "sequence-parallel shards (SP >= 2) must be gathered to the whole call first, and padded calls "
+                "(pad_packed_microbatch) are not supported under prefix sharing until the executor PR"
+            )
+        own = layout.position_ids.to(device=flat.device, dtype=flat.dtype)
+        if not torch.equal(own, flat):
+            raise ValueError(
+                "position_ids are not the active prefix-sharing PackedLayout's own positions, so they belong to "
+                "another call; wrap that model in its own using_layout (an unshared layout is fine)"
             )
         return layout.cu_seqlens.to(device=position_ids.device, dtype=torch.int32)
     if flat.numel() == 0:

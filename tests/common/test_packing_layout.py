@@ -46,6 +46,7 @@ from arctic_platform.common.packing import skip_share_if_router_disagree
 from arctic_platform.common.packing import using_layout
 from arctic_platform.common.packing.layout import LAYOUT_ATTR
 from arctic_platform.common.packing.layout import active_layout_requires_token_mean
+from arctic_platform.common.packing.layout import dense_causal_attention
 from arctic_platform.common.packing.layout import get_active_packed_layout
 from arctic_platform.common.packing.layout import get_stashed_layout
 from arctic_platform.common.packing.layout import prefix_varlen_args
@@ -498,6 +499,9 @@ def test_cu_seqlens_from_position_ids_uses_active_layout():
         torch_assert_equal(cu_seqlens_from_position_ids(packed["position_ids"]), layout.cu_seqlens)
         with pytest.raises(ValueError, match="5 packed tokens.*SP >= 2.*pad_packed_microbatch"):
             cu_seqlens_from_position_ids(torch.zeros(1, 8, dtype=torch.long))
+        # Same width, another call's positions: not this layout's segments.
+        with pytest.raises(ValueError, match="not the active prefix-sharing PackedLayout's own positions"):
+            cu_seqlens_from_position_ids(torch.tensor([[0, 1, 0, 1, 2]]))
         with pytest.raises(ValueError, match="position_ids == 0"):
             require_no_prefix_sharing("helper")
     require_no_prefix_sharing("helper")
@@ -523,41 +527,47 @@ def test_nested_unshared_context_keeps_sharing_guards():
         with using_layout(other, None):
             with pytest.raises(ValueError, match="nested using_layout contexts"):
                 cu_seqlens_from_position_ids(packed["position_ids"])
+    # An unshared context changes nothing: boundaries are read from the positions, padded or not.
+    positions = torch.tensor([[0, 1, 2, 0, 1, 0, 0]])
+    expected = cu_seqlens_from_position_ids(positions)
     with using_layout(other, inner):
         require_no_prefix_sharing("helper")
         active_layout_requires_token_mean("seq-mean-token-sum")
-        torch_assert_equal(cu_seqlens_from_position_ids(torch.zeros(1, 8, dtype=torch.long)), inner.cu_seqlens)
+        torch_assert_equal(cu_seqlens_from_position_ids(positions), expected)
 
 
-def test_unstashed_attention_refuses_to_run_inside_another_context():
+def test_unstashed_attention_refuses_to_run_inside_another_sharing_context():
     set_seed(4)
     x, mask, layout, unshared = _attention_batch()
     model, other = FlashAttention().double(), FlashAttention().double()
     hidden = unshared.pack(x)
     segments = (unshared.cu_seqlens, unshared.max_len_q)
     expected = other(hidden, *segments)
-    for active in (layout, unshared):
-        with using_layout(model, active):
-            with pytest.raises(ValueError, match="no PackedLayout stashed"):
-                other(hidden, *segments)
-            # Wrapped in its own unshared layout, the other model runs as it does on its own.
-            with using_layout(other, unshared):
-                torch_assert_equal(other(hidden, *segments), expected)
+    with using_layout(model, layout):
+        with pytest.raises(ValueError, match="no PackedLayout stashed"):
+            other(hidden, *segments)
+        # Wrapped in its own unshared layout, the other model runs as it does on its own.
+        with using_layout(other, unshared):
+            torch_assert_equal(other(hidden, *segments), expected)
+    # An unshared context does not hand its segments to anyone, so it refuses nothing.
+    with using_layout(model, unshared):
+        torch_assert_equal(other(hidden, *segments), expected)
     torch_assert_equal(other(hidden, *segments), expected)
 
 
-def test_dense_attention_refuses_packed_layouts():
+def test_dense_attention_refuses_only_prefix_sharing():
     _, layout = _shared_layout()
     unshared = PackedLayout.build(torch.ones(2, 4, dtype=torch.long), *unshared_groups(2))
-    single = PackedLayout.build(torch.ones(1, 4, dtype=torch.long), *unshared_groups(1))
     require_dense_attention_layout("SDPAAttention", None)
-    require_dense_attention_layout("SDPAAttention", single)
-    for packed in (layout, unshared):
-        with pytest.raises(ValueError, match="no varlen path"):
-            require_dense_attention_layout("SDPAAttention", packed)
-        with using_layout(FlashAttention(), packed):
-            with pytest.raises(ValueError, match="SDPAAttention ran with no PackedLayout stashed"):
-                require_dense_attention_layout("SDPAAttention", None)
+    # An unshared layout runs as dense attention does today.
+    require_dense_attention_layout("SDPAAttention", unshared)
+    with using_layout(FlashAttention(), unshared):
+        require_dense_attention_layout("SDPAAttention", None)
+    with pytest.raises(ValueError, match="no varlen path"):
+        require_dense_attention_layout("SDPAAttention", layout)
+    with using_layout(FlashAttention(), layout):
+        with pytest.raises(ValueError, match="SDPAAttention ran with no PackedLayout stashed"):
+            require_dense_attention_layout("SDPAAttention", None)
 
 
 def test_using_layout_is_owned_by_one_thread():
@@ -949,6 +959,82 @@ def test_checkpoint_after_context_exit_without_unpack():
     assert max((g - want).abs().max().item() for g, want in zip(got, expected)) > 1e-3
 
 
+def test_unshared_layout_keeps_padded_and_sharded_calls_as_they_are():
+    batch, _ = _shared_layout()
+    unshared = PackedLayout.build(batch["attention_mask"], *unshared_groups(2), batch["position_ids"])
+    # Two pad tokens past the layout (pad_packed_microbatch), and one SP rank's half of the call.
+    padded = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3, 0, 0]])
+    shard = padded[:, :5]
+    k = torch.randn(10, 2, 4)
+    cu = torch.tensor([0, 4, 8, 9, 10], dtype=torch.int32)
+    expected = [cu_seqlens_from_position_ids(positions) for positions in (padded, shard)]
+    with using_layout(FlashAttention(), unshared):
+        for positions, want in zip((padded, shard), expected):
+            torch_assert_equal(cu_seqlens_from_position_ids(positions), want)
+        got = prefix_varlen_args(k, k, cu, 4, unshared)
+    assert got[0] is k and got[2] is cu and got[3] is cu and got[4:] == (4, 4)
+
+
+def test_unshared_layout_gives_its_segments_for_its_own_positions():
+    # Client positions that do not start at 0 read back as one segment of the wrong length.
+    mask = torch.ones(2, 3, dtype=torch.long)
+    unshared = PackedLayout.build(mask, *unshared_groups(2), torch.tensor([[5, 6, 7], [2, 3, 4]]))
+    own = unshared.position_ids.unsqueeze(0)
+    other = torch.tensor([[0, 1, 2, 3, 0, 1]])
+    expected_other = cu_seqlens_from_position_ids(other)
+    assert not torch.equal(cu_seqlens_from_position_ids(own), unshared.cu_seqlens.int())
+    with using_layout(FlashAttention(), unshared):
+        torch_assert_equal(cu_seqlens_from_position_ids(own), unshared.cu_seqlens.int())
+        # Another batch of the same width is not this layout's, so its positions are read.
+        torch_assert_equal(cu_seqlens_from_position_ids(other), expected_other)
+        # With a second layout active neither can be told apart, so positions are read.
+        with using_layout(FlashAttention(), PackedLayout.build(mask, *unshared_groups(2))):
+            assert not torch.equal(cu_seqlens_from_position_ids(own), unshared.cu_seqlens.int())
+
+
+def test_position_id_boundaries_follow_the_callers_stash():
+    _, shared = _shared_layout()
+    mask = torch.ones(2, 3, dtype=torch.long)
+    own = PackedLayout.build(mask, *unshared_groups(2), torch.tensor([[5, 6, 7], [2, 3, 4]]))
+    positions = own.position_ids.unsqueeze(0)
+    read = cu_seqlens_from_position_ids(positions)
+    torch_assert_equal(cu_seqlens_from_position_ids(positions, None), read)
+    with using_layout(FlashAttention(), shared):
+        with using_layout(FlashAttention(), own):
+            with pytest.raises(ValueError, match="nested using_layout"):
+                cu_seqlens_from_position_ids(positions)
+            torch_assert_equal(cu_seqlens_from_position_ids(positions, own), own.cu_seqlens.int())
+        # No stash while another model shares: the positions may be that call's.
+        with pytest.raises(ValueError, match="no PackedLayout stashed"):
+            cu_seqlens_from_position_ids(positions, None)
+        torch_assert_equal(
+            cu_seqlens_from_position_ids(shared.position_ids.unsqueeze(0), shared), shared.cu_seqlens.int()
+        )
+
+
+def test_dense_causal_attention_keeps_segments_apart():
+    set_seed(0)
+    unshared = PackedLayout.build(torch.tensor([[1, 1, 1, 1, 0], [1, 1, 1, 1, 1]]), *unshared_groups(2))
+    q, k, v = (torch.randn(1, 2, unshared.num_tokens, 4, dtype=torch.float64) for _ in range(3))
+    rows = torch.cat(
+        [
+            torch.nn.functional.scaled_dot_product_attention(q[:, :, s:e], k[:, :, s:e], v[:, :, s:e], is_causal=True)
+            for s, e in unshared.segment_bounds
+        ],
+        dim=2,
+    )
+    got = dense_causal_attention("SDPAAttention", q, k, v, unshared)
+    torch_assert_close(got, rows, atol=F64_ATOL, rtol=0)
+    assert not torch.allclose(got, torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True))
+    # A call the layout does not describe (padded past it, or more than one row) runs one causal rectangle.
+    for call in (torch.randn(1, 2, unshared.num_tokens + 1, 4), torch.randn(2, 2, unshared.num_tokens, 4)):
+        rectangle = torch.nn.functional.scaled_dot_product_attention(call, call, call, is_causal=True)
+        torch_assert_equal(dense_causal_attention("SDPAAttention", call, call, call, unshared), rectangle)
+    _, shared = _shared_layout()
+    with pytest.raises(ValueError, match="no varlen path"):
+        dense_causal_attention("SDPAAttention", q, k, v, shared)
+
+
 def test_share_off_layout_matches_pack_microbatch_attention():
     set_seed(3)
     x, mask, _, unshared = _attention_batch(left_pad_row=None)
@@ -956,7 +1042,8 @@ def test_share_off_layout_matches_pack_microbatch_attention():
     positions = (mask.cumsum(1) - 1).clamp(min=0) * mask
     packed, metadata = pack_microbatch({"x": x, "attention_mask": mask, "position_ids": positions})
     with using_layout(module, unshared):
-        out = module(unshared.pack(x))
+        cu = cu_seqlens_from_position_ids(unshared.pack(positions).unsqueeze(0))
+        out = module(unshared.pack(x), cu_seqlens=cu, max_seqlen=int(cu.diff().max()))
     baseline = module(packed["x"][0], cu_seqlens=metadata.cu_seqlens, max_seqlen=int(metadata.cu_seqlens.diff().max()))
     torch_assert_equal(out, baseline)
 

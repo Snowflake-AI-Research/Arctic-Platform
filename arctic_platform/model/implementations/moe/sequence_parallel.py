@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from arctic_platform.common.packing.layout import get_stashed_layout
 from arctic_platform.model.implementations.gpu.packing import cu_seqlens_from_position_ids
 from arctic_platform.model.implementations.gpu.sp.collectives import sequence_head_all_to_all
 from arctic_platform.model.implementations.moe.logging_utils import get_logger
@@ -98,7 +99,7 @@ def _make_backbone_sp_forward(
             gathered_position_ids = [torch.empty_like(position_ids) for _ in range(sp_world_size)]
             dist.all_gather(gathered_position_ids, position_ids.contiguous(), group=sp_group)
             global_position_ids = torch.cat(gathered_position_ids, dim=1)
-            cu_seqlens = cu_seqlens_from_position_ids(global_position_ids)
+            cu_seqlens = cu_seqlens_from_position_ids(global_position_ids, get_stashed_layout(self))
             max_seqlen = int(cu_seqlens.diff().max().item())
             for module in softmax_attn_modules:
                 module._sp_cu_seqlens = cu_seqlens

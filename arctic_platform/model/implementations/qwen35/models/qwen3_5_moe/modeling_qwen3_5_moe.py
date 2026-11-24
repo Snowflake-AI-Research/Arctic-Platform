@@ -18,10 +18,12 @@ from transformers.utils import logging
 
 from arctic_platform.common.packing.layout import PREFIX_CONTINUATION_ATTR
 from arctic_platform.common.packing.layout import PackedLayout
+from arctic_platform.common.packing.layout import dense_causal_attention
+from arctic_platform.common.packing.layout import get_sharing_layout
 from arctic_platform.common.packing.layout import get_stashed_layout
+from arctic_platform.common.packing.layout import layout_for_own_positions
 from arctic_platform.common.packing.layout import prefix_varlen_args
 from arctic_platform.common.packing.layout import register_native_prefix_attention
-from arctic_platform.common.packing.layout import require_dense_attention_layout
 from arctic_platform.common.packing.layout import require_stash_inside_context
 from arctic_platform.model.implementations.debug.determinism import resolve_flash_attention_determinism
 from arctic_platform.model.implementations.fp8 import fp8_weight_block_size
@@ -306,9 +308,12 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         key = key.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
         value = value.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
 
-        # Inside using_layout the stashed layout is the packed call's boundaries (global under SP), and a sharing
-        # layout's continuations resume their root's conv inputs and recurrent state.
-        layout = get_stashed_layout(self)
+        # A sharing layout is the packed call's boundaries (global under SP), and its continuations resume their
+        # root's conv inputs and recurrent state. An unshared layout keeps the usual path, with the cu_seqlens
+        # the text forward passes.
+        layout = get_sharing_layout(self)
+        if layout is None:
+            require_stash_inside_context(type(self).__name__, get_stashed_layout(self))
         cp_group = getattr(self, "cp_group", None)
         if cp_group is not None or layout is not None:
             global_cu_seqlens = None if layout is not None else getattr(self, "_dss_sp_global_cu_seqlens", None)
@@ -338,7 +343,6 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                 use_qk_l2norm_in_kernel=True,
             )
         else:
-            require_stash_inside_context(type(self).__name__, layout)
             mixed_qkv = mixed_qkv.transpose(1, 2)
             if self._causal_conv1d_fn is not None:
                 seq_idx = None
@@ -500,14 +504,14 @@ class Qwen3_5MoeGatedSDPAAttention(Qwen3_5MoeGatedAttentionBase):
         key_states: torch.Tensor,
         value_states: torch.Tensor,
     ) -> torch.Tensor:
-        require_dense_attention_layout(type(self).__name__, get_stashed_layout(self))
         key_states = _repeat_kv(key_states, self.num_key_value_groups)
         value_states = _repeat_kv(value_states, self.num_key_value_groups)
-        return F.scaled_dot_product_attention(
+        return dense_causal_attention(
+            type(self).__name__,
             query_states,
             key_states,
             value_states,
-            is_causal=True,
+            get_stashed_layout(self),
             scale=self.scaling,
         )
 
@@ -903,14 +907,19 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        layout = get_stashed_layout(self)
+        layout = get_sharing_layout(self)
+        stashed = get_stashed_layout(self)
+        if layout is None and position_ids is not None and inputs_embeds.shape[0] == 1:
+            # An unshared stash whose positions are this call's: its segments hold for every attention implementation,
+            # including SDPA, whose GatedDeltaNet layers would otherwise get no boundaries.
+            layout = layout_for_own_positions(stashed, position_ids.reshape(-1))
         if layout is not None:
-            # Not position_ids == 0, which would glue a continuation onto the root before it. The mixers read the
-            # stash themselves; these only fill the decoder's arguments.
+            # Not position_ids == 0, which would glue a continuation onto the root before it. Under sharing the
+            # mixers read the stash themselves; these only fill the decoder's arguments.
             cu_seqlens = layout.cu_seqlens.to(device=inputs_embeds.device, dtype=torch.int32)
             max_seqlen = layout.max_len_q
         elif self.config._attn_implementation in ("flash_attention_2", "flash_attention_3", "flash_attention_4"):
-            require_stash_inside_context("Qwen3.5-MoE segment boundaries", layout)
+            require_stash_inside_context("Qwen3.5-MoE segment boundaries", stashed)
             flat_position_ids = position_ids.view(-1)
             # Segment lengths from boundary indices (where position_ids resets to 0), not position values, so
             # an SP shard carrying global-offset positions still yields local cu_seqlens. Same as the
