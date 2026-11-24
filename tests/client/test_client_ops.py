@@ -41,7 +41,6 @@ from arctic_platform.client import Transport
 from arctic_platform.client import base as base_module
 from arctic_platform.client import requests as cluster_requests
 from arctic_platform.client import unresolved_ops
-from arctic_platform.client.config import CORTEX_DENSE_LM_HEAD_CHUNK_SIZE
 from arctic_platform.client.transport import CLUSTER_OPS
 from arctic_platform.client.transport import method_name
 
@@ -724,47 +723,50 @@ class TestCortexModelOptions:
     def test_absent_options_do_not_add_a_transport_block(self):
         cfg = ArcticClientConfig(model_name="model", training_gpus=1)
         training = cfg._cortex_training_sub_job()["training_config"]
-        assert set(training["model_options"]) == {"lm_head"}
+        assert "model_options" not in training
         assert "prime_rl" not in training
 
 
 class TestCortexChunkedLMHead:
-    """Cortex reads the chunked LM head only from its own fields, so the dense loader's
+    """Cortex reads the chunked LM head only from its own fields, so the loaders'
     ds_worker_config keys must be lifted into ``model_options`` or they are dropped."""
+
+    _WORKER_KEYS = {
+        "fused_lm_head_token_chunk_size": 4096,
+        "fused_lm_head_vocab_chunk_size": 16384,
+        "fp32_lm_head": True,
+        "tiled_mlp_token_chunk_size": 2048,
+    }
 
     @staticmethod
     def _training(training: dict | None = None) -> dict:
         cfg = ArcticClientConfig(model_name="m", training_gpus=8, training=training or {})
         return cfg._cortex_training_sub_job()["training_config"]
 
-    def test_dense_job_defaults_to_the_chunked_lm_head(self):
-        assert self._training()["model_options"]["lm_head"] == {
-            "token_chunk_size": CORTEX_DENSE_LM_HEAD_CHUNK_SIZE,
-            "vocab_chunk_size": CORTEX_DENSE_LM_HEAD_CHUNK_SIZE,
-        }
+    def test_a_job_without_the_keys_sends_no_lm_head_options(self):
+        assert "model_options" not in self._training()
 
-    def test_worker_lm_head_keys_use_the_model_options_channel(self):
-        training = self._training(
-            {
-                "ds_worker_config": {
-                    "fused_lm_head_token_chunk_size": 4096,
-                    "fused_lm_head_vocab_chunk_size": 16384,
-                    "fp32_lm_head": True,
-                    "tiled_mlp_token_chunk_size": 2048,
-                }
-            }
-        )
+    @pytest.mark.parametrize("loader", [{}, {"model_provider": "arctic"}, {"ep_size": 8}])
+    def test_worker_keys_use_the_model_options_channel_on_every_loader(self, loader):
+        training = self._training({"ds_worker_config": {**loader, **self._WORKER_KEYS}})
         assert training["model_options"] == {
             "lm_head": {"token_chunk_size": 4096, "vocab_chunk_size": 16384, "fp32": True},
             "tiled_mlp": {"token_chunk_size": 2048},
         }
         assert "fused_lm_head_token_chunk_size" not in training
 
-    def test_explicit_model_options_lm_head_wins_over_the_default(self):
-        training = self._training({"ds_worker_config": {"model_options": {"lm_head": {"token_chunk_size": 1024}}}})
-        assert training["model_options"]["lm_head"] == {"token_chunk_size": 1024}
+    def test_a_worker_key_merges_with_model_options(self):
+        training = self._training(
+            {
+                "ds_worker_config": {
+                    "fused_lm_head_token_chunk_size": 1024,
+                    "model_options": {"lm_head": {"fp32": True}},
+                }
+            }
+        )
+        assert training["model_options"]["lm_head"] == {"fp32": True, "token_chunk_size": 1024}
 
-    def test_none_turns_the_chunked_lm_head_off(self):
+    def test_none_sends_nothing(self):
         training = self._training({"ds_worker_config": {"fused_lm_head_token_chunk_size": None}})
         assert "model_options" not in training
 
@@ -778,20 +780,6 @@ class TestCortexChunkedLMHead:
                     }
                 }
             )
-
-    @pytest.mark.parametrize(
-        "worker",
-        [
-            {"model_provider": "arctic"},
-            {"model_provider": "prime_rl"},
-            {"ep_size": 8},
-            {"use_liger": True},
-            {"model_options": {"liger": True}},
-        ],
-    )
-    def test_no_default_off_the_dense_loader_or_with_liger(self, worker):
-        training = self._training({"ds_worker_config": worker})
-        assert "lm_head" not in training.get("model_options", {})
 
     def test_does_not_mutate_the_client_config(self):
         cfg = ArcticClientConfig(

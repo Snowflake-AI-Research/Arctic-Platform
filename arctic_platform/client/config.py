@@ -372,7 +372,7 @@ class ArcticClientConfig(BaseModel):
             )
         if provider:
             training["model_provider"] = provider
-        options = _cortex_model_options(worker, dense=provider != "arctic" and (worker.get("ep_size") or 1) == 1)
+        options = _cortex_model_options(worker)
         if options:
             training["model_options"] = options
         if worker.get("attn_implementation"):
@@ -412,8 +412,8 @@ class ArcticClientConfig(BaseModel):
         return sub
 
 
-# ds_worker_config keys the on-prem dense loader reads (``dense_model_spec``), by the
-# ``model_options`` path Cortex validates against the training loader's option profile.
+# ds_worker_config keys the on-prem loaders read, by the ``model_options`` path Cortex reads them from.
+# Cortex validates them against the training loader's option profile, so one a loader lacks is rejected.
 _WORKER_MODEL_OPTION_KEYS: dict[str, tuple[str, str]] = {
     "fused_lm_head_token_chunk_size": ("lm_head", "token_chunk_size"),
     "fused_lm_head_vocab_chunk_size": ("lm_head", "vocab_chunk_size"),
@@ -421,23 +421,16 @@ _WORKER_MODEL_OPTION_KEYS: dict[str, tuple[str, str]] = {
     "tiled_mlp_token_chunk_size": ("tiled_mlp", "token_chunk_size"),
 }
 
-# Every dense training profile in Cortex's model catalog runs the chunked LM head at this size. Without it
-# the trainer materializes [tokens, vocab] logits plus their fp32 log-softmax: ~120 GB for a 248k vocab at
-# 64k tokens, more than an H200 holds.
-CORTEX_DENSE_LM_HEAD_CHUNK_SIZE = 8192
 
-
-def _cortex_model_options(worker: dict[str, Any], *, dense: bool) -> dict[str, Any]:
+def _cortex_model_options(worker: dict[str, Any]) -> dict[str, Any]:
     """``training_config.model_options`` for a Cortex training sub-job.
 
-    Starts from ``ds_worker_config.model_options`` and adds ``use_liger``. On the dense loader it
-    also adds that loader's top-level keys under their ``model_options`` names and, without Liger,
-    turns the chunked LM head on unless the config sets its token chunk size;
-    ``fused_lm_head_token_chunk_size: None`` turns it off.
+    ``ds_worker_config.model_options``, plus ``use_liger`` and the keys in ``_WORKER_MODEL_OPTION_KEYS``
+    under their ``model_options`` names.
     """
     options = deepcopy(worker.get("model_options") or {})
     for key, (group, name) in _WORKER_MODEL_OPTION_KEYS.items():
-        if not dense or worker.get(key) is None:
+        if worker.get(key) is None:
             continue
         section = options.setdefault(group, {})
         if name in section and section[name] != worker[key]:
@@ -448,18 +441,6 @@ def _cortex_model_options(worker: dict[str, Any], *, dense: bool) -> dict[str, A
         section[name] = worker[key]
     if worker.get("use_liger"):
         options["liger"] = True
-    lm_head = options.get("lm_head") or {}
-    if (
-        dense
-        and not options.get("liger")
-        and "fused_lm_head_token_chunk_size" not in worker
-        and "token_chunk_size" not in lm_head
-    ):
-        options["lm_head"] = {
-            "token_chunk_size": CORTEX_DENSE_LM_HEAD_CHUNK_SIZE,
-            "vocab_chunk_size": CORTEX_DENSE_LM_HEAD_CHUNK_SIZE,
-            **lm_head,
-        }
     return options
 
 

@@ -161,5 +161,6 @@ Every harness setting, sandbox backend, model, and RL hyperparameter in `recipes
 | **Horizon & context length** | `MAX_TURNS` / `MAX_CONTEXT_LENGTH` | `10` / `32768` | `20` / `32768` |
 | **Learning rate & RL loss** | `LR` / Hydra CLI args | `1.0e-6` (`gspo`) | `LR=5e-7 trainer.algorithm.policy_loss_type=grpo` |
 | **Attention & weight sync** | `ATTN_IMPLEMENTATION` / `WEIGHT_SYNC_BACKEND` | `flash_attention_3` / `nccl` | `flash_attention_2` (non-Hopper GPUs) |
+| **Chunked LM head (trainer)** | `LM_HEAD_CHUNK_SIZE` | `8192` | `0` (off; a model whose loader fuses the LM head into the loss) |
 
 This release was run end to end on Snowflake sandboxes with `base_image` and on `host`, with the defaults above and with `8` + `8` GPUs at `16` $\times$ `8` rollouts, and with evaluation during training. The launcher also accepts Harbor's other environments (`docker`, `modal`, `daytona`, `e2b`) and other models, but those weren't tested with this recipe.

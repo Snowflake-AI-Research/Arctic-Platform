@@ -149,6 +149,7 @@ def launch_driver(
     num_cpus: float = 0,
     env_prefixes: tuple[str, ...] = ("ARCTIC_", "WANDB_", "GIT_"),
     env_keys: tuple[str, ...] = ("PATH", "HF_HOME", "HF_HUB_CACHE"),
+    ds_worker_config: Optional[dict[str, Any]] = None,
 ) -> None:
     """Provision Cortex, then run ``remote_fn(cfg, reconnect_config)`` under Ray.
 
@@ -157,6 +158,9 @@ def launch_driver(
     ``num_cpus=0`` when ``remote_fn`` submits more Ray tasks: a reserved CPU on
     the coordinator deadlocks them. The job is cancelled when this returns or
     raises, including on Ctrl-C and SIGTERM.
+
+    ``ds_worker_config`` is merged over the one SkyRL builds from
+    ``trainer.arctic_rl``, for worker keys that config has no field for.
     """
     import os
     from pathlib import Path
@@ -167,6 +171,9 @@ def launch_driver(
 
     upstream = patch_upstream()
     rl_config = _with_placement_timeout(cfg, build_rl_config(cfg))
+    if ds_worker_config:
+        merged = {**(rl_config.ds_worker_config or {}), **ds_worker_config}
+        rl_config = rl_config.model_copy(update=dict(ds_worker_config=merged))
     env_vars = prepare_runtime_environment(cfg)
     for key, value in os.environ.items():
         if key.startswith(env_prefixes):

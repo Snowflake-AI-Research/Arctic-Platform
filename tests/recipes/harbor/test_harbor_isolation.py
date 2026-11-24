@@ -1062,6 +1062,33 @@ def test_harbor_verifier_env_must_be_a_json_object_of_strings(monkeypatch):
         harbor_verifier_env()
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("8192", {"fused_lm_head_token_chunk_size": 8192, "fused_lm_head_vocab_chunk_size": 8192}),
+        ("0", {}),
+        ("", {}),
+        (None, {}),
+    ],
+)
+def test_lm_head_chunk_size_sets_both_tiles_and_0_or_empty_leaves_it_off(monkeypatch, raw, expected):
+    from harbor_rl.entrypoint import lm_head_worker_config
+
+    if raw is None:
+        monkeypatch.delenv("LM_HEAD_CHUNK_SIZE", raising=False)
+    else:
+        monkeypatch.setenv("LM_HEAD_CHUNK_SIZE", raw)
+    assert lm_head_worker_config() == expected
+
+
+def test_a_negative_lm_head_chunk_size_is_rejected(monkeypatch):
+    from harbor_rl.entrypoint import lm_head_worker_config
+
+    monkeypatch.setenv("LM_HEAD_CHUNK_SIZE", "-1")
+    with pytest.raises(ValueError, match="LM_HEAD_CHUNK_SIZE"):
+        lm_head_worker_config()
+
+
 class _UnstartableEnvironment(HostEnvironment):
     async def start(self, force_build: bool) -> None:
         raise RuntimeError("pushing image: unexpected status code 444")
