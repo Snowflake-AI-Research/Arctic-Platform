@@ -121,6 +121,7 @@ def manager_methods(monkeypatch):
         ("router_replay", "ensure_router_replay_vllm_patches"),
         ("xgrammar_stop_mask", "ensure_xgrammar_stop_mask_fix"),
         ("dense_prompt_logprobs", "ensure_dense_prompt_logprobs_patch"),
+        ("flashmla_sparse_dcp", "ensure_flashmla_sparse_bf16_dcp"),
         ("spec_decode_grammar", "ensure_spec_decode_grammar_fix"),
         ("hybrid_state_fixes", "apply_hybrid_state_fixes"),
         ("tp_spec_decode_sync", "ensure_tp_spec_decode_sync"),
@@ -128,6 +129,7 @@ def manager_methods(monkeypatch):
         ("mrope_yarn", "ensure_mrope_yarn_fix"),
         ("glm5next_lora", "ensure_glm5next_lora"),
         ("deepseek_v41_lora", "ensure_deepseek_v41_lora"),
+        ("decoded_tail_prefix_hit", "ensure_decoded_tail_prefix_hit"),
     ]:
         stub = ModuleType(f"arctic_platform.inference.vllm.{name}")
         setattr(stub, entry, lambda: None)

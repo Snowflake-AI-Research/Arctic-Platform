@@ -8,6 +8,7 @@ vLLM patch stack so weight sync and router replay can run with
 from __future__ import annotations
 
 import os
+from copy import copy
 
 from arctic_platform.inference.utils import require_supported_vllm_version
 
@@ -101,8 +102,28 @@ def patch_scheduler_check_stop() -> None:
     scheduler_mod.check_stop = check_stop_with_token_sequences
 
 
+def patch_aux_output_allow_dcp() -> None:
+    """DCP shards attention KV, not captured token rows; PCP still splits rows."""
+    from vllm.config import VllmConfig
+
+    original = VllmConfig._verify_aux_output_compatibility
+    if getattr(original, "_arctic_allow_dcp", False):
+        return
+
+    def verify_aux_output_compatibility(config: VllmConfig) -> None:
+        if config.aux_output_config.enabled and config.parallel_config.decode_context_parallel_size > 1:
+            config = copy(config)
+            config.parallel_config = copy(config.parallel_config)
+            config.parallel_config.decode_context_parallel_size = 1
+        original(config)
+
+    verify_aux_output_compatibility._arctic_allow_dcp = True
+    VllmConfig._verify_aux_output_compatibility = verify_aux_output_compatibility
+
+
 def ensure_router_replay_vllm_patches() -> None:
     _check_supported_vllm_version()
+    patch_aux_output_allow_dcp()
 
     from vllm.v1.core.sched import scheduler as scheduler_mod
 
