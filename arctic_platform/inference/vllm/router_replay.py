@@ -11,6 +11,9 @@ import os
 
 from arctic_platform.inference.utils import require_supported_vllm_version
 
+# The server imports this key, so the module stays torch-free; its bytes survive the msgpack round trip in extra_args.
+FORCED_ROUTES_KEY = "dss_router_replay_forced_routes"
+
 
 def _check_supported_vllm_version() -> None:
     if os.getenv("ARCTIC_INFERENCE_SKIP_VERSION_CHECK", "0") != "1":
@@ -104,8 +107,10 @@ def patch_scheduler_check_stop() -> None:
 def ensure_router_replay_vllm_patches() -> None:
     _check_supported_vllm_version()
 
+    from arctic_platform.inference.vllm.forced_routes import ensure_forced_routes_patch
     from vllm.v1.core.sched import scheduler as scheduler_mod
 
+    ensure_forced_routes_patch()
     if getattr(scheduler_mod.check_stop, "_arctic_router_replay_patch", False):
         return
     patch_scheduler_check_stop()

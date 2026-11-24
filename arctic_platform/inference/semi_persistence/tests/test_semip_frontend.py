@@ -152,7 +152,7 @@ def _front(inst=None, agents=(), pin=False, **kwargs):
     journals of most tests leave out."""
     inst = inst if inst is not None else _Inst()
     front = _Front(journal=inst.journal, **kwargs)
-    front._init_semi_p(inst, list(agents))
+    front._init_semi_p(inst, list(agents), forced_route_support_rpc=True)
     front._pin_pending = front._pin_pending and pin
     return front, inst
 
@@ -552,6 +552,26 @@ def test_attach_serves_the_core_then_builds_asyncllm_on_its_addresses(
         assert llm._death_watch_stop is not None
         assert "front end attached in" in caplog.text
         assert "serve_core" in caplog.text and "AsyncLLM" in caplog.text
+    finally:
+        llm._stop_death_watch()
+
+
+@pytest.mark.parametrize("has_rpc", [False, True])
+def test_attached_snapshot_only_probes_advertised_forced_routes(asyncllm, has_rpc):
+    cfg = _vllm_config()
+    summary = fe.core_summary(cfg)
+    if has_rpc:
+        summary["forced_route_support_rpc"] = True
+    llm = asyncio.run(asyncllm.attach(_handle(_Inst(pid=os.getpid(), summary=summary)), cfg))
+    try:
+        replies = asyncio.run(llm.collective_rpc("forced_route_support"))
+        if has_rpc:
+            assert replies == ["forced_route_support-ok"]
+            assert llm.rpcs == [("forced_route_support", (), None)]
+        else:
+            assert "snapshot" in replies[0]
+            assert llm.rpcs == []
+        assert asyncio.run(llm.collective_rpc("check_health")) == ["check_health-ok"]
     finally:
         llm._stop_death_watch()
 
