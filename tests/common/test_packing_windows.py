@@ -23,6 +23,7 @@ from arctic_platform.common.packing import PackMetadata
 from arctic_platform.common.packing import pack_microbatch
 from arctic_platform.common.packing import pad_packed_microbatch
 from arctic_platform.common.packing import token_budget_groups
+from arctic_platform.common.packing import token_budget_microbatch_groups
 from arctic_platform.common.packing import token_shard
 from arctic_platform.common.packing import token_validity_mask
 from arctic_platform.common.packing import token_window
@@ -178,6 +179,60 @@ def test_splitting_refuses_to_lower_a_call_count():
 
     with pytest.raises(ValueError, match="cannot reduce"):
         split_groups_to_count([[0], [1]], [4, 4], 1)
+
+
+def test_costliest_first_runs_the_long_call_before_the_short_one():
+    """Row order and cost disagree here, so only a cost order puts the long call first.
+
+    Call ``k`` waits for the slowest shard's ``k``-th call. Two shards whose rows arrive short-first would run
+    their short calls together and then their long ones only if both sort the same way, so the order has to be
+    by cost and not by which row happened to come first.
+    """
+    from arctic_platform.common.packing import costliest_first
+
+    assert costliest_first([[0], [1]], [2, 8], 9) == [[1], [0]]
+    assert costliest_first([[0], [1], [2]], [3, 9, 1], 10) == [[1], [0], [2]]
+
+
+def test_costliest_first_scores_attention_not_only_tokens():
+    """Equal token counts, unequal attention: the one long row costs more than two half-length rows.
+
+    Both calls carry 10 tokens, so a token-only key would tie them and keep row order. The ``len**2`` term is what
+    puts the single 10-token row ahead of the 5 + 5 pair.
+    """
+    from arctic_platform.common.packing import costliest_first
+
+    assert costliest_first([[0, 1], [2]], [5, 5, 10], 10) == [[2], [0, 1]]
+
+
+def test_costliest_first_keeps_row_order_among_equal_costs_and_rows_within_a_call():
+    """Ties fall back to the first row, and each call's rows stay ascending, so every rank derives one plan."""
+    from arctic_platform.common.packing import costliest_first
+
+    assert costliest_first([[1], [0]], [4, 4], 9) == [[0], [1]]
+    assert costliest_first([[3, 0], [2, 1]], [2, 3, 4, 5], 16) == [[0, 3], [1, 2]]
+    # Lengths 4, 7, 1, 2 under budget 9: the 7-token call, then 4+1, then 2.
+    assert costliest_first([[0, 2], [1], [3]], [4, 7, 1, 2], 9) == [[1], [0, 2], [3]]
+
+
+def test_costliest_first_refuses_a_non_positive_budget():
+    from arctic_platform.common.packing import costliest_first
+
+    with pytest.raises(ValueError, match="must be positive"):
+        costliest_first([[0]], [4], 0)
+
+
+def test_token_budget_microbatch_groups_runs_costliest_first():
+    """The batch helper ends in execution order, so a dispatch oracle is not comparing against row order.
+
+    Rows of 2 and 8 tokens under a 9-token budget cannot share a call. Grouping returns ``[[0], [1]]``; the
+    helper must then put the 8-token call first.
+    """
+    attention_mask = torch.zeros(2, 8, dtype=torch.long)
+    attention_mask[0, :2] = 1
+    attention_mask[1, :8] = 1
+    batch = {"input_ids": torch.zeros(2, 8, dtype=torch.long), "attention_mask": attention_mask}
+    assert token_budget_microbatch_groups(batch, 9) == [[1], [0]]
 
 
 def test_window_cu_seqlens_are_the_row_boundaries_when_nothing_is_sharded():
