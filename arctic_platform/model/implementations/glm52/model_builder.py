@@ -19,10 +19,16 @@ from transformers import AutoConfig, AutoModelForCausalLM, GenerationConfig, Pre
 
 from arctic_platform.model.implementations.moe.conversion_cache import (
     WEIGHT_CONVERSION_CACHE_SCOPE_ENV,
+    begin_conversion_preparation,
+    conversion_cache_attempt_id,
     conversion_cache_is_node_local,
     conversion_cache_ready,
+    conversion_preparation_root,
     ensure_node_local_conversion_cache,
+    get_checkpoint_converter,
+    record_conversion_preparation_failure,
     resolve_conversion_cache_path,
+    wait_for_conversion_cache,
     resolve_ready_conversion_cache_path,
     _write_conversion_cache,
 )
@@ -248,7 +254,13 @@ def _init_random_moe_weights(model: nn.Module, init_std: float) -> None:
         get_logger().info(f"Initialized {count} MoE/LatentMoE modules after random_init")
 
 
+@record_conversion_preparation_failure(distributed=True, heartbeat=False)
 def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
+    """Collectively load weights; every rank in the default process group must call.
+
+    Native checkpoints and random initialization still use the existing barriers, and DCP loading
+    is collective. This entry point is not a rank-subset loading API.
+    """
     device = "cpu" if config.fsdp_cpu_offload else "cuda"
     model.to_empty(device=device)
     torch.distributed.barrier()
@@ -305,6 +317,10 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
             snapshot_path = resolve_conversion_cache_path(config, source_path, fmt)
             node_local_cache = conversion_cache_is_node_local(snapshot_path)
             world = get_world()
+            attempt_id, fresh_attempt = conversion_cache_attempt_id(shared=not node_local_cache)
+            if not conversion_cache_ready(snapshot_path):
+                begin_conversion_preparation()
+            stream_convert_fn = get_checkpoint_converter(model, fmt)
             if node_local_cache:
                 ensure_node_local_conversion_cache(
                     source_path,
@@ -316,9 +332,14 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
                     save_state_dict,
                     rank=world.rank,
                     local_rank=world.local_rank,
+                    stream_convert_fn=stream_convert_fn,
+                    attempt_id=attempt_id,
+                    node_local=True,
+                    fresh_attempt=fresh_attempt,
+                    preparation_root=conversion_preparation_root(config, source_path),
                 )
             elif not conversion_cache_ready(snapshot_path) and world.is_master:
-                _write_conversion_cache(
+                ensure_node_local_conversion_cache(
                     source_path,
                     snapshot_path,
                     convert_fn,
@@ -328,6 +349,18 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
                     save_state_dict,
                     rank=world.rank,
                     local_rank=world.local_rank,
+                    stream_convert_fn=stream_convert_fn,
+                    attempt_id=attempt_id,
+                    node_local=False,
+                    fresh_attempt=fresh_attempt,
+                    preparation_root=conversion_preparation_root(config, source_path),
+                )
+            elif not conversion_cache_ready(snapshot_path):
+                wait_for_conversion_cache(
+                    snapshot_path,
+                    attempt_id=attempt_id,
+                    fresh_attempt=fresh_attempt,
+                    preparation_root=conversion_preparation_root(config, source_path),
                 )
 
     torch.distributed.barrier()
