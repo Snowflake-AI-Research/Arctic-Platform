@@ -91,9 +91,12 @@ def _remix(fused: bool, fp32: bool, post, comb, sublayer_out, streams) -> torch.
     if fused or (fp32 and streams.is_cuda and streams.shape[-2] == 4):
         return mix_streams(post, comb, sublayer_out, streams)
     if fp32:
-        # Under autocast ``post`` can arrive in bf16; the buffer must still accumulate in fp32.
-        mixed = post.float().unsqueeze(-1) * sublayer_out.unsqueeze(-2)
-        for weights, stream in zip(comb.float().unbind(-2), streams.unbind(-2)):
+        terms = zip(comb.float().unbind(-2), streams.unbind(-2))
+        weights, stream = next(terms)
+        # The sampler rounds stream zero's product before fusing the weighted sublayer output into it.
+        mixed = weights.unsqueeze(-1) * stream.unsqueeze(-2)
+        mixed.addcmul_(post.float().unsqueeze(-1), sublayer_out.unsqueeze(-2))
+        for weights, stream in terms:
             mixed.addcmul_(weights.unsqueeze(-1), stream.unsqueeze(-2))
         return mixed.to(streams.dtype)
     dtype = streams.dtype

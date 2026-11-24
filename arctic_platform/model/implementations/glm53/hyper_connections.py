@@ -228,24 +228,20 @@ def _hc_mix_fwd_kernel(
     row = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
     col = tl.program_id(1) * COLS + tl.arange(0, COLS)
     h = tl.arange(0, H)
-    rows = row[:, None, None].to(tl.int64)
-    mask3 = (row[:, None, None] < T) & (col[None, None, :] < D)
-    x = tl.load(x_ptr + (rows * H + h[None, :, None]) * D + col[None, None, :], mask=mask3, other=0.0).to(tl.float32)
-    y = tl.load(
-        y_ptr + row[:, None].to(tl.int64) * D + col[None, :], mask=(row[:, None] < T) & (col[None, :] < D), other=0.0
-    ).to(tl.float32)
+    rows = row.to(tl.int64)
+    mask = (row[:, None] < T) & (col[None, :] < D)
+    y = tl.load(y_ptr + rows[:, None] * D + col[None, :], mask=mask, other=0.0).to(tl.float32)
     post = tl.load(post_ptr + row[:, None] * H + h[None, :], mask=row[:, None] < T, other=0.0)
-    comb = tl.load(
-        comb_ptr + (row[:, None, None] * H + h[None, :, None]) * H + h[None, None, :],
-        mask=row[:, None, None] < T,
-        other=0.0,
-    )
-    # out[:, j] = post[:, j] * y + sum_i comb[:, i, j] * x[:, i]
-    mixed = tl.sum(comb[:, :, :, None] * x[:, :, None, :], axis=1)
-    out = post[:, :, None] * y[:, None, :] + mixed
-    tl.store(
-        out_ptr + (rows * H + h[None, :, None]) * D + col[None, None, :], out.to(out_ptr.dtype.element_ty), mask=mask3
-    )
+    for i in tl.static_range(H):
+        x_i = tl.load(x_ptr + (rows[:, None] * H + i) * D + col[None, :], mask=mask, other=0.0).to(tl.float32)
+        comb_i = tl.load(comb_ptr + (row[:, None] * H + i) * H + h[None, :], mask=row[:, None] < T, other=0.0)
+        if i == 0:
+            # vLLM's CUDA mHC remix rounds the first stream product before fusing post * y into it.
+            out = tl.fma(post[:, :, None], y[:, None, :], comb_i[:, :, None] * x_i[:, None, :])
+        else:
+            out = tl.fma(comb_i[:, :, None], x_i[:, None, :], out)
+    offset = (rows[:, None, None] * H + h[None, :, None]) * D + col[None, None, :]
+    tl.store(out_ptr + offset, out, mask=mask[:, None, :])
 
 
 @triton.jit
