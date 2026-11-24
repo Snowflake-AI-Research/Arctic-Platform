@@ -27,8 +27,11 @@ import vLLM, Ray and NVML, so the steps are restated rather than imported;
 
 One input is not in the job body: a job that names no ``reasoning_parser`` gets
 the one chat pairs with the checkpoint's architecture (``chat.CHAT_MODELS``), or
-none. ``Keying.candidates`` then holds one cfg12 per possible reasoner, and the
-node labels pick the one that exists.
+none. ``Keying.candidates`` then holds one cfg12 per possible reasoner; the
+architecture (``MODEL_ARCHITECTURES``, else the model's Hugging Face config.json)
+picks one through ``chat_reasoner``, and the node labels show the one that exists.
+The worker also drops chat's reasoner when the tokenizer has no think tokens,
+which is not known offline.
 
 ``env12`` hashes the pod's image digest and GPU driver (``env_hash``): the digest
 is read from the nodes' image lists (``image_digests``), the driver from GPU
@@ -116,6 +119,57 @@ NON_VLLM_ENGINE_KEYS = ("ray_num_gpus", "router_replay_max_cache_bytes", "router
 VLLM_REJECTED = ("fp32_lm_head",)
 # Every reasoner chat.CHAT_MODELS can add to an engine whose job names none, and none.
 CHAT_REASONERS = (None, "qwen3", "glm47", "deepseek_v4", "openai_gptoss", "minimax_m2", "nemotron_v3", "inkling")
+# chat.CHAT_MODELS: the reasoner chat adds, by the architecture vLLM resolves, to an engine whose
+# job names none. Any other architecture gets none.
+CHAT_ARCHITECTURE_REASONERS = {
+    "Qwen3ForCausalLM": "qwen3",
+    "Qwen3MoeForCausalLM": "qwen3",
+    "Qwen3_5ForCausalLM": "qwen3",
+    "Qwen3_5ForConditionalGeneration": "qwen3",
+    "Qwen3_5MoeForCausalLM": "qwen3",
+    "Qwen3_5MoeForConditionalGeneration": "qwen3",
+    "Qwen4ExpForCausalLM": "qwen3",
+    "Qwen4ExpForConditionalGeneration": "qwen3",
+    "GlmMoeDsaForCausalLM": "glm47",
+    "Glm4MoeForCausalLM": "glm47",
+    "Glm5NextForCausalLM": "glm47",
+    "Glm5NextForConditionalGeneration": "glm47",
+    "DeepseekV4ForCausalLM": "deepseek_v4",
+    "DeepseekV4ForConditionalGeneration": "deepseek_v4",
+    "GptOssForCausalLM": "openai_gptoss",
+    "MiniMaxM2ForCausalLM": "minimax_m2",
+    "AfmoeForCausalLM": None,
+    "NemotronHForCausalLM": "nemotron_v3",
+    "InklingForCausalLM": "inkling",
+    "InklingForConditionalGeneration": "inkling",
+    "Inkling2ForConditionalGeneration": "inkling",
+}
+# The architecture vLLM resolved for each baked checkpoint ("Resolved architecture" in publish logs).
+MODEL_ARCHITECTURES = {
+    "deepseek-ai/DeepSeek-V4.1-Flash-1017": "DeepseekV41ForCausalLM",
+    "google/gemma-3-4b-it": "Gemma3ForConditionalGeneration",
+    "google/gemma-4-31B-it": "Gemma4ForConditionalGeneration",
+    "google/medgemma-1.5-4b-it": "Gemma3ForConditionalGeneration",
+    "google/medgemma-4b-it": "Gemma3ForConditionalGeneration",
+    "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": "NemotronHForCausalLM",
+    "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16": "NemotronHForCausalLM",
+    "openai/gpt-oss-120b": "GptOssForCausalLM",
+    "Qwen/Qwen3-0.6B": "Qwen3ForCausalLM",
+    "Qwen/Qwen3-1.7B": "Qwen3ForCausalLM",
+    "Qwen/Qwen3-30B-A3B": "Qwen3MoeForCausalLM",
+    "Qwen/Qwen3-4B-Instruct-2507": "Qwen3ForCausalLM",
+    "Qwen/Qwen3-8B": "Qwen3ForCausalLM",
+    "Qwen/Qwen3.5-2B": "Qwen3_5ForConditionalGeneration",
+    "Qwen/Qwen3.5-4B": "Qwen3_5ForConditionalGeneration",
+    "Qwen/Qwen3.5-9B": "Qwen3_5ForConditionalGeneration",
+    "Qwen/Qwen3.6-35B-A3B": "Qwen3_5MoeForConditionalGeneration",
+    "Qwen/Qwen3.8-27B": "Qwen3_5ForConditionalGeneration",
+    "Qwen/Qwen3.8-Flash-Next": "Qwen4ExpForConditionalGeneration",
+    "thinkingmachines/Inkling-2-Small-MXFP8": "Inkling2ForConditionalGeneration",
+    "zai-org/GLM-5.3": "GlmMoeDsaForCausalLM",
+    "zai-org/GLM-5.3-Flash": "Glm5NextForConditionalGeneration",
+    "zai-org/GLM-5.3-Flash-BF16": "Glm5NextForConditionalGeneration",
+}
 
 # semip_engine._device_binding: at TP >= 2 an image is bound to the pod's /dev/nvidia* and
 # /dev/infiniband/uverbs* nodes, which a whole-node pod always holds in full.
@@ -335,6 +389,11 @@ def topology(sub_job: dict) -> tuple[int, int]:
     if world % GPUS_PER_NODE or n_gpus != world:
         raise Unsupported(f"a world size of {world} on {n_gpus} GPUs is not one engine over whole nodes")
     return n_gpus, world // GPUS_PER_NODE
+
+
+def chat_reasoner(architecture: str) -> str | None:
+    """The reasoner chat adds for ``architecture`` to an engine whose job names none."""
+    return CHAT_ARCHITECTURE_REASONERS.get(architecture)
 
 
 def reasoner_of(sub_job: dict) -> tuple[bool, str | None]:

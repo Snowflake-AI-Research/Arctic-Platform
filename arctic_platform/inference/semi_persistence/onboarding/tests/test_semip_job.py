@@ -221,6 +221,8 @@ def test_http_get_sends_github_token_and_keeps_it_out_of_errors(monkeypatch):
     monkeypatch.setenv("GITHUB_TOKEN", "ghp_SECRET")
     semip_job.http_get("https://api.github.com/x")
     assert seen[-1]["Authorization"] == "Bearer ghp_SECRET"
+    semip_job.http_get("https://huggingface.co/org/m/resolve/main/config.json")
+    assert "Authorization" not in seen[-1]
     with pytest.raises(ValueError) as err:
         semip_job.http_get("https://raw.githubusercontent.com/missing")
     assert "HTTP 404" in str(err.value) and "SECRET" not in str(err.value)

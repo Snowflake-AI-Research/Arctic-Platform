@@ -67,8 +67,12 @@ requested test failed, or a config's tests could not run (they need more than
 ``max_gpus``). SIGINT, SIGTERM and SIGHUP are passed on to publish or onboard,
 which cancel their jobs.
 
-A dry run also computes each job's cfg12 offline (``keys``) and, when kubectl
-reaches the cluster's context, reads the nodes once (``kubectl get nodes``) to
+A dry run also computes each job's cfg12 offline (``keys``). A job that names no
+reasoning_parser gets the one chat pairs with its model's architecture: the one
+vLLM resolved in a publish (``keys.MODEL_ARCHITECTURES``), else the first its
+Hugging Face config.json names (``architectures`` in the plan); when neither is
+known, only the node labels can tell, and cfg12 is ``?`` without them. When kubectl
+reaches the cluster's context, it reads the nodes once (``kubectl get nodes``) to
 report which of those skeletons the model-cache nodes have verified: per env12,
 on how many of them. ``existing`` is ``none`` when publish would dump.
 
@@ -162,6 +166,10 @@ CONFIGS_DIR = "model-catalog/semip_models/"
 OFFICIAL_OWNER = "snowflakedb"
 OFFICIAL_BRANCH = "main"
 COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
+# GITHUB_TOKEN is sent to these hosts only.
+GITHUB_HOSTS = ("api.github.com", "raw.githubusercontent.com")
+HF_CONFIG_URL = "https://huggingface.co/{model}/resolve/main/config.json"
+HF_MODEL_ID = re.compile(r"[A-Za-z0-9][\w.-]*/[A-Za-z0-9][\w.-]*")
 PUBLISHED = ("published", "already")
 # An env12 shown only this far is taken as this image's when no weight hash can confirm it.
 ENV_PREFIX_CHARS = 6
@@ -259,7 +267,7 @@ def http_get(url: str, accept: str | None = None) -> bytes:
     headers = {"User-Agent": "arctic-platform-semip-job"}
     if accept:
         headers["Accept"] = accept
-    if os.environ.get("GITHUB_TOKEN"):
+    if os.environ.get("GITHUB_TOKEN") and urllib.parse.urlsplit(url).netloc in GITHUB_HOSTS:
         headers["Authorization"] = f"Bearer {os.environ['GITHUB_TOKEN']}"
     try:
         with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=60) as resp:
@@ -302,6 +310,28 @@ def visibility(configs: ConfigsRef, sha: str, get: Callable = http_get) -> tuple
     if status in ("identical", "ahead"):
         return True, f"{official[:-1]}; {sha[:12]} is on {OFFICIAL_BRANCH})"
     return False, f"{restricted} (compare {sha[:12]}...{OFFICIAL_BRANCH}: {status})"
+
+
+class ArchitectureUnknown(Exception):
+    """A model's architecture could not be found; the message says why."""
+
+
+def model_architecture(model_name: str, get: Callable = http_get) -> tuple[str, str]:
+    """``(architecture, source)``: the one vLLM resolved for the baked checkpoint when a publish
+    log recorded it (``keys.MODEL_ARCHITECTURES``), else the first one the model's config.json
+    on Hugging Face names."""
+    if model_name in keys.MODEL_ARCHITECTURES:
+        return keys.MODEL_ARCHITECTURES[model_name], "publish logs"
+    if not HF_MODEL_ID.fullmatch(model_name or ""):
+        raise ArchitectureUnknown(f"{model_name!r} is not a Hugging Face model id")
+    url = HF_CONFIG_URL.format(model=model_name)
+    try:
+        names = json.loads(get(url)).get("architectures")
+    except (ValueError, AttributeError) as exc:
+        raise ArchitectureUnknown(str(exc)) from None
+    if not isinstance(names, list) or not names or not isinstance(names[0], str):
+        raise ArchitectureUnknown(f"{url} names no architectures")
+    return names[0], "Hugging Face config.json"
 
 
 def connection_path(args: dict[str, str], cluster: str) -> str | None:
@@ -561,6 +591,7 @@ class SemipJob:
                 logger.warning("show_all=true (admin override): reporting every skeleton the node cache has "
                                "for these jobs, of any image")
             full = official or self.show_all
+            plan["architectures"] = self.architectures(specs)
             cache, note = self.node_cache(plan)
             lookup = self.skeletons if full else self.own_skeletons
             skeletons = lookup(specs, plan, cache, note)
@@ -607,6 +638,39 @@ class SemipJob:
             if s.name not in self._keyings:
                 self._keyings[s.name] = keys.keying(s.sub_job, json.loads(self.lines[s.name]).get("hardware"))
         return {s.name: self._keyings[s.name] for s in specs}
+
+    def architectures(self, specs: list[ModelSpec]) -> dict[str, dict]:
+        """For each model with a job that names no reasoner: its architecture, where it came
+        from and the reasoner chat pairs with it, or why the architecture is not known."""
+        out: dict[str, dict] = {}
+        for s, k in zip(specs, self.keyings(specs).values()):
+            model = s.sub_job.get("model_name")
+            if model in out or not k.candidates:
+                continue
+            try:
+                arch, source = model_architecture(model, self.get)
+            except ArchitectureUnknown as exc:
+                out[model] = {"architecture": None, "note": str(exc)}
+                continue
+            out[model] = {"architecture": arch, "source": source, "reasoning_parser": keys.chat_reasoner(arch)}
+        return out
+
+    def reasoners(self, chosen: dict[str, set], archs: dict[str, dict]) -> dict[str, tuple[str | None, str]]:
+        """Each model's reasoner for its jobs that name none, and what says so: the node labels
+        when they show exactly one, else the model's architecture. When the two disagree the
+        labels' is used, with a warning."""
+        out = {m: (next(iter(rs)), "node labels") for m, rs in chosen.items() if len(rs) == 1}
+        for model, a in archs.items():
+            if a["architecture"] is None:
+                continue
+            via = f"architecture {a['architecture']} ({a['source']})"
+            if model not in out:
+                out[model] = (a["reasoning_parser"], via)
+            elif out[model][0] != a["reasoning_parser"]:
+                self.warnings.append(f"{model}: the node labels show its skeleton with reasoning_parser="
+                                     f"{out[model][0]}, but {via} pairs with {a['reasoning_parser']}; "
+                                     "the labels' is used")
+        return out
 
     def inventory(self, specs: list[ModelSpec], plan: dict, cache: keys.NodeCache | None,
                   note: str | None) -> dict:
@@ -660,7 +724,7 @@ class SemipJob:
                 if len(hit) == 1:
                     chosen.setdefault(s.sub_job.get("model_name"), set()).add(hit[0])
         # One checkpoint, one reasoner: what the labels show for a model holds for all its jobs.
-        reasoner = {m: next(iter(rs)) for m, rs in chosen.items() if len(rs) == 1}
+        reasoner = self.reasoners(chosen, plan["architectures"])
         out: dict[str, dict] = {}
         counts = {"restore": 0, "partial": 0, "dump": 0, "unknown": 0, "other_image": 0}
         for s in specs:
@@ -671,14 +735,16 @@ class SemipJob:
                 entry["cfg12_note"] = k.reason
             lk = lookups.get(s.name, {})
             if not k.cfg12 and k.candidates:
+                model = s.sub_job.get("model_name")
                 entry["cfg12_candidates"] = {r or "none": c for r, c in k.candidates.items()}
-                r = reasoner.get(s.sub_job.get("model_name"), "?")
+                r, via = reasoner.get(model, ("?", None))
                 if r != "?":
-                    entry.update(cfg12=k.candidates[r], reasoning_parser=r, reasoning_parser_from="node labels")
-                    lk = {r: lk[r]}
+                    entry.update(cfg12=k.candidates[r], reasoning_parser=r, reasoning_parser_from=via)
+                    lk = {r: lk[r]} if lk else {}
                 else:
                     entry["cfg12_note"] = ("the job names no reasoning_parser, so cfg12 depends on the one chat "
-                                           "pairs with the checkpoint's architecture; "
+                                           "pairs with the checkpoint's architecture, which is not known ("
+                                           + plan["architectures"][model]["note"] + "); "
                                            + ("no candidate is on the nodes" if cache else "the node labels tell which"))
             if cache is None:
                 entry.update(skeleton="not checked", existing=[], existing_text="not checked")
@@ -728,7 +794,7 @@ class SemipJob:
             hit = [r for r, (n, _, _) in hits[s.name].items() if n]
             if not k.cfg12 and len(hit) == 1:
                 chosen.setdefault(s.sub_job.get("model_name"), set()).add(hit[0])
-        reasoner = {m: next(iter(rs)) for m, rs in chosen.items() if len(rs) == 1}
+        reasoner = self.reasoners(chosen, plan["architectures"])
         out: dict[str, dict] = {}
         counts = {"restore": 0, "partial": 0, "dump": 0, "unknown": 0}
         for s in specs:
@@ -739,14 +805,16 @@ class SemipJob:
                 entry["cfg12_note"] = k.reason
             mine = hits[s.name]
             if not k.cfg12 and k.candidates:
+                model = s.sub_job.get("model_name")
                 entry["cfg12_candidates"] = {r or "none": c for r, c in k.candidates.items()}
-                r = reasoner.get(s.sub_job.get("model_name"), "?")
+                r, via = reasoner.get(model, ("?", None))
                 if r != "?":
-                    entry.update(cfg12=k.candidates[r], reasoning_parser=r, reasoning_parser_from="node labels")
-                    mine = {r: mine[r]}
+                    entry.update(cfg12=k.candidates[r], reasoning_parser=r, reasoning_parser_from=via)
+                    mine = {r: mine[r]} if mine else {}
                 else:
                     entry["cfg12_note"] = ("the job names no reasoning_parser, so cfg12 depends on the one chat "
-                                           "pairs with the checkpoint's architecture; "
+                                           "pairs with the checkpoint's architecture, which is not known ("
+                                           + plan["architectures"][model]["note"] + "); "
                                            + ("no candidate's skeleton exists for this image" if cache
                                               else "the node labels tell which"))
             if cache is None:
@@ -855,11 +923,17 @@ def plan_text(plan: dict) -> str:
                      + (f" {j['test_gpus']} | {j['onboard']} |" if onboard else ""))
     if cache:
         lines += ["", skeleton_summary(cache)]
+        archs = plan.get("architectures") or {}
+        if archs:
+            lines.append("reasoners of jobs that name no reasoning_parser, by the model's architecture:")
+            lines += [f"  {m}: " + (f"{a['architecture']} ({a['source']}) -> {a['reasoning_parser'] or 'none'}"
+                                    if a["architecture"] else f"not known ({a['note']})") for m, a in archs.items()]
         if any(not j["cfg12"] and "cfg12_candidates" in j for j in plan["jobs"]):
             why = ("the node labels did not show which one chat adds for the checkpoint" if not cache.get("restricted")
                    else "no candidate's skeleton was found for this image" if cache["checked"]
                    else "the node labels were not checked")
-            lines.append(f"cfg12 ?: the job names no reasoning_parser and {why} (plan.json lists the candidates)")
+            lines.append(f"cfg12 ?: the job names no reasoning_parser, its model's architecture is not known and {why} "
+                         "(plan.json lists the candidates)")
     if "backend_inventory" in plan:
         lines += ["", *inventory_lines(plan["backend_inventory"])]
     lines += ["", f"publish: {plan['commands']['publish']}"]

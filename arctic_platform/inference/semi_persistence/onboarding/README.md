@@ -277,11 +277,18 @@ env         fc37441c0c27 (digest a544c618585e from node images, driver 580.159.0
 When the H200 driver changes, update `DEFAULT_DRIVER_VERSION`. Until then the
 warning says that no skeleton label confirms the env12.
 
-Two things stay `?`: a job that names no
-`reasoning_parser` gets one chat picks by the checkpoint's architecture, which
-only a matching label reveals, and labels cut by the 63-character limit before
-cfg12 (long model names such as `NVIDIA-Nemotron-3-Nano-30B-A3B-BF16`) cannot
-be read.
+A job that names no `reasoning_parser` gets the one chat pairs with the
+checkpoint's architecture. The dry run takes the architecture vLLM resolved in
+a publish (`keys.MODEL_ARCHITECTURES`), else the first one the model's
+`config.json` on Hugging Face names, and lists each model's under `reasoners of
+jobs that name no reasoning_parser`. Node labels that show one of the job's
+candidates win (a disagreement is a warning). The job's cfg12 is `?` only when
+neither source knows the model and no label shows which. When a new model is
+published, add its `Resolved architecture` log line to `MODEL_ARCHITECTURES`.
+
+Labels cut by the 63-character limit before cfg12 (long model names such as
+`NVIDIA-Nemotron-3-Nano-30B-A3B-BF16`) cannot be read, so such a job's
+`existing` is `?` even when its cfg12 is known.
 
 That full lookup is only for the official catalog: `snowflakedb/cortex-training`
 at `main`, or at a commit on main (GitHub's compare API with main says

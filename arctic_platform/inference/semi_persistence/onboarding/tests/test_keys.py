@@ -131,6 +131,29 @@ def test_chat_reasoners_are_chat_models_reasoners():
     assert named | {None} == set(keys.CHAT_REASONERS)
 
 
+def test_chat_architecture_reasoners_are_chat_models():
+    tree = ast.parse((SERVER / "chat.py").read_text())
+
+    def reasoner(call):
+        assert isinstance(call, ast.Call) and call.func.id == "ChatModel"
+        return ast.literal_eval(call.args[0])
+
+    shared = {t.id: reasoner(n.value) for n in tree.body if isinstance(n, ast.Assign)
+              and isinstance(n.value, ast.Call) and getattr(n.value.func, "id", None) == "ChatModel" for t in n.targets}
+    table = next(n.value for n in tree.body if isinstance(n, ast.Assign) and n.targets[0].id == "CHAT_MODELS").args[0]
+    assert {ast.literal_eval(k): shared[v.id] if isinstance(v, ast.Name) else reasoner(v)
+            for k, v in zip(table.keys, table.values)} == keys.CHAT_ARCHITECTURE_REASONERS
+    assert keys.chat_reasoner("Gemma4ForConditionalGeneration") is None
+
+
+@pytest.mark.parametrize("case", [c for c in PUBLISHED if not keys.reasoner_of(_sub(c))[0]],
+                         ids=lambda c: c["label"])
+def test_the_architecture_of_a_published_model_gives_the_reasoner_it_published_with(case):
+    sub = _sub(case)
+    assert keys.chat_reasoner(keys.MODEL_ARCHITECTURES[sub["model_name"]]) == case["reasoning_parser"]
+    assert keys.keying(sub, case["job"]["hardware"]).candidates[case["reasoning_parser"]] == case["published"][:12]
+
+
 def test_worker_pops_and_defaults_are_the_workers():
     worker = (SERVER / "worker.py").read_text()
     assert f'"worker_extension_cls",\n            "{keys.WORKER_EXTENSION_CLS}"' in worker
@@ -327,13 +350,18 @@ FORK = OFFICIAL.replace("/snowflakedb/", "/o/")
 COMPARE = f"https://api.github.com/repos/snowflakedb/cortex-training/compare/{SHA}...main"
 
 
-def _dry_run(tmp_path, monkeypatch, nodes, configs=OFFICIAL, **extra):
-    """A dry run of ``JOBS``; the official catalog's ``SHA`` is on main."""
+def _dry_run(tmp_path, monkeypatch, nodes, configs=OFFICIAL, hf=None, **extra):
+    """A dry run of ``JOBS``; the official catalog's ``SHA`` is on main, and Hugging Face serves
+    the config.json of the models in ``hf``."""
     owner = configs.split("/")[3]
 
     def get(url, accept=None):
         if url == COMPARE:
             return json.dumps({"status": "ahead"}).encode()
+        if url.startswith("https://huggingface.co/"):
+            if url not in (hf or {}):
+                raise ValueError(f"GET {url}: HTTP 404 Not Found")
+            return json.dumps(hf[url]).encode()
         assert url == f"https://raw.githubusercontent.com/{owner}/cortex-training/{SHA}/model-catalog/semip_models/jobs.jsonl"
         return JOBS.encode()
 
@@ -443,7 +471,7 @@ def test_a_driver_from_node_labels_is_used_instead_of_the_default(tmp_path, monk
         {driver: 4}, f"node label {GFD}", False)
     assert f"env         {env} (digest a544c618585e from node images, driver {driver} from node label {GFD}; " in text
     assert plan["warnings"] == [] and "assumed" not in text
-    assert f"| a65858a869ba | {want} |" in text if driver == "580.159.03" else f"| ? | {want} |" in text
+    assert f"| a65858a869ba | {want} |" in text
 
 
 def test_a_failing_kubectl_skips_the_lookup_with_a_note(tmp_path, monkeypatch):
@@ -458,7 +486,7 @@ def test_a_failing_kubectl_skips_the_lookup_with_a_note(tmp_path, monkeypatch):
     assert plan["node_cache"]["checked"] is False and "skeletons: not checked (kubectl --context=" in text
     assert "env         not derived (kubectl --context=sfc-or-dev-meta-k8s-2 get nodes failed: " in text
     assert plan["env"]["derived"] is False and plan["warnings"] == []
-    assert plan["jobs"][1]["cfg12"] == "ed76d47780e3" and plan["jobs"][0]["cfg12"] is None
+    assert plan["jobs"][1]["cfg12"] == "ed76d47780e3" and plan["jobs"][0]["cfg12"] == "a65858a869ba"
 
 
 def _table(text):
@@ -489,9 +517,9 @@ def test_a_restricted_dry_run_reports_only_this_images_own_skeletons(tmp_path, m
 def test_a_restricted_dry_run_says_none_for_another_env_and_never_names_the_others(tmp_path, monkeypatch):
     plan, text = _dry_run(tmp_path, monkeypatch, lambda ctx: _cluster(images=((TAG, "0" * 64),)), configs=FORK)
     assert plan["env"]["env12"] == [keys.env_hash("0" * 64, "580.159.03")]
-    assert "| ? | none (will dump) |" in text and "| ed76d47780e3 | none (will dump) |" in text
+    assert "| a65858a869ba | none (will dump) |" in text and "| ed76d47780e3 | none (will dump) |" in text
     assert [j["skeleton"] for j in plan["jobs"]] == ["dump", "dump"] and plan["jobs"][0]["existing"] == []
-    assert "cfg12 ?: the job names no reasoning_parser and no candidate's skeleton was found for this image" in text
+    assert "cfg12 ?" not in text
     assert "skeletons: 0 will restore (all nodes), 0 exist but not on all nodes, 2 will dump\n" in text
     for other in (ENV, ENV[:10], OLD, OLD[:10], "another image"):
         assert other not in json.dumps(plan) and other not in text, other
@@ -502,13 +530,91 @@ def test_a_restricted_dry_run_without_kubectl_says_why_it_is_not_checked(tmp_pat
         raise semip_job.NodesUnavailable("kubectl is not on PATH")
 
     plan, text = _dry_run(tmp_path, monkeypatch, nodes, configs=FORK)
-    assert "| a65858a869ba |" not in text and text.count("| not checked: kubectl is not on PATH |") == 2
+    assert text.count("| not checked: kubectl is not on PATH |") == 2
+    assert "| a65858a869ba | not checked: kubectl is not on PATH |" in text
     assert "skeletons: not checked (kubectl is not on PATH)" in text
     assert "node cache  not checked: kubectl is not on PATH" in text
     assert "env         not derived (kubectl is not on PATH)" in text
     assert plan["node_cache"]["checked"] is False and plan["node_cache"]["summary"] is None
     assert all(j["existing"] == [] and j["skeleton"] == "not checked" for j in plan["jobs"])
-    assert "cfg12 ?: the job names no reasoning_parser and the node labels were not checked" in text
+    assert plan["jobs"][0]["reasoning_parser_from"] == "architecture Qwen3ForCausalLM (publish logs)"
+
+
+HF_QWEN = "https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/config.json"
+# The image pulled, nothing of Qwen3-0.6B on the nodes: as on a cluster nothing was published to.
+UNPUBLISHED = [_pulled(_node(_label(DS, "4008d4360385", "weight")), (TAG, DIGEST))]
+
+
+@pytest.mark.parametrize("configs", [OFFICIAL, FORK])
+def test_a_job_naming_no_reasoner_gets_the_one_of_its_models_architecture(tmp_path, monkeypatch, configs):
+    plan, text = _dry_run(tmp_path, monkeypatch, lambda ctx: UNPUBLISHED, configs=configs)
+    qwen = plan["jobs"][0]
+    assert (qwen["cfg12"], qwen["reasoning_parser"], qwen["reasoning_parser_from"], qwen["skeleton"]) == (
+        "a65858a869ba", "qwen3", "architecture Qwen3ForCausalLM (publish logs)", "dump")
+    assert plan["architectures"] == {"Qwen/Qwen3-0.6B": {"architecture": "Qwen3ForCausalLM", "source": "publish logs",
+                                                         "reasoning_parser": "qwen3"}}
+    assert "| a65858a869ba | none" in text and "cfg12 ?" not in text
+    assert ("reasoners of jobs that name no reasoning_parser, by the model's architecture:\n"
+            "  Qwen/Qwen3-0.6B: Qwen3ForCausalLM (publish logs) -> qwen3\n") in text
+
+
+def test_hugging_face_names_the_architecture_no_publish_recorded(tmp_path, monkeypatch):
+    monkeypatch.delitem(keys.MODEL_ARCHITECTURES, "Qwen/Qwen3-0.6B")
+    plan, text = _dry_run(tmp_path, monkeypatch, lambda ctx: UNPUBLISHED, configs=FORK,
+                          hf={HF_QWEN: {"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3"}})
+    assert plan["jobs"][0]["cfg12"] == "a65858a869ba"
+    assert plan["jobs"][0]["reasoning_parser_from"] == "architecture Qwen3ForCausalLM (Hugging Face config.json)"
+    assert "  Qwen/Qwen3-0.6B: Qwen3ForCausalLM (Hugging Face config.json) -> qwen3\n" in text
+
+
+@pytest.mark.parametrize("nodes,why", [
+    (UNPUBLISHED, "no candidate's skeleton was found for this image"),
+    (None, "the node labels were not checked"),
+])
+def test_an_unknown_architecture_leaves_cfg12_to_the_node_labels(tmp_path, monkeypatch, nodes, why):
+    def read(context):
+        if nodes is None:
+            raise semip_job.NodesUnavailable("kubectl is not on PATH")
+        return nodes
+
+    monkeypatch.delitem(keys.MODEL_ARCHITECTURES, "Qwen/Qwen3-0.6B")
+    plan, text = _dry_run(tmp_path, monkeypatch, read, configs=FORK)
+    qwen = plan["jobs"][0]
+    not_found = f"GET {HF_QWEN}: HTTP 404 Not Found"
+    assert qwen["cfg12"] is None and qwen["reasoning_parser_from"] is None and len(qwen["cfg12_candidates"]) == 8
+    assert f"which is not known ({not_found})" in qwen["cfg12_note"]
+    assert plan["architectures"] == {"Qwen/Qwen3-0.6B": {"architecture": None, "note": not_found}}
+    assert f"  Qwen/Qwen3-0.6B: not known ({not_found})\n" in text and "| ? |" in text
+    assert f"cfg12 ?: the job names no reasoning_parser, its model's architecture is not known and {why}" in text
+
+
+def test_node_labels_win_over_a_disagreeing_architecture(tmp_path, monkeypatch):
+    monkeypatch.setitem(keys.MODEL_ARCHITECTURES, "Qwen/Qwen3-0.6B", "Gemma4ForConditionalGeneration")
+    plan, text = _dry_run(tmp_path, monkeypatch, lambda ctx: _cluster(), configs=FORK)
+    qwen = plan["jobs"][0]
+    assert (qwen["cfg12"], qwen["reasoning_parser"], qwen["reasoning_parser_from"]) == ("a65858a869ba", "qwen3",
+                                                                                         "node labels")
+    assert ("Qwen/Qwen3-0.6B: the node labels show its skeleton with reasoning_parser=qwen3, but architecture "
+            "Gemma4ForConditionalGeneration (publish logs) pairs with None; the labels' is used") in plan["warnings"]
+
+
+@pytest.mark.parametrize("model,body,why", [
+    ("/mnt/checkpoints/m", None, "is not a Hugging Face model id"),
+    ("org/m", ValueError("GET u: HTTP 401 Unauthorized"), "HTTP 401 Unauthorized"),
+    ("org/m", b"<html>", "Expecting value"),
+    ("org/m", b"[]", "'list' object has no attribute 'get'"),
+    ("org/m", b'{"model_type": "m"}', "names no architectures"),
+    ("org/m", b'{"architectures": []}', "names no architectures"),
+])
+def test_an_architecture_that_cannot_be_read_says_why(model, body, why):
+    def get(url, accept=None):
+        assert url == "https://huggingface.co/org/m/resolve/main/config.json"
+        if isinstance(body, Exception):
+            raise body
+        return body
+
+    with pytest.raises(semip_job.ArchitectureUnknown, match=re.escape(why)):
+        semip_job.model_architecture(model, get)
 
 
 def test_a_restricted_dry_run_cannot_confirm_a_label_cut_too_short(tmp_path, monkeypatch):
