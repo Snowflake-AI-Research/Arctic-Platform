@@ -158,6 +158,63 @@ def test_router_replay_cache_size_is_removed_before_vllm_args(monkeypatch):
     assert kwargs == {"model": "Qwen/Qwen3-0.6B"}
 
 
+class _NoKernelLaunch:
+    def __getitem__(self, grid):
+        return lambda *args, **kwargs: None
+
+
+def test_probabilistic_draft_cache_takes_fp32_head_logits(monkeypatch):
+    """The draft-logits cache vLLM sizes by ``head_dtype`` must accept the fp32 head's logits.
+
+    Real toggle, patches, ``ModelConfig.head_dtype``, ``draft_logits_spec`` and ``gumbel_sample``
+    checks; only the Triton launch is stubbed, so this runs on CPU.
+    """
+    from vllm.config import DeviceConfig, ModelConfig, VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.logits_processor import LogitsProcessor
+    from vllm.model_executor.layers.vocab_parallel_embedding import UnquantizedEmbeddingMethod
+    from vllm.v1.worker.gpu.sample import gumbel
+    from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+
+    from arctic_platform.inference.vllm.fp32_lm_head import (
+        ensure_fp32_lm_head_vllm_patches,
+        set_fp32_lm_head_enabled,
+    )
+
+    vocab_size, hidden_size, num_reqs, num_steps = 64, 16, 2, 3
+    model_config = object.__new__(ModelConfig)  # a bf16 generate model, without loading one
+    for name, value in dict(hf_config=types.SimpleNamespace(), dtype=torch.bfloat16, runner_type="generate").items():
+        object.__setattr__(model_config, name, value)
+    lm_head = types.SimpleNamespace(
+        quant_method=UnquantizedEmbeddingMethod(),
+        weight=torch.randn(vocab_size, hidden_size, dtype=torch.bfloat16),
+    )
+    monkeypatch.setattr(gumbel, "_gumbel_sample_kernel", _NoKernelLaunch())
+
+    ensure_fp32_lm_head_vllm_patches(enabled=True)
+    try:
+        with set_current_vllm_config(VllmConfig(device_config=DeviceConfig(device="cpu"))):
+            logits = LogitsProcessor(vocab_size)._apply_head(
+                lm_head, torch.randn(num_reqs, hidden_size, dtype=torch.bfloat16), None
+            )
+        dtype, fill = DraftModelSpeculator.draft_logits_spec(None, types.SimpleNamespace(model_config=model_config))
+        draft_logits = torch.full((num_reqs, num_steps, vocab_size), fill, dtype=dtype)
+        gumbel.gumbel_sample(
+            logits,
+            torch.arange(num_reqs),
+            torch.ones(num_reqs),
+            torch.zeros(num_reqs, dtype=torch.int64),
+            torch.zeros(num_reqs, dtype=torch.int64),
+            apply_temperature=True,
+            is_drafting=True,
+            logits_cache=draft_logits,
+            logits_cache_col=torch.tensor(0),
+        )
+    finally:
+        set_fp32_lm_head_enabled(False)
+
+    assert logits.dtype == draft_logits.dtype == torch.float32
+
+
 def _skip_if_no_cuda():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
