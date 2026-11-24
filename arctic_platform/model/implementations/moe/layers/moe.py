@@ -690,6 +690,13 @@ class TokenChoiceTopKRouter(nn.Module):
         """Route ``ROUTER_REPLAY_FRESH`` tokens in ``routed_experts`` with this router's own gate."""
         self.fresh_replay_routing = True
 
+    def gate_logits(self, x: torch.Tensor) -> torch.Tensor:
+        if self.fp32_logits:
+            # Autocast would run the GEMM in bf16 despite the fp32 operands.
+            with torch.autocast(device_type=x.device.type, enabled=False):
+                return F.linear(x.float(), self.gate.weight.float())
+        return self.gate(x)
+
     def forward(
         self, x: torch.Tensor, expert_bias: torch.Tensor | None = None, routed_experts: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -697,12 +704,7 @@ class TokenChoiceTopKRouter(nn.Module):
         assert (
             routed_experts is None or routed_experts.shape[-1] == self.top_k
         ), f"routed_experts shape: {routed_experts.shape}, top_k: {self.top_k}"
-        if self.fp32_logits:
-            # Autocast would run the GEMM in bf16 despite the fp32 operands.
-            with torch.autocast(device_type=x.device.type, enabled=False):
-                scores = F.linear(x.float(), self.gate.weight.float())
-        else:
-            scores = self.gate(x)
+        scores = self.gate_logits(x)
 
         # By default, sigmoid or softmax is performed in float32 to avoid loss explosion
         if self.score_func == "sigmoid":
