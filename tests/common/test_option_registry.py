@@ -71,6 +71,7 @@ EXPECTED_KEYS = {
     "moe.ultraep_spares": ("trainer", "speed"),
     "moe.ultraep_ipc_symm": ("trainer", "robustness"),
     "moe.expert_replicas": ("trainer", "speed"),
+    "moe.expert_placement": ("trainer", "speed"),
     "moe.w8a8_experts": ("trainer", "speed"),
 }
 EXPECTED_PROFILES = {
@@ -539,7 +540,7 @@ class TestCommandLine(TestCasePlus):
     def test_check_passes_on_real_data(self):
         out = self._run("check")
         assert len(out) == 1
-        assert out[0].startswith("check passed: 29 options x 10 profiles = 290 cells, ")
+        assert out[0].startswith("check passed: 30 options x 10 profiles = 300 cells, ")
 
     def test_matrix_write_reproduces_committed_file(self):
         tmp_dir = Path(self.get_auto_remove_tmp_dir())

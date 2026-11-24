@@ -24,12 +24,14 @@ one module; a field left unset (None) turns its setting off, so a job that sets 
 from __future__ import annotations
 
 import importlib
+import json
 import os
 from typing import Any
 
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
+from pydantic import field_validator
 from pydantic import model_validator
 from typing_extensions import Self
 
@@ -39,6 +41,7 @@ _SETTERS = {
     # One spare count for UltraEP's three paths (moe/ultraep_replicas.py picks one from the experts).
     "ultraep_spares": ("moe.ultraep_replicas", "configure_from_options"),
     "expert_replicas": ("moe.expert_replicas", "configure_spares"),
+    "expert_placement": ("moe.expert_placement", "configure_from_options"),
 }
 _ULTRA_EP_IPC_SYMM_ENV = "ULTRA_EP_IPC_SYMM"
 
@@ -85,6 +88,37 @@ class MoeRuntimeOptions(BaseModel):
             "turns them off. Unset: off."
         ),
     )
+    expert_placement: str | dict[str, Any] | None = Field(
+        None,
+        description=(
+            "A static placement of each MoE layer's experts over the EP ranks, fitted offline from router histograms "
+            "(moe/expert_placement.py): a JSON file path on the workers, the JSON text, or the object itself, "
+            '{"ep_size": ep, "gpus_per_node": g, "layers": {"<layer>": [expert per slot, ...]}}. Unset: '
+            "contiguous."
+        ),
+    )
+
+    @field_validator("expert_placement")
+    @classmethod
+    def _check_placement(cls, value: str | dict[str, Any] | None) -> str | dict[str, Any] | None:
+        """Refuse what can be refused without the workers' files: an empty path, malformed inline JSON, or an
+        object without its ``layers`` map. The permutations are checked against the model when it loads."""
+        if value is None:
+            return None
+        if isinstance(value, str):
+            if not value.strip():
+                raise ValueError("expert_placement must be a file path, the placement JSON, or its object")
+            if not value.lstrip().startswith("{"):
+                return value
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError as error:
+                raise ValueError(f"expert_placement is not valid JSON: {error}") from None
+        else:
+            parsed = value
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("layers"), dict):
+            raise ValueError("expert_placement must hold {'layers': {layer: [expert per slot, ...]}}")
+        return value
 
     @model_validator(mode="after")
     def _one_spare_planner(self) -> Self:
