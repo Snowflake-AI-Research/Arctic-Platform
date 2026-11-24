@@ -150,6 +150,16 @@ _SWEEP_TIMEOUT_S = 120.0
 _LIVE_SANDBOXES: dict[str, tuple[str | None, str | None]] = {}
 _LIVE_SANDBOXES_GUARD = threading.Lock()
 _sweep_at_exit = False
+# A sandbox can still be listed as live after its terminate returned, and under the per-owner cap a few such
+# sandboxes block later creates. So the sandboxes this process stopped are checked against the list, at most every
+# _REAP_INTERVAL_S, once they have had _REAP_GRACE_S to end, and terminated again while they are still live, for up
+# to _REAP_WINDOW_S.
+_STOPPED_SANDBOXES: dict[str, tuple[float, str | None, str | None]] = {}
+_REAP_INTERVAL_S = 300.0
+_REAP_GRACE_S = 60.0
+_REAP_WINDOW_S = 3600.0
+_LIVE_STATUSES = frozenset({"pending", "ready"})
+_last_reap = float("-inf")
 # Keyed by event loop: an asyncio.Semaphore binds to the loop that first waits
 # on it, so trials on another loop get their own cap instead of a RuntimeError.
 _LIVE_SLOTS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[int, asyncio.Semaphore]] = (
@@ -240,7 +250,47 @@ async def _terminate(sandbox: AsyncSandbox) -> None:
         logger.error("Error terminating sandbox %s: %s", sandbox.id, e)
         return
     with _LIVE_SANDBOXES_GUARD:
-        _LIVE_SANDBOXES.pop(sandbox.name, None)
+        session = _LIVE_SANDBOXES.pop(sandbox.name, None)
+        if session is not None:
+            _STOPPED_SANDBOXES[sandbox.name] = (time.monotonic(), *session)
+    await _reap_stopped_sandboxes()
+
+
+async def _reap_stopped_sandboxes() -> None:
+    """Terminate again the sandboxes this process stopped that the service still lists as live."""
+    global _last_reap
+    now = time.monotonic()
+    by_session: dict[tuple[str | None, str | None], set[str]] = {}
+    with _LIVE_SANDBOXES_GUARD:
+        for name, (stopped_at, *_) in list(_STOPPED_SANDBOXES.items()):
+            if now - stopped_at > _REAP_WINDOW_S:
+                del _STOPPED_SANDBOXES[name]
+        if now - _last_reap < _REAP_INTERVAL_S:
+            return
+        for name, (stopped_at, connection, role) in _STOPPED_SANDBOXES.items():
+            if now - stopped_at >= _REAP_GRACE_S:
+                by_session.setdefault((connection, role), set()).add(name)
+        if not by_session:
+            return
+        _last_reap = now
+    for (connection, role), names in by_session.items():
+        try:
+            listed = await AsyncSandbox.list(connection=await get_config(connection, role))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Could not list sandboxes to check that stopped ones ended: %s", e)
+            continue
+        still_live = [s for s in listed if s.name in names and str(s.status) in _LIVE_STATUSES]
+        with _LIVE_SANDBOXES_GUARD:
+            for name in names - {s.name for s in still_live}:
+                _STOPPED_SANDBOXES.pop(name, None)
+        for sandbox in still_live:
+            logger.warning(
+                "Sandbox %s is still %s after it was terminated; terminating it again", sandbox.name, sandbox.status
+            )
+            try:
+                await sandbox.terminate()
+            except Exception as e:  # noqa: BLE001
+                logger.error("Error terminating sandbox %s: %s", sandbox.id, e)
 
 
 def _track(name: str, connection: str | None, role: str | None) -> None:

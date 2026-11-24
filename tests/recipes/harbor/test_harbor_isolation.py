@@ -747,6 +747,72 @@ def test_a_cancelled_rollout_still_terminates_its_sandbox(tmp_path, monkeypatch)
     assert sf_env._LIVE_SANDBOXES == {}
 
 
+def test_a_sandbox_still_live_after_it_was_terminated_is_terminated_again(monkeypatch):
+    from arctic_platform.integrations.harbor.snowflake_sandbox import environment as sf_env
+
+    terminated: list[str] = []
+    listed: list[SimpleNamespace] = []
+
+    def sandbox(name: str, status: str) -> SimpleNamespace:
+        async def terminate() -> None:
+            terminated.append(name)
+
+        return SimpleNamespace(id=f"id-{name}", name=name, status=status, terminate=terminate)
+
+    async def list_sandboxes(connection: object) -> list[SimpleNamespace]:
+        return list(listed)
+
+    async def get_config(connection: object, role: object) -> str:
+        return "config"
+
+    monkeypatch.setattr(sf_env, "AsyncSandbox", SimpleNamespace(list=list_sandboxes))
+    monkeypatch.setattr(sf_env, "get_config", get_config)
+    monkeypatch.setattr(sf_env, "_REAP_GRACE_S", 0.0)
+    monkeypatch.setattr(sf_env, "_REAP_INTERVAL_S", 0.0)
+    monkeypatch.setattr(sf_env, "_LIVE_SANDBOXES", {"harbor-1": (None, None), "harbor-2": (None, None)})
+
+    # The terminate returns but the sandbox is still listed as running.
+    listed[:] = [sandbox("harbor-1", "ready"), sandbox("harbor-2", "ready"), sandbox("other", "ready")]
+    asyncio.run(sf_env._terminate(sandbox("harbor-1", "ready")))
+    assert terminated == ["harbor-1", "harbor-1"]
+    assert list(sf_env._STOPPED_SANDBOXES) == ["harbor-1"]
+
+    listed[:] = [sandbox("harbor-1", "dead"), sandbox("harbor-2", "ready")]
+    asyncio.run(sf_env._reap_stopped_sandboxes())
+    assert terminated == ["harbor-1", "harbor-1"]
+    assert sf_env._STOPPED_SANDBOXES == {}
+    assert list(sf_env._LIVE_SANDBOXES) == ["harbor-2"]
+
+
+def test_stopped_sandboxes_are_checked_at_most_once_per_interval(monkeypatch):
+    from arctic_platform.integrations.harbor.snowflake_sandbox import environment as sf_env
+
+    lists: list[object] = []
+
+    async def list_sandboxes(connection: object) -> list[SimpleNamespace]:
+        lists.append(connection)
+        return []
+
+    async def get_config(connection: object, role: object) -> str:
+        return "config"
+
+    async def terminate() -> None:
+        return None
+
+    monkeypatch.setattr(sf_env, "AsyncSandbox", SimpleNamespace(list=list_sandboxes))
+    monkeypatch.setattr(sf_env, "get_config", get_config)
+    monkeypatch.setattr(sf_env, "_REAP_GRACE_S", 0.0)
+    monkeypatch.setattr(sf_env, "_last_reap", float("-inf"))
+    monkeypatch.setattr(sf_env, "_LIVE_SANDBOXES", {f"harbor-{i}": (None, None) for i in range(3)})
+
+    async def stop_all() -> None:
+        for i in range(3):
+            await sf_env._terminate(SimpleNamespace(id=f"id-{i}", name=f"harbor-{i}", terminate=terminate))
+
+    asyncio.run(stop_all())
+    assert len(lists) == 1
+
+
 def test_sandboxes_left_running_are_terminated_when_shared_resources_close(monkeypatch):
     pytest.importorskip("snowflake.sandbox")
     from snowflake.sandbox.exceptions import SandboxNotFoundError
