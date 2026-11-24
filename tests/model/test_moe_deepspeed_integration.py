@@ -324,8 +324,9 @@ def test_ep_weight_gather_to_cpu_rejects_budget_smaller_than_one_group_element(m
     assert state["calls"] == []
 
 
+@pytest.mark.parametrize("include_skipped", [True, False])
 @pytest.mark.parametrize("rank,group_ranks", [(0, [0, 1]), (2, [2, 3])])
-def test_hf_export_delegates_only_master_replica_to_cpu_gather(monkeypatch, rank, group_ranks):
+def test_hf_export_stages_only_checkpoint_experts_through_host_memory(monkeypatch, rank, group_ranks, include_skipped):
     converted = {}
 
     class ExportableModel(nn.Module):
@@ -354,6 +355,9 @@ def test_hf_export_delegates_only_master_replica_to_cpu_gather(monkeypatch, rank
     monkeypatch.setitem(sys.modules, "deepspeed.utils.groups", groups_module)
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: rank)
     monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda ep_group: group_ranks)
+    # A one-rank EP group, so the device gather runs for real.
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 1)
+    monkeypatch.setattr(torch.distributed, "gather", lambda tensor, outputs, dst, group: outputs[0].copy_(tensor))
     calls = []
 
     def gather(tensor, ep_group, *, is_master, max_gather_bytes=64 * 1024 * 1024):
@@ -363,7 +367,7 @@ def test_hf_export_delegates_only_master_replica_to_cpu_gather(monkeypatch, rank
     monkeypatch.setattr(common, "_gather_ep_weight_to_cpu", gather)
     model = ExportableModel()
 
-    exported = dict(common.build_iter_full_hf_weights(model)())
+    exported = dict(common.build_iter_full_hf_weights(model)(include_skipped=include_skipped))
 
     if rank != 0:
         assert exported == {}
@@ -372,6 +376,10 @@ def test_hf_export_delegates_only_master_replica_to_cpu_gather(monkeypatch, rank
         return
 
     assert list(exported) == ["dense", "expert"]
+    assert torch.equal(exported["expert"], model.expert.detach())
+    if not include_skipped:  # a weight sync never stages experts through host memory
+        assert calls == []
+        return
     assert converted == {"layer_index": -1, "expert_device": "cpu"}
     assert len(calls) == 1
     tensor, ep_group, is_master, max_gather_bytes = calls[0]
@@ -381,7 +389,7 @@ def test_hf_export_delegates_only_master_replica_to_cpu_gather(monkeypatch, rank
     assert max_gather_bytes == 64 * 1024 * 1024
 
 
-def _gloo_ep_weight_gather_worker(rank, world_size, init_method):
+def _gloo_ep_weight_gather_worker(rank, world_size, init_method, on_master=False):
     import torch.distributed as dist
 
     os.environ["GLOO_SOCKET_IFNAME"] = "lo"
@@ -394,12 +402,10 @@ def _gloo_ep_weight_gather_worker(rank, world_size, init_method):
     )
     try:
         local = (torch.arange(5, dtype=torch.int64) + rank * 100).reshape(1, 5)
-        result = common._gather_ep_weight_to_cpu(
-            local,
-            dist.group.WORLD,
-            is_master=rank == 0,
-            max_gather_bytes=32,
-        )
+        if on_master:
+            result = common._gather_ep_weight_on_master(local, dist.group.WORLD, is_master=rank == 0)
+        else:
+            result = common._gather_ep_weight_to_cpu(local, dist.group.WORLD, is_master=rank == 0, max_gather_bytes=32)
         if rank == 0:
             expected = torch.cat(
                 [torch.arange(5, dtype=torch.int64), torch.arange(5, dtype=torch.int64) + 100]
@@ -413,10 +419,11 @@ def _gloo_ep_weight_gather_worker(rank, world_size, init_method):
         dist.destroy_process_group()
 
 
-def test_ep_weight_gather_to_cpu_two_rank_gloo(tmp_path):
+@pytest.mark.parametrize("on_master", [False, True])
+def test_ep_weight_gather_two_rank_gloo(tmp_path, on_master):
     mp.spawn(
         _gloo_ep_weight_gather_worker,
-        args=(2, (tmp_path / "ep-gather").as_uri()),
+        args=(2, (tmp_path / "ep-gather").as_uri(), on_master),
         nprocs=2,
         join=True,
     )
