@@ -271,14 +271,20 @@ def _unfused_causal_conv1d_module(global_cu_seqlens):
 
 
 def _head_parallel_kda_worker(rank, world_size, rendezvous, fallback_convolution):
+    import runpy
     import sys
     from datetime import timedelta
+    from pathlib import Path
     from unittest.mock import patch
 
     import torch.distributed as dist
 
     from arctic_platform.model.implementations.glm53 import context_parallel as cp
-    from tests.model.conftest import build_tiny_glm_sparse_model
+
+    # Spawned workers load the checkout's helper without relying on a tests.model package.
+    build_tiny_glm_sparse_model = runpy.run_path(str(Path(__file__).with_name("conftest.py")))[
+        "build_tiny_glm_sparse_model"
+    ]
 
     torch.cuda.set_device(rank)
     dist.init_process_group(
@@ -346,6 +352,18 @@ def _head_parallel_kda_worker(rank, world_size, rendezvous, fallback_convolution
     assert "conv1d.bias" in gradients
     for name, gradient in gradients.items():
         torch.testing.assert_close(gradient, local_gradients[name], rtol=3e-2, atol=3e-2, msg=name)
+
+
+def test_glm53_spawned_worker_loads_checkout_fixture_without_tests_package(monkeypatch):
+    import sys
+
+    def stop_before_gpu(rank):
+        raise RuntimeError("checkout fixture loaded before CUDA setup")
+
+    monkeypatch.setitem(sys.modules, "tests.model.conftest", None)
+    monkeypatch.setattr(torch.cuda, "set_device", stop_before_gpu)
+    with pytest.raises(RuntimeError, match="checkout fixture loaded before CUDA setup"):
+        _head_parallel_kda_worker(0, 1, "unused", False)
 
 
 def _spawn_head_parallel_kda(world_size, fallback_convolution):
