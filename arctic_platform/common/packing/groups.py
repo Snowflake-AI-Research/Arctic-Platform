@@ -186,6 +186,31 @@ def split_groups_to_count(
     return sorted(sorted(group) for group in result)
 
 
+def costliest_first(
+    groups: Sequence[Sequence[int]],
+    valid_lengths: Sequence[int],
+    max_tokens_per_mb: int,
+) -> List[List[int]]:
+    """``groups`` in execution order: estimated call cost, highest first, with each group's rows ascending.
+
+    Every rank of a request runs call ``k`` together and meets its peers at a collective spanning data-parallel
+    shards, so call ``k`` takes as long as the slowest shard's ``k``-th call. Running each shard's costliest call
+    first lines call ``k`` up across shards; ascending row order instead pairs one shard's longest call with
+    another's shortest whenever their rows arrive in a different order. A group costs its tokens for the
+    per-token work plus ``sum(len**2) / max_tokens_per_mb`` for attention. Ties keep the order of the groups'
+    first rows, so the result is still a pure function of the lengths and every rank derives the same plan.
+    """
+    if max_tokens_per_mb <= 0:
+        raise ValueError(f"max_tokens_per_mb must be positive, got {max_tokens_per_mb}")
+
+    def scaled_cost(group: Sequence[int]) -> int:
+        lengths = [int(valid_lengths[row]) for row in group]
+        return sum(lengths) * max_tokens_per_mb + sum(length * length for length in lengths)
+
+    ordered = [sorted(int(row) for row in group) for group in groups]
+    return sorted(ordered, key=lambda group: (-scaled_cost(group), group[0]))
+
+
 def token_budget_microbatch_groups(
     batch: Dict[str, Any],
     max_tokens_per_mb: int,
@@ -195,7 +220,9 @@ def token_budget_microbatch_groups(
     """Token-budget row groups for one shard, in the order they will be executed.
 
     ``min_groups`` raises the group count to a request-wide schedule, splitting groups rather than adding calls
-    that do no work; a shard with too few rows to reach it comes back short.
+    that do no work; a shard with too few rows to reach it comes back short. The last step is
+    ``costliest_first``, so a test that compares this plan to dispatch is comparing execution order, not row
+    order.
     """
     valid_lengths = shard_valid_lengths(batch)
     n_rows = len(valid_lengths)
@@ -205,6 +232,7 @@ def token_budget_microbatch_groups(
     groups = token_budget_groups(valid_lengths, max_tokens_per_mb)
     if min_groups > len(groups):
         groups = split_groups_to_count(groups, valid_lengths, min_groups)
+    groups = costliest_first(groups, valid_lengths, max_tokens_per_mb)
 
     covered = sorted(int(row) for group in groups for row in group)
     if covered != list(range(n_rows)):

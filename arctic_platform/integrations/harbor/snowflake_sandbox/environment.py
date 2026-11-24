@@ -625,7 +625,11 @@ class SnowflakeSandboxEnvironment(BaseEnvironment):
         await self._slots().acquire()
         self._slot_held = True
         try:
-            env = dict(self._base_env) if plan is not None else {**self._base_env, **self._startup_env()}
+            # The service refuses many names an image config sets (PATH, PYTHON_SHA256, ...) at create,
+            # so the image's ENV is set on each command, as the replay plan's already is.
+            env = {} if plan is not None else self._startup_env()
+            if plan is None:
+                self._replay_env = {**self._base_env, **env}
             started = time.monotonic()
             self._sandbox = await self._create_sandbox(image, env)
             logger.debug(
