@@ -69,7 +69,8 @@ except ImportError:
 # signature than v3 (qv is the 4th positional arg) -> called by keyword below.
 try:
     from flash_attn.cute import flash_attn_varlen_func as flash_attn_4_varlen_func
-except ImportError:
+# Some flash_attn builds raise AttributeError, not ImportError, while importing ``flash_attn.cute``.
+except (ImportError, AttributeError):
     flash_attn_4_varlen_func = None  # type: ignore
 
 # Flash linear attention imports (for GatedDeltaNet fast path)
