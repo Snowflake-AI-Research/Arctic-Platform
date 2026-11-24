@@ -2,6 +2,7 @@ from arctic_platform.inference.vllm import config
 from arctic_platform.inference.vllm import deepseek_v41_lora
 from arctic_platform.inference.vllm import dense_prompt_logprobs
 from arctic_platform.inference.vllm import glm5next_lora
+from arctic_platform.inference.vllm import glm5next_kpool_chunk_align
 from arctic_platform.inference.vllm import hybrid_state_fixes
 from arctic_platform.inference.vllm import kv_group_size
 from arctic_platform.inference.vllm import mamba_completion_refresh
@@ -57,6 +58,11 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         lambda: calls.append("kv_group_size"),
     )
     monkeypatch.setattr(
+        glm5next_kpool_chunk_align,
+        "apply_glm5next_kpool_chunk_align_check",
+        lambda: calls.append("glm5next_kpool_chunk_align"),
+    )
+    monkeypatch.setattr(
         mrope_yarn,
         "ensure_mrope_yarn_fix",
         lambda: calls.append("mrope_yarn"),
@@ -84,6 +90,7 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "tp_spec_decode_sync",
         "glm5next_lora",
         "kv_group_size",
+        "glm5next_kpool_chunk_align",
         "dflash_max_position",
         "mrope_yarn",
         "mamba_completion_refresh",

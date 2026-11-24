@@ -126,6 +126,7 @@ def manager_methods(monkeypatch):
         ("tp_spec_decode_sync", "ensure_tp_spec_decode_sync"),
         ("kv_group_size", "ensure_kv_group_size_patch"),
         ("mrope_yarn", "ensure_mrope_yarn_fix"),
+        ("glm5next_kpool_chunk_align", "apply_glm5next_kpool_chunk_align_check"),
         ("glm5next_lora", "ensure_glm5next_lora"),
         ("deepseek_v41_lora", "ensure_deepseek_v41_lora"),
     ]:
