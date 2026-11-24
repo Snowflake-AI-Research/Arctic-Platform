@@ -22,6 +22,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from harbor_rl.entrypoint import materialize_harbor_task_from_row
@@ -278,3 +279,123 @@ def test_a_dropped_exec_stream_runs_the_command_exactly_once(
     assert (result.return_code, result.stdout) == (0, "done\n")
     assert marker.read_text() == "x\n"
     assert len(calls) == (2 if started_before_the_drop else 3)
+
+
+def _flaky_exec_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, drops: int, drop: Any) -> tuple[Any, list]:
+    """A sandbox environment whose first ``drops`` exec streams end with ``drop()`` and the next one succeeds."""
+    pytest.importorskip("snowflake.sandbox")
+    from harbor.models.task.config import EnvironmentConfig
+    from harbor.models.trial.paths import TrialPaths
+
+    from arctic_platform.integrations.harbor.snowflake_sandbox import environment as sf_env
+
+    calls: list[list[str]] = []
+
+    class Stream:
+        def __init__(self, argv: list[str]) -> None:
+            calls.append(argv)
+            self.done = len(calls) > drops
+            self.exit_code = 0 if self.done else None
+
+        def __aiter__(self):
+            return self._lines()
+
+        async def _lines(self):
+            if not self.done:
+                drop()
+                return
+            yield SimpleNamespace(stream="stdout", data="done")
+
+    async def no_wait(_: float) -> None:
+        return None
+
+    monkeypatch.setattr(sf_env.asyncio, "sleep", no_wait)
+    (tmp_path / "environment").mkdir()
+    (tmp_path / "trial").mkdir()
+    env = sf_env.SnowflakeSandboxEnvironment(
+        environment_dir=tmp_path / "environment",
+        environment_name="task",
+        session_id="session",
+        trial_paths=TrialPaths(trial_dir=tmp_path / "trial"),
+        task_env_config=EnvironmentConfig(),
+        prebuilt_image="/db/schema/repo/image:tag",
+    )
+    env._sandbox = SimpleNamespace(exec_stream=lambda argv, timeout: Stream(argv))
+    return env, calls
+
+
+def _closed_stream() -> None:
+    return None
+
+
+@pytest.mark.parametrize("stream_stays_up", [True, False])
+def test_only_drops_soon_after_attaching_count_toward_giving_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stream_stays_up: bool
+) -> None:
+    import asyncio
+
+    from arctic_platform.integrations.harbor.snowflake_sandbox import environment as sf_env
+
+    drops = sf_env._MAX_REATTACH + 3
+    env, calls = _flaky_exec_env(tmp_path, monkeypatch, drops, _closed_stream)
+    # A stream counts as having stayed up when it lasted at least _HEALTHY_STREAM_S.
+    monkeypatch.setattr(sf_env, "_HEALTHY_STREAM_S", 0.0 if stream_stays_up else 3600.0)
+    monkeypatch.setattr(sf_env, "_REATTACH_BUDGET_S", 0.0)
+
+    if stream_stays_up:
+        result = asyncio.run(env.exec("sleep 3600; echo done", user="root"))
+        assert (result.return_code, result.stdout) == (0, "done\n")
+        assert len(calls) == drops + 1
+    else:
+        with pytest.raises(sf_env.SandboxTransportError):
+            asyncio.run(env.exec("sleep 3600; echo done", user="root"))
+        assert len(calls) == sf_env._MAX_REATTACH + 1
+
+
+def test_a_command_outlives_failed_reattaches_shorter_than_the_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+
+    from arctic_platform.integrations.harbor.snowflake_sandbox import environment as sf_env
+
+    drops = sf_env._MAX_REATTACH * 3
+    env, calls = _flaky_exec_env(tmp_path, monkeypatch, drops, _closed_stream)
+    monkeypatch.setattr(sf_env, "_HEALTHY_STREAM_S", 3600.0)
+
+    result = asyncio.run(env.exec("echo done", user="root"))
+
+    assert (result.return_code, result.stdout) == (0, "done\n")
+    assert len(calls) == drops + 1
+
+
+def test_an_http2_connection_failure_under_the_stream_is_a_drop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+
+    # httpcore raises KeyError(stream_id) when a closed HTTP/2 connection no longer tracks the stream.
+    httpcore_code = compile(
+        "def receive(stream_id):\n    raise KeyError(stream_id)\n", f"{tmp_path}/httpcore/_async/http2.py", "exec"
+    )
+    scope: dict = {}
+    exec(httpcore_code, scope)
+    env, calls = _flaky_exec_env(tmp_path, monkeypatch, 2, lambda: scope["receive"](41))
+
+    result = asyncio.run(env.exec("echo done", user="root"))
+
+    assert result.stdout == "done\n"
+    assert len(calls) == 3
+
+
+def test_an_error_outside_the_http_stack_is_not_a_drop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import asyncio
+
+    def bug() -> None:
+        raise KeyError("not a transport error")
+
+    env, calls = _flaky_exec_env(tmp_path, monkeypatch, 2, bug)
+
+    with pytest.raises(KeyError):
+        asyncio.run(env.exec("echo done", user="root"))
+    assert len(calls) == 1
