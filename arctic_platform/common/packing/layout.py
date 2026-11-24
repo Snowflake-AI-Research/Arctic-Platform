@@ -114,6 +114,9 @@ LAYOUT_ATTR = "_arctic_packed_layout"
 # ``sft_mask`` / ``echo_observation_mask`` sit outside ``loss_mask`` but still weight a loss term.
 LOSS_WEIGHT_KEYS = frozenset({"loss_mask", "response_mask", "sft_mask", "echo_observation_mask"})
 _HF_PREFIX_MARK = "_arctic_prefix_attention"
+# Instance attribute: ``check(layout) -> reason | None``. A mixer that continues prefixes itself (the GatedDeltaNet
+# adapter) sets it on each module it installs on; a class attribute does not count.
+PREFIX_CONTINUATION_ATTR = "_arctic_prefix_continuation"
 _MISSING = object()
 _ModuleType = TypeVar("_ModuleType", bound=type)
 
@@ -688,7 +691,7 @@ def using_layout(model: torch.nn.Module, layout: PackedLayout | None) -> Iterato
     default); :meth:`PackedLayout.unpack` raises on the latter only if the loss flows through it.
     """
     if layout is not None and layout.has_sharing:
-        require_prefix_continuation(model)
+        require_prefix_continuation(model, layout)
         require_router_replay_decision(model, layout)
         require_bottom_right_causal_flash(model)
     previous_stash = [(module, module.__dict__.get(LAYOUT_ATTR, _MISSING)) for module in model.modules()]
@@ -719,6 +722,12 @@ def _unstashed_error(name: str) -> ValueError:
         "the active layout's segments may have reached it through cu_seqlens_from_position_ids. Wrap this "
         "model in its own using_layout (an unshared layout is fine)"
     )
+
+
+def require_stash_inside_context(name: str, layout: PackedLayout | None) -> None:
+    """Raise if mixer ``name`` has no stash while any context is active: its boundaries may be another call's."""
+    if layout is None and any(active is not None for active in _ACTIVE_LAYOUTS):
+        raise _unstashed_error(name)
 
 
 def require_dense_attention_layout(name: str, layout: PackedLayout | None) -> None:
@@ -801,7 +810,8 @@ def _flash_kernel(module: torch.nn.Module) -> int:
 
 def require_bottom_right_causal_flash(model: torch.nn.Module) -> None:
     """Every flash kernel ``model``'s mixers call must be installed and align the causal mask bottom-right."""
-    for kernel in sorted({_flash_kernel(module) for module in sequence_mixers(model)}):
+    attention = [module for module in sequence_mixers(model) if _prefix_continuation_check(module) is None]
+    for kernel in sorted({_flash_kernel(module) for module in attention}):
         distribution, oldest = _FLASH_KERNELS[kernel]
         installed = _installed_version(distribution)
         if installed is None:
@@ -956,9 +966,18 @@ def sequence_mixers(model: torch.nn.Module) -> list[torch.nn.Module]:
     return [module for module in model.modules() if _is_sequence_mixer(module)]
 
 
-def _prefix_continuation_blocker(module: torch.nn.Module) -> str | None:
-    """Why ``module`` cannot run prefix continuation, or ``None`` if it can."""
+def _prefix_continuation_check(module: torch.nn.Module) -> Callable[[PackedLayout | None], str | None] | None:
+    check = module.__dict__.get(PREFIX_CONTINUATION_ATTR)
+    return check if callable(check) else None
+
+
+def _prefix_continuation_blocker(module: torch.nn.Module, layout: PackedLayout | None = None) -> str | None:
+    """Why ``module`` cannot run prefix continuation (on ``layout``, if given), or ``None`` if it can."""
     name = type(module).__name__
+    check = _prefix_continuation_check(module)
+    if check is not None:
+        reason = check(layout)
+        return None if reason is None else f"{name} ({reason})"
     if type(module) in _NATIVE_PREFIX_ATTENTION:
         version = getattr(module, "_flash_attn_version", 2)
         if version not in _FLASH_KERNELS:
@@ -980,11 +999,12 @@ def supports_prefix_continuation(module: torch.nn.Module) -> bool:
     return _prefix_continuation_blocker(module) is None
 
 
-def require_prefix_continuation(model: torch.nn.Module) -> None:
+def require_prefix_continuation(model: torch.nn.Module, layout: PackedLayout | None = None) -> None:
+    """Raise unless every sequence mixer of ``model`` can continue a shared prefix (on ``layout``, if given)."""
     mixers = sequence_mixers(model)
     if not mixers:
         raise ValueError("zorro/prefix sharing found no sequence mixers to validate")
-    unsupported = sorted({reason for module in mixers if (reason := _prefix_continuation_blocker(module))})
+    unsupported = sorted({reason for module in mixers if (reason := _prefix_continuation_blocker(module, layout))})
     if unsupported:
         raise ValueError(
             "zorro/prefix sharing needs prefix continuation in every sequence mixer; "
