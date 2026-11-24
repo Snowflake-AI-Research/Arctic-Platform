@@ -63,13 +63,21 @@ varlen backward) have been checked on GPU against an unshared run. A sharing lay
 other ``FlashAttention`` versions and Hugging Face implementations other than
 ``flash_attention_2`` / ``_3`` / ``_4``, and needs the kernel each mixer calls installed.
 
-Mixers are found by class name and by a direct ``Conv1d`` child; any that is not one of the
-flash attentions above (Mamba / SSM, GatedDeltaNet, short convolutions) refuses a sharing
-layout, because it would restart its state at each continuation instead of carrying the root's.
+Mixers are found by class name and by a direct ``Conv1d`` child. A GatedDeltaNet continues a
+shared prefix when its module carries a :data:`PREFIX_CONTINUATION_ATTR` check (the adapter in
+``gpu/sp/gated_delta_net.py``, or the custom Qwen3.5-MoE layer): each continuation's conv window
+starts with its root's last inputs and its recurrent state starts from the root's final state,
+which needs FLA's chunk rule, causal-conv1d's ``seq_idx``, and roots of whole 64-token chunks. Any
+other mixer that is not one of the flash attentions above (Mamba / SSM, unadapted GatedDeltaNet,
+short convolutions) refuses a sharing layout, because it would restart its state at each
+continuation instead of carrying the root's.
 
-Not supported inside :func:`using_layout` until the GatedDeltaNet and executor PRs define
-them: sequence parallelism (SP >= 2, a shard's ``position_ids`` do not cover the layout)
-and padded calls (``pad_packed_microbatch``). Both fail the packed-token-count checks in
+Under sequence parallelism the layout describes the whole packed call, identical on every rank,
+and mixers apply it after their all-to-all, when they hold every token: DeepSpeed's
+``UlyssesSPAttentionHF`` gets the prefix gather by having its inner attention swapped for the
+context (its subclasses are refused), and the GatedDeltaNet adapters read it after the head
+exchange. Not supported inside :func:`using_layout` until the executor PR: padded calls
+(``pad_packed_microbatch``), which fail the packed-token-count checks in
 ``cu_seqlens_from_position_ids`` and :func:`prefix_varlen_args`.
 
 MoE policy (documentation only; nothing here adjusts token counts): a shared root token goes
@@ -770,8 +778,8 @@ def prefix_varlen_args(
     if k.shape[0] != layout.num_tokens or v.shape[0] != layout.num_tokens:
         raise ValueError(
             f"layout expects {layout.num_tokens} packed K/V tokens, got {k.shape[0]} / {v.shape[0]} "
-            "(already gathered, or a sequence-parallel shard or padded call, which using_layout does not "
-            "support until the GatedDeltaNet / executor PRs)"
+            "(already gathered; a sequence-parallel shard, which must be all-to-all'd to the whole call first; "
+            "or a padded call, which using_layout does not support until the executor PR)"
         )
     cu_q = layout.cu_seqlens.to(device=k.device, dtype=torch.int32)
     if not layout.has_sharing:
@@ -886,12 +894,62 @@ def _hf_prefix_attention_fn(orig: Callable, impl: str = "flash_attention_2") -> 
     return prefix_attention
 
 
+def _hf_stash_check_fn(orig: Callable) -> Callable:
+    """Pass ``orig`` through, raising for a module with no stash while a sharing context is active."""
+
+    def stash_check(module, *args, **kwargs):
+        if get_stashed_layout(module) is None and prefix_sharing_active():
+            raise _unstashed_error(type(module).__name__)
+        return orig(module, *args, **kwargs)
+
+    setattr(stash_check, _HF_PREFIX_MARK, True)
+    return stash_check
+
+
+def _ulysses_attention(fn: Callable) -> Any:
+    """The DeepSpeed ``UlyssesSPAttentionHF`` behind registry entry ``fn``, or ``None`` if ``fn`` is not one.
+
+    ``register_with_transformers`` replaces the core entry with a ``uattn_wrapper`` closure over the instance,
+    whose ``attn`` (the captured core) runs after the all-to-all on the whole packed sequence for local heads.
+    That is where the prefix gather has to run; DeepSpeed exposes no other hook.
+    """
+    try:
+        from deepspeed.runtime.sequence_parallel.ulysses_sp import UlyssesSPAttentionHF
+    except ImportError:
+        return None
+    found = []
+    for cell in getattr(fn, "__closure__", None) or ():
+        try:
+            value = cell.cell_contents
+        except ValueError:
+            continue
+        if isinstance(value, UlyssesSPAttentionHF):
+            found.append(value)
+    if not found:
+        return None
+    if getattr(fn, "__name__", None) != "uattn_wrapper" or len(found) != 1:
+        raise ValueError(
+            f"attention registry entry {fn!r} closes over a DeepSpeed UlyssesSPAttentionHF but is not the "
+            "uattn_wrapper prefix sharing is verified with"
+        )
+    if type(found[0]) is not UlyssesSPAttentionHF:
+        # DSS's HeterogeneousUlyssesSPAttentionHF re-dispatches large head dims to flex attention, which
+        # ignores the prefix segments.
+        raise ValueError(
+            f"prefix sharing supports DeepSpeed's UlyssesSPAttentionHF, not the subclass {type(found[0]).__name__}"
+        )
+    return found[0]
+
+
 @contextmanager
 def _hf_prefix_attention(model: torch.nn.Module) -> Iterator[None]:
     """Point every entry of ``transformers``' attention registry at the prefix wrapper, then restore them.
 
     Every entry, not just the ones ``model`` uses, so another model's Hugging Face attention with no
     stash raises instead of reading the packed batch as one sequence. Eager attention skips the registry.
+
+    Under DeepSpeed Ulysses the registry entry sees this rank's token window, so it only checks the stash and
+    the prefix wrapper goes on the Ulysses instance's ``attn``, which sees the whole packed call.
     """
     hf_modules = [module for module in model.modules() if type(module).__name__ in _HF_PREFIX_ATTENTION]
     try:
@@ -907,6 +965,7 @@ def _hf_prefix_attention(model: torch.nn.Module) -> Iterator[None]:
         if getattr(sys.modules.get(type(module).__module__), "ALL_ATTENTION_FUNCTIONS", None) is not registry:
             raise ValueError(f"{type(module).__name__} does not dispatch through transformers.ALL_ATTENTION_FUNCTIONS")
     saved: list[tuple[str, Any]] = []
+    swapped: list[tuple[Any, Callable, Callable]] = []
     try:
         for impl in sorted({module.config._attn_implementation for module in hf_modules}):
             if impl not in registry:
@@ -915,18 +974,37 @@ def _hf_prefix_attention(model: torch.nn.Module) -> Iterator[None]:
             current = registry[impl]
             if getattr(current, _HF_PREFIX_MARK, False):
                 continue
+            ulysses = _ulysses_attention(current)
             saved.append((impl, local.get(impl, _MISSING)))
-            registry[impl] = _hf_prefix_attention_fn(current, impl)
+            if ulysses is None:
+                registry[impl] = _hf_prefix_attention_fn(current, impl)
+                continue
+            core = ulysses.attn
+            ulysses.attn = _hf_prefix_attention_fn(core, impl)
+            swapped.append((ulysses, core, ulysses.attn))
+            registry[impl] = _hf_stash_check_fn(current)
         yield
     finally:
+        replaced = False
+        for ulysses, core, wrapper in reversed(swapped):
+            replaced = replaced or ulysses.attn is not wrapper
+            ulysses.attn = core
         for impl, previous in reversed(saved):
             if previous is _MISSING:
                 del registry[impl]
             else:
                 registry[impl] = previous
+        if replaced:
+            raise RuntimeError("DeepSpeed Ulysses attention was replaced inside a prefix-sharing context")
 
 
-_HF_PREFIX_ATTENTION = {"Qwen3Attention", "Qwen3MoeAttention"}
+_HF_PREFIX_ATTENTION = {
+    "Qwen3Attention",
+    "Qwen3MoeAttention",
+    "Qwen3_5Attention",
+    "Qwen3_5MoeAttention",
+    "Qwen3NextAttention",
+}
 _NATIVE_PREFIX_ATTENTION: set[type] = set()
 _SEQUENCE_MIXER_NEEDLES = (
     "Attention",

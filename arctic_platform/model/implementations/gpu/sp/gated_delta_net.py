@@ -525,7 +525,9 @@ def packed_gated_delta_rule(
             f"{None if state is None else (tuple(state.shape), state.device)}"
         )
     if state.dtype != torch.promote_types(v.dtype, torch.float32):
-        raise RuntimeError(f"packed GatedDeltaNet expected {torch.promote_types(v.dtype, torch.float32)} state, got {state.dtype}")
+        raise RuntimeError(
+            f"packed GatedDeltaNet expected {torch.promote_types(v.dtype, torch.float32)} state, got {state.dtype}"
+        )
     continuation_output, final_state = gated_delta_rule(
         continuations(q),
         continuations(k),
@@ -985,7 +987,9 @@ def prefix_continuation_kernel_blocker(causal_convolution, gated_delta_rule) -> 
     if missing:
         return f"the gated delta rule takes no {sorted(missing)}"
     if "seq_idx" not in _kernel_parameters(causal_convolution):
-        return "prefix sharing needs causal-conv1d's causal_conv1d_fn with seq_idx; the torch fallback ignores boundaries"
+        return (
+            "prefix sharing needs causal-conv1d's causal_conv1d_fn with seq_idx; the torch fallback ignores boundaries"
+        )
     checked = ["fla-core", "flash-linear-attention"]
     if str(getattr(causal_convolution, "__module__", "")).startswith("causal_conv1d"):
         checked.append("causal-conv1d")
@@ -999,26 +1003,33 @@ def prefix_continuation_kernel_blocker(causal_convolution, gated_delta_rule) -> 
     return None
 
 
-def _prefix_continuation_check(module: nn.Module, causal_convolution, gated_delta_rule):
+def gated_delta_net_prefix_continuation_blocker(
+    layout: PackedLayout | None, kernel_size: int, causal_convolution, gated_delta_rule
+) -> str | None:
+    """Why a GatedDeltaNet with these kernels cannot run ``layout`` (any layout if ``None``), or ``None``."""
+    reason = prefix_continuation_kernel_blocker(causal_convolution, gated_delta_rule)
+    if reason is not None or layout is None or not layout.has_sharing:
+        return reason
+    cu = layout.cu_seqlens.tolist()
+    for root in sorted(set(layout.parent[layout.num_roots :].tolist())):
+        length = cu[root + 1] - cu[root]
+        if length % GATED_DELTA_CHUNK_SIZE:
+            return (
+                f"shared root {root} has {length} tokens; GatedDeltaNet roots must be a multiple of its "
+                f"{GATED_DELTA_CHUNK_SIZE}-token chunk (shared_prefix_length(first_weighted, "
+                f"{GATED_DELTA_CHUNK_SIZE}))"
+            )
+        if length < kernel_size - 1:
+            return f"shared root {root} has {length} tokens, fewer than the conv carry's {kernel_size - 1}"
+    return None
+
+
+def gated_delta_net_prefix_continuation_check(module: nn.Module, causal_convolution, gated_delta_rule):
     """``check(layout)`` for :data:`~arctic_platform.common.packing.layout.PREFIX_CONTINUATION_ATTR`."""
     kernel_size = int(module.conv_kernel_size)
 
     def check(layout: PackedLayout | None) -> str | None:
-        reason = prefix_continuation_kernel_blocker(causal_convolution, gated_delta_rule)
-        if reason is not None or layout is None or not layout.has_sharing:
-            return reason
-        cu = layout.cu_seqlens.tolist()
-        for root in sorted(set(layout.parent[layout.num_roots :].tolist())):
-            length = cu[root + 1] - cu[root]
-            if length % GATED_DELTA_CHUNK_SIZE:
-                return (
-                    f"shared root {root} has {length} tokens; GatedDeltaNet roots must be a multiple of its "
-                    f"{GATED_DELTA_CHUNK_SIZE}-token chunk (shared_prefix_length(first_weighted, "
-                    f"{GATED_DELTA_CHUNK_SIZE}))"
-                )
-            if length < kernel_size - 1:
-                return f"shared root {root} has {length} tokens, fewer than the conv carry's {kernel_size - 1}"
-        return None
+        return gated_delta_net_prefix_continuation_blocker(layout, kernel_size, causal_convolution, gated_delta_rule)
 
     return check
 
@@ -1170,7 +1181,7 @@ def _adapt_gated_delta_net_module(
     setattr(
         module,
         PREFIX_CONTINUATION_ATTR,
-        _prefix_continuation_check(module, original_causal_convolution, original_gated_delta_rule),
+        gated_delta_net_prefix_continuation_check(module, original_causal_convolution, original_gated_delta_rule),
     )
 
 

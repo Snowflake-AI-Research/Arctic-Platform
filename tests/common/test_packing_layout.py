@@ -29,6 +29,7 @@ import torch
 from torch import nn
 from torch.utils.checkpoint import CheckpointError
 from torch.utils.checkpoint import checkpoint
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from arctic_platform.common.packing import IGNORE_INDEX
 from arctic_platform.common.packing import PackedLayout
@@ -958,3 +959,83 @@ def test_share_off_layout_matches_pack_microbatch_attention():
         out = module(unshared.pack(x))
     baseline = module(packed["x"][0], cu_seqlens=metadata.cu_seqlens, max_seqlen=int(metadata.cu_seqlens.diff().max()))
     torch_assert_equal(out, baseline)
+
+
+def _ulysses_registry_entry(ulysses, full_qkv):
+    """Shaped like DeepSpeed's ``register_with_transformers`` closure: the core runs on the gathered sequence."""
+
+    def uattn_wrapper(module, query, key, value, attention_mask, *args, **kwargs):
+        assert query.shape[2] * 2 == full_qkv[0].shape[2], "the registry entry sees one rank's window"
+        return ulysses.attn(module, *full_qkv, None, *args, **kwargs)
+
+    return uattn_wrapper
+
+
+class _HFAttentionConfig:
+    _attn_implementation = "flash_attention_2"
+
+
+class Qwen3_5Attention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = _HFAttentionConfig()
+        self.sliding_window = None
+
+
+@pytest.mark.parametrize("subclass", [False, True], ids=["ulysses", "heterogeneous"])
+def test_ulysses_prefix_gather_runs_after_the_all_to_all(monkeypatch, subclass):
+    ulysses_sp = pytest.importorskip("deepspeed.runtime.sequence_parallel.ulysses_sp")
+
+    _, layout = _shared_layout(lengths=(4, 5), shared=3)
+    tokens = layout.num_tokens
+    assert tokens == 6
+    calls = []
+
+    def core(module, query, key, value, attention_mask, *args, **kwargs):
+        calls.append({"q": query.shape[2], "k": key.shape[2], **kwargs})
+        return query.transpose(1, 2), None
+
+    cls = ulysses_sp.UlyssesSPAttentionHF
+    if subclass:
+        cls = type("HeterogeneousUlyssesSPAttentionHF", (cls,), {})
+    ulysses = cls.__new__(cls)
+    nn.Module.__init__(ulysses)
+    ulysses.attn = core
+    full = tuple(torch.randn(1, 2, tokens, 4) for _ in range(3))
+    entry = _ulysses_registry_entry(ulysses, full)
+    monkeypatch.setitem(ALL_ATTENTION_FUNCTIONS._global_mapping, "flash_attention_2", entry)
+    module = Qwen3_5Attention()
+    local = tuple(tensor[:, :, : tokens // 2] for tensor in full)
+
+    if subclass:
+        with pytest.raises(ValueError, match="not the subclass HeterogeneousUlyssesSPAttentionHF"):
+            with using_layout(module, layout):
+                pass
+        assert ulysses.attn is core and ALL_ATTENTION_FUNCTIONS["flash_attention_2"] is entry
+        return
+
+    with using_layout(module, layout):
+        ALL_ATTENTION_FUNCTIONS["flash_attention_2"](module, *local, None, cu_seq_lens_q=torch.tensor([0, 3]))
+        assert ulysses.attn is not core
+    assert ulysses.attn is core and ALL_ATTENTION_FUNCTIONS["flash_attention_2"] is entry
+    assert len(calls) == 1
+    assert calls[0]["q"] == tokens and calls[0]["k"] == layout.kv_index.numel()
+    torch_assert_equal(calls[0]["cu_seq_lens_q"], layout.cu_seqlens.to(torch.int32))
+    torch_assert_equal(calls[0]["cu_seq_lens_k"], layout.cu_seqlens_k.to(torch.int32))
+
+
+def test_ulysses_entry_still_refuses_an_unstashed_module_in_a_sharing_context(monkeypatch):
+    ulysses_sp = pytest.importorskip("deepspeed.runtime.sequence_parallel.ulysses_sp")
+
+    _, layout = _shared_layout(lengths=(4, 5), shared=3)
+    ulysses = ulysses_sp.UlyssesSPAttentionHF.__new__(ulysses_sp.UlyssesSPAttentionHF)
+    nn.Module.__init__(ulysses)
+    ulysses.attn = lambda *args, **kwargs: (None, None)
+    full = tuple(torch.randn(1, 2, layout.num_tokens, 4) for _ in range(3))
+    monkeypatch.setitem(
+        ALL_ATTENTION_FUNCTIONS._global_mapping, "flash_attention_2", _ulysses_registry_entry(ulysses, full)
+    )
+    local = tuple(tensor[:, :, :3] for tensor in full)
+    with using_layout(Qwen3_5Attention(), layout):
+        with pytest.raises(ValueError, match="no PackedLayout stashed"):
+            ALL_ATTENTION_FUNCTIONS["flash_attention_2"](Qwen3_5Attention(), *local, None)
