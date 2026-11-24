@@ -171,7 +171,12 @@ def test_convert_failure_removes_partial_cache(monkeypatch, tmp_path):
         assert "disk full" in str(exc)
 
     leftovers = [p.name for p in dest.parent.iterdir() if p.name == dest.name or p.name.startswith(f"{dest.name}.")]
-    assert leftovers == []
+    assert leftovers == [f"{dest.name}.failed"]
+    failure = json.loads((dest.parent / leftovers[0]).read_text())
+    assert failure["attempt_id"]
+    assert failure["writer_id"]
+    assert failure["error"] == "rank=0: RuntimeError: disk full"
+    assert not conversion_cache_ready(dest)
 
 
 def test_promote_from_explicit_cache(monkeypatch, tmp_path):

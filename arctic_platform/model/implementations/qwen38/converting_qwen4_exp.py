@@ -16,6 +16,8 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
+from pathlib import Path
 
 import torch
 from torch import Tensor
@@ -28,7 +30,7 @@ def _layer_prefix(layer_idx: int) -> str:
     return f"model.language_model.layers.{layer_idx}"
 
 
-def _layer_indices(state_dict: dict[str, Tensor]) -> list[int]:
+def _layer_indices(state_dict: Mapping[str, object]) -> list[int]:
     return sorted({int(match.group(1)) for name in state_dict if (match := _LAYER_RE.match(name)) is not None})
 
 
@@ -158,13 +160,45 @@ def convert_hf_to_prime(state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
     return state_dict
 
 
+def _checkpoint_groups(names: tuple[str, ...]) -> list[list[str]]:
+    keys = dict.fromkeys(names)
+    for layer_idx in _layer_indices(keys):
+        _indexed_expert_keys(keys, _layer_prefix(layer_idx))
+    ple_groups: dict[str, list[int]] = {}
+    groups: dict[tuple[str, str], list[str]] = {}
+    for name in names:
+        layer = _LAYER_RE.match(name)
+        ple = _PLE_SHARD_RE.match(name)
+        if ple is not None:
+            ple_groups.setdefault(ple.group(1), []).append(int(ple.group(2)))
+        if layer is not None:
+            group = ("layer", layer.group(1))
+        elif ple is not None:
+            group = ("ple", ple.group(1))
+        else:
+            group = ("tensor", name)
+        groups.setdefault(group, []).append(name)
+    for base, indices in ple_groups.items():
+        indices.sort()
+        if indices != list(range(len(indices))):
+            raise KeyError(f"Non-contiguous Qwen3.8 PLE shards for {base}: {indices}")
+    return list(groups.values())
+
+
+def convert_hf_checkpoint_to_prime(source_dir: Path, save_dir: Path) -> None:
+    """Convert complete Qwen3.8 dependency groups without loading the entire checkpoint."""
+    from ..moe.weights import convert_safetensor_checkpoint
+
+    convert_safetensor_checkpoint(source_dir, save_dir, convert_hf_to_prime, _checkpoint_groups)
+
+
 def convert_prime_to_hf(state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
     for layer_idx in _layer_indices(state_dict):
         convert_prime_layer_to_hf(state_dict, layer_idx)
     return state_dict
 
 
-def _indexed_expert_keys(state_dict: dict[str, Tensor], prefix: str) -> dict[int, dict[str, str]]:
+def _indexed_expert_keys(state_dict: Mapping[str, object], prefix: str) -> dict[int, dict[str, str]]:
     pattern = re.compile(rf"^{re.escape(prefix)}\.mlp\.experts\.(\d+)\.(gate_proj|down_proj|up_proj)\.weight$")
     experts: dict[int, dict[str, str]] = {}
     for name in state_dict:
