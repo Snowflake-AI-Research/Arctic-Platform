@@ -380,6 +380,7 @@ def get_model(
     # Read by the custom Qwen3.5-MoE decoder, which a composite model builds from its text config.
     model_config.fp32_parity = config.fp32_parity
     model_config.fp32_routed_weighting = config.fp32_routed_weighting
+    model_config.fp32_kda = config.fp32_kda
     if getattr(model_config, "text_config", None) is not None:
         model_config.text_config.fp32_parity = config.fp32_parity
         model_config.text_config.fp32_routed_weighting = config.fp32_routed_weighting
