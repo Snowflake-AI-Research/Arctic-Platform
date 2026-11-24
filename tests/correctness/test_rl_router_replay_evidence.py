@@ -289,11 +289,11 @@ def test_router_observer_close_failure_cannot_prevent_native_worker_destroy(_con
     if native_failure:
         with pytest.raises(ValueError, match="native sender destroy failed"):
             namespace["destroy"](worker)
-        assert events == ["sender", "close"]
+        assert events == ["sender", "group", "close"]
     else:
         with pytest.raises(RuntimeError, match="observer close failed"):
             namespace["destroy"](worker)
         assert events == ["sender", "group", "close"]
-        assert worker._weight_sender is None
-        assert worker.engine is None and worker._gpu_mem_preallocation is None
+    assert worker._weight_sender is None
+    assert worker.engine is None and worker._gpu_mem_preallocation is None
     assert evidence.active() is None and evidence._publication is None

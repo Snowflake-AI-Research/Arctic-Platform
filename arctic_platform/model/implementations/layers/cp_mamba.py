@@ -116,9 +116,7 @@ def _causal_conv_packed(
     channels_first = hidden_states_b_c.transpose(1, 2)
     padding = weight.shape[2] - 1
     if cu_seqlens is None:
-        convolved = torch.nn.functional.conv1d(
-            channels_first, weight, bias, groups=groups, padding=padding
-        )
+        convolved = torch.nn.functional.conv1d(channels_first, weight, bias, groups=groups, padding=padding)
         return torch.nn.functional.silu(convolved.transpose(1, 2)[:, :length])
 
     if int(cu_seqlens[-1]) != length:
@@ -235,9 +233,7 @@ def mamba_cp_forward(
     # ── 5. SSM scan on the gathered sequence, local heads. seq_idx resets state at row boundaries. ──
     dt_limit_kwargs = {} if mixer.time_step_limit is None else {"dt_limit": mixer.time_step_limit}
     seq_idx = (
-        None
-        if cu_seqlens is None
-        else _seq_idx_from_cu_seqlens(cu_seqlens, full_seq_len, hidden_states_local.device)
+        None if cu_seqlens is None else _seq_idx_from_cu_seqlens(cu_seqlens, full_seq_len, hidden_states_local.device)
     )
 
     scan_output, _ = mamba_chunk_scan_combined(
