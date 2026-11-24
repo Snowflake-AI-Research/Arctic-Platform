@@ -780,12 +780,7 @@ def test_a_padded_router_sends_every_token_to_the_same_experts_at_every_row_coun
     )
 
 
-def test_the_pad_is_requested_only_by_a_determinism_run():
-    """A production recipe keeps the projection it had; the pad follows ``debug.full_determinism``.
-
-    The pad costs a taller call on every covered projection, so which runs pay for it is a decision worth
-    pinning here rather than leaving to a branch in the model loader.
-    """
+def test_without_a_loader_override_the_pad_follows_full_determinism():
     assert row_invariant_projections_requested({}) is False
     assert row_invariant_projections_requested({"debug": {}}) is False
     assert row_invariant_projections_requested({"debug": {"full_determinism": False}}) is False
@@ -808,3 +803,37 @@ def test_the_entry_point_patches_only_when_the_run_asked():
     assert "forward" not in unasked[0].__dict__
     assert maybe_apply_row_invariant_projections(asked, {"debug": {"full_determinism": True}}, verify=False) == 1
     assert "forward" in asked[0].__dict__
+
+
+@pytest.mark.parametrize(
+    "model_type", ["glm5_next", "qwen4_exp", "qwen3_5_moe", "qwen3_moe", "deepseek_v4", "deepseek_v41"]
+)
+def test_standalone_pad_reaches_the_registered_loader(model_type, tmp_path, monkeypatch):
+    from unittest.mock import Mock
+
+    from arctic_platform.model import build_moe_model
+    from arctic_platform.model.implementations.debug.token_combine import maybe_use_fixed_order_row_sum
+    from arctic_platform.model.implementations.qwen35 import deepspeed_integration
+    from arctic_platform.testing_utils import set_seed
+    from arctic_platform.testing_utils import torch_assert_equal
+
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type}))
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", MEASURED_WORKSPACE)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr("arctic_platform.model.parallel.groups.expert_parallel_group", lambda size: object())
+
+    def load_projection(*args, options, **kwargs):
+        layer = torch.nn.Linear(4096, 1024)
+        assert maybe_use_fixed_order_row_sum(layer, options.model_dump()) == 0
+        return layer
+
+    monkeypatch.setattr(deepspeed_integration, "_load_moe_model", load_projection)
+    set_seed(0)
+    model = build_moe_model(model_name=str(tmp_path), ep_size=2, loader_options={"row_invariant_projections": True})
+    rows = torch.randn(invariant_row_target(1024, MEASURED_WORKSPACE), 4096)
+    linear = Mock(wraps=torch.nn.functional.linear)
+    monkeypatch.setattr(torch.nn.functional, "linear", linear)
+    with torch.no_grad():
+        alone = model(rows[:1])
+        assert linear.call_args.args[0].shape == rows.shape
+        torch_assert_equal(alone.view(torch.int32), model(rows)[:1].view(torch.int32))

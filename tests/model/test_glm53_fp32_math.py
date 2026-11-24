@@ -188,6 +188,81 @@ def test_glm53_kda_beta_gate_is_an_fp32_sigmoid(tiny_glm_sparse_model, single_ra
         torch_assert_equal(beta.reshape(expected.shape), expected)
 
 
+def test_glm53_kda_keeps_normalized_qk_in_fp32_like_the_sampler_decode(tiny_glm_sparse_model, single_rank_group):
+    for enabled in (False, True):
+        _check_kda_operands(tiny_glm_sparse_model, single_rank_group, enabled)
+
+
+def _check_kda_operands(tiny_glm_sparse_model, single_rank_group, fp32_kda):
+    """Check the operands and normalization flag FLA actually receives, the result at o_norm, and the gradient
+    through the post-convolution q/k/v cast on both GLM forwards."""
+    from arctic_platform.model.implementations.glm53 import context_parallel as cp
+    from tests.model.test_glm53_packed_rows import _unfused_causal_conv1d_module
+
+    set_seed(0)
+    attention = tiny_glm_sparse_model(with_linear_attention=True).model.layers[1].self_attn
+    hidden_states = torch.randn(1, 6, attention.b_proj.in_features).to(torch.bfloat16)
+    cu_seqlens = torch.tensor([0, 2, 6], dtype=torch.int32)
+    setattr(attention, cp._GLOBAL_CU_SEQLENS, cu_seqlens)
+    attention._cp_group, attention._cp_world_size, attention._fp32_kda = single_rank_group, 1, fp32_kda
+    calls, convolved, outputs = [], [], []
+    convolution = _unfused_causal_conv1d_module(cu_seqlens)
+    convolve = convolution.causal_conv1d_fn
+
+    def record_conv(*args, **kwargs):
+        result = convolve(*args, **kwargs)
+        convolved.append(result)
+        return result
+
+    def chunk_kda(q, k, v, *, cu_seqlens, use_qk_l2norm_in_kernel, **kwargs):
+        calls.append(((q, k, v), cu_seqlens, use_qk_l2norm_in_kernel))
+        return q + k * v, None
+
+    convolution.causal_conv1d_fn = record_conv
+    attention.o_norm.register_forward_pre_hook(lambda module, args: outputs.append(args[0]))
+    modules = {"fla.ops.kda": types.SimpleNamespace(chunk_kda=chunk_kda), "causal_conv1d": convolution}
+    with patch.dict(sys.modules, modules):
+        cp._local_linear_attention_forward(attention, hidden_states)
+        cp._linear_attention_forward(attention, hidden_states)
+
+    assert len(outputs) == 2
+    for mixed, (operands, boundaries, normalize_in_kernel), output in zip(convolved, calls, outputs, strict=True):
+        reference = mixed.detach().to(torch.float32 if fp32_kda else mixed.dtype).requires_grad_(fp32_kda)
+        qkv = reference.transpose(1, 2).unflatten(-1, (3, attention.num_heads, attention.head_dim))
+        q, k, v = qkv.unbind(2)
+        if fp32_kda:
+            q, k = (x / torch.sqrt(x.square().sum(-1, keepdim=True) + 1e-6) for x in (q, k))
+        for actual, expected_operand in zip(operands, (q, k, v), strict=True):
+            torch_assert_equal(actual, expected_operand)
+        assert normalize_in_kernel is (not fp32_kda)
+        torch_assert_equal(boundaries, cu_seqlens)
+        expected = (q + k * v).to(mixed.dtype)
+        torch_assert_equal(output, expected)
+        if fp32_kda:
+            grad = torch.randn_like(output)
+            (actual_grad,) = torch.autograd.grad(output, mixed, grad)
+            (reference_grad,) = torch.autograd.grad(expected, reference, grad)
+            torch_assert_equal(actual_grad, reference_grad.to(mixed.dtype))
+
+
+def test_glm53_loader_passes_fp32_kda_to_attention(tmp_path):
+    from arctic_platform.model import ModelSpec
+    from arctic_platform.model.implementations.glm53.deepspeed_integration import _adapter
+    from arctic_platform.model.loaders.flash_moe import _FlashLoadOptions
+
+    _tiny_config().save_pretrained(tmp_path)
+    adapter = _adapter()
+    for loader_options in ({"fp32_kda": True}, {}):
+        spec = ModelSpec(model_path_or_name=str(tmp_path), loader="glm5_next", loader_options=loader_options)
+        options = _FlashLoadOptions.model_validate(spec.loader_options)
+        config = adapter.build_model_config(str(tmp_path), 1, 1, "bfloat16", spec.attn_implementation, options)
+        model = adapter.get_model(config, torch.device("meta"), torch.bfloat16)
+        adapter.apply_sequence_parallelism(model, 1, None)
+        assert model.model.language_model.layers[0].self_attn._fp32_kda is bool(loader_options)
+    with pytest.raises(ValueError, match="fp32_kda"):
+        ModelSpec(model_path_or_name=str(tmp_path), loader="qwen4_exp", loader_options={"fp32_kda": True})
+
+
 @pytest.mark.parametrize("autocast", [False, True])
 @pytest.mark.parametrize("fp32_parity", [True, False])
 def test_qwen38_gated_delta_net_beta_is_the_same_at_every_sequence_parallel_size(monkeypatch, fp32_parity, autocast):
