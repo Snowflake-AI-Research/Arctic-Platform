@@ -146,6 +146,20 @@ class TestKlPenalty(TestCasePlus):
         d = ref - logp
         torch_assert_close(kl_penalty(logp, ref, "k3"), d.exp() - d - 1, rtol=0, atol=1e-5, msg="k3")
 
+    def test_k3_is_non_negative_and_float32_accurate_near_zero(self):
+        # k3 = r - 1 - log r >= 0. As exp(x) - 1 - x it carries exp(x)'s rounding to a float32 step of 1 (up to 6e-8),
+        # more than k3 ~ x^2 / 2 itself near x = 0, and comes out negative.
+        log_ratio = torch.tensor([-1e-3, -1e-4, -1e-7, 0.0, 1e-7, 1e-4, 1e-3])
+        expected = torch.expm1(log_ratio.double()) - log_ratio.double()
+        tolerance = log_ratio.double().abs() * 2.0**-23
+        for name, k3 in (
+            ("sampler_kl", _sampler_kl(log_ratio, "k3", 5.0)),
+            ("kl_penalty", kl_penalty(torch.zeros_like(log_ratio), log_ratio, "k3")),
+        ):
+            with self.subTest(name=name):
+                self.assertTrue((k3 >= 0).all(), k3)
+                self.assertTrue(((k3.double() - expected).abs() <= tolerance).all(), k3.double() - expected)
+
     def test_identical_policies_give_zero_kl(self):
         logp = torch.tensor([-1.0, -2.0, -3.0])
         for method in ("k1", "abs", "k2", "k3", "low_var_kl"):
