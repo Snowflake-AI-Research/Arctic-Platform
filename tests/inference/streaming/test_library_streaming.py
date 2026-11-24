@@ -102,6 +102,10 @@ class FakeEngine:
                 await self.running.wait()
                 if step == 1 and prompt == "blocked":
                     await self.gate.wait()
+                if step == 1 and prompt == "engine-dead":
+                    from vllm.v1.engine.exceptions import EngineDeadError
+
+                    raise EngineDeadError()
                 if step == 1 and prompt == "failure":
                     raise RuntimeError("sensitive engine details")
                 if step == 1 and prompt == "truncated":
@@ -389,6 +393,31 @@ def test_engine_errors_are_terminal_and_sanitized(
         assert events[-1].get("context_limit_source") == context_limit_source
         assert not any(event["type"] == "completed" for event in events)
         assert "sensitive" not in str(events)
+
+    asyncio.run(exercise(check))
+
+
+@pytest.mark.parametrize("failure", ["actor", "engine"])
+def test_stream_death_quarantines_actor_for_both_apis(failure):
+    async def check(driver, pool, actor):
+        from vllm.v1.engine.exceptions import EngineDeadError
+
+        stream = driver.stream_generate("model", "first", "engine-dead", {"max_tokens": 3})
+        if failure == "actor":
+            ray.kill(actor)
+            death = ray.exceptions.ActorDiedError
+            with pytest.raises(death):
+                await anext(stream)
+        else:
+            death = EngineDeadError
+            events = [event async for event in stream]
+            assert events[-1]["code"] == "engine_error"
+
+        assert not pool._scheduler.is_worker_available(0)
+        with pytest.raises(death):
+            await asyncio.wait_for(driver.generate([1], {}, model_id="model"), 1)
+        with pytest.raises(death):
+            await asyncio.wait_for(anext(driver.stream_generate("model", "next", [1])), 1)
 
     asyncio.run(exercise(check))
 

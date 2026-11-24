@@ -1513,7 +1513,10 @@ class InferenceWorker(StreamingWorkerMixin):
         result["reasoning_token_ids"] = reasoning_token_ids
         result["content_token_ids"] = content_token_ids
 
-    def is_healthy(self) -> bool:
+    async def is_healthy(self) -> bool:
+        if self.llm is not None and self.state == WorkerLifecycleState.READY:
+            # Raises EngineDeadError once the engine core has died; the lifecycle state does not change.
+            await self.llm.check_health()
         return self.llm is not None and self.state in (
             WorkerLifecycleState.READY,
             WorkerLifecycleState.SLEEPING,

@@ -769,11 +769,16 @@ class EngineStream:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            # Imported here: clients load this module without vLLM.
+            from vllm.v1.engine.exceptions import EngineDeadError
+
             param = None
             if isinstance(exc, StreamError):
                 code = exc.code
                 context_limit_source = exc.context_limit_source
                 param = exc.param
+            elif isinstance(exc, EngineDeadError):
+                code, context_limit_source = "engine_dead", None
             else:
                 code, context_limit_source = classify_engine_error(exc)
             self.buffer.fail(
@@ -1235,6 +1240,8 @@ class ClientStream(AsyncIterator):
                     raise StreamError("scheduler_stopped")
                 self.worker = self.scheduler._take(self.request, stream=True)
                 if self.worker is None:
+                    if (death := self.scheduler._pool_error()) is not None:
+                        raise death()
                     await self.scheduler._wake.wait()
             self.submitted_at = time.time()
             self.registration = asyncio.ensure_future(
@@ -1297,6 +1304,11 @@ class ClientStream(AsyncIterator):
                 or not isinstance(event["param"], str)
             ):
                 raise StreamError("invalid_terminal_error")
+            if event["code"] == "engine_dead":
+                from vllm.v1.engine.exceptions import EngineDeadError
+
+                self.worker.quarantine(EngineDeadError)
+                event = {**event, "code": "engine_error"}
             result = await self.abort(event["code"])
             self.error_delivered = True
             if result["status"] == "cleanup_unconfirmed":
@@ -1395,7 +1407,8 @@ class ClientStream(AsyncIterator):
                     status = result["status"]
                     if status == "not_found":
                         status = "already_terminal"
-            except Exception:
+            except Exception as exc:
+                self.worker.record_death(exc)
                 status = "cleanup_unconfirmed"
         if self.remote_stream is not None:
             import ray

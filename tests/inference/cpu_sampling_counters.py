@@ -11,9 +11,11 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 for name in ('vllm', 'vllm.config', 'vllm.v1', 'vllm.v1.metrics',
-             'vllm.v1.metrics.loggers', 'vllm.v1.metrics.stats', 'ray'):
+             'vllm.v1.metrics.loggers', 'vllm.v1.metrics.stats',
+             'vllm.v1.engine', 'vllm.v1.engine.exceptions', 'ray'):
     sys.modules[name] = types.ModuleType(name)
 sys.modules['vllm.config'].VllmConfig = object
+sys.modules['vllm.v1.engine.exceptions'].EngineDeadError = type('EngineDeadError', (Exception,), {})
 sys.modules['vllm.v1.metrics.loggers'].StatLoggerBase = object
 for name in ('SchedulerStats', 'IterationStats', 'MultiModalCacheStats'):
     setattr(sys.modules['vllm.v1.metrics.stats'], name, object)
