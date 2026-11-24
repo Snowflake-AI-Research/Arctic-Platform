@@ -34,6 +34,7 @@ from pydantic import ConfigDict
 from pydantic import Field
 
 from arctic_platform.common.optimizer import OptimizerSettings
+from arctic_platform.debug.deepspeed_zero_initialization import maybe_trace_zero_initialization
 from arctic_platform.debug.training import maybe_cleanup_router_replay_on_failure
 from arctic_platform.debug.training import maybe_configure_router_replay_trace
 from arctic_platform.debug.weight_sync import maybe_configure_broadcast_training
@@ -292,12 +293,13 @@ def initialize_training_engine(
     import deepspeed
 
     init_kwargs = {"mpu": mpu} if mpu is not None else {}
-    if built is not None:
-        engine, built, _, _ = deepspeed.initialize(model=model, optimizer=built, config=ds_config, **init_kwargs)
-    else:
-        if ds_config.get("optimizer") is not None:
-            init_kwargs["model_parameters"] = model.parameters()
-        engine, built, _, _ = deepspeed.initialize(model=model, config=ds_config, **init_kwargs)
+    with maybe_trace_zero_initialization(ds_config, rank) as init_config:
+        if built is not None:
+            engine, built, _, _ = deepspeed.initialize(model=model, optimizer=built, config=init_config, **init_kwargs)
+        else:
+            if init_config.get("optimizer") is not None:
+                init_kwargs["model_parameters"] = model.parameters()
+            engine, built, _, _ = deepspeed.initialize(model=model, config=init_config, **init_kwargs)
     return engine, built, choice
 
 

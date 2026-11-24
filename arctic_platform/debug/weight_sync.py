@@ -142,6 +142,40 @@ def verify_sources(pins: dict[str, str]) -> None:
             raise RuntimeError(f"weight-sync source changed: {path}")
 
 
+@contextmanager
+def maybe_observe_weight_send(worker, weights):
+    """Observe a production-owned send without calling the transport."""
+    evidence = {}
+    if not enabled():
+        yield evidence
+        return
+    sender = worker._weight_sender
+    parameters = list(worker.engine.module.named_parameters())
+    if any(hasattr(value, "ds_id") for _, value in parameters):
+        raise ValueError("weight-sync evidence does not admit post-gather ZeRO3 tensor views")
+    if any(getattr(value, "allreduce", True) is False for _, value in parameters):
+        raise ValueError("a single sender cannot prove complete expert-parallel trainer holdings")
+    origins = source_files(type(sender).send, type(worker).get_weights)
+    manifest = {}
+    for name, value in weights:
+        if not isinstance(name, str) or not name or name in manifest:
+            raise ValueError("weight-sync names must be nonempty and unique")
+        manifest[name] = tensor_manifest(value)
+    verify_sources(origins)
+    yield evidence
+    verify_sources(origins)
+    if manifest != {name: tensor_manifest(value) for name, value in weights}:
+        raise RuntimeError("actually sent tensors changed during weight sync")
+    evidence.update(
+        sent_manifest=manifest,
+        trainer_parameters={
+            "numel": sum(value.numel() for _, value in parameters),
+            "count": len(parameters),
+        },
+        evidence_sources=origins,
+    )
+
+
 def maybe_annotate_weight_sync_result(result, evidence):
     if not evidence:
         return result
