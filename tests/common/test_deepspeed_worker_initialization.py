@@ -69,6 +69,20 @@ def test_expert_parallel_worker_builds_the_moe_spec_and_splits_expert_groups(mon
     pytest.importorskip("ray")
     pytest.importorskip("deepspeed")
     from arctic_platform.common import deepspeed_worker as mod
+    from arctic_platform.model.parallel import groups
+
+    ep, sp, mpu = object(), object(), object()
+    monkeypatch.setattr(
+        mod.dist, "all_gather_object", lambda output, host: output.__setitem__(slice(None), [host] * 8)
+    )
+    monkeypatch.setattr(groups, "expert_parallel_group", lambda size: ep)
+
+    def setup(sp_size, ep_size, **kwargs):
+        assert ep_size == 8
+        assert kwargs["world_size"] == 8
+        return groups.SPGroups(mpu if sp_size > 1 else None, sp if sp_size > 1 else None, sp_size, 0)
+
+    monkeypatch.setattr(groups, "setup_parallel_groups", setup)
 
     model_path = tmp_path / "glm5_next"
     model_path.mkdir()
@@ -81,11 +95,12 @@ def test_expert_parallel_worker_builds_the_moe_spec_and_splits_expert_groups(mon
     monkeypatch.setattr(mod, "pr0", lambda *args: None)
     monkeypatch.setattr(worker, "ds_training_config", lambda *args: {"train_micro_batch_size_per_gpu": 1})
 
-    def build(spec):
+    def build(spec, *, parallel_groups):
         # Spec validation imports kernels that query the real device, so fake it only afterwards.
         monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
         monkeypatch.setattr(torch.cuda, "get_device_properties", lambda gpu: SimpleNamespace(uuid="test"))
         observed["spec"] = spec
+        assert parallel_groups == {"ep_group": ep, "sp_group": None}
         return SimpleNamespace(model=model)
 
     def initialize(model, ds_config, **kwargs):
@@ -106,13 +121,14 @@ def test_expert_parallel_worker_builds_the_moe_spec_and_splits_expert_groups(mon
                 "model_provider": "prime_rl",
                 "attn_implementation": "sparse_mla",
                 "ep_size": 8,
-                "sp_size": 8,
+                "sp_size": 1,
             },
         },
     )
 
     assert observed["spec"].loader == "glm5_next"
-    assert observed["spec"].parallelism.expert_parallel == observed["spec"].parallelism.sequence_parallel == 8
+    assert observed["spec"].parallelism.expert_parallel == 8
+    assert observed["spec"].parallelism.sequence_parallel == 1
     assert observed["engine"]["ep_size"] == 8
     assert observed["engine"]["mpu"] is None
     assert observed["ds_config"]["train_batch_size"] == 8

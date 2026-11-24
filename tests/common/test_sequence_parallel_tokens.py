@@ -1,0 +1,818 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Synthetic token-domain controls and tiny native ZeRO2 reduction parity."""
+
+import math
+import os
+import sys
+from copy import deepcopy
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from arctic_platform.model.implementations.gpu.sp import utils as sp
+from arctic_platform.testing_utils import TestCasePlus
+from arctic_platform.testing_utils import execute_subprocess_async
+from arctic_platform.testing_utils import require_deepspeed
+from arctic_platform.testing_utils import require_torch_multi_gpu
+from arctic_platform.testing_utils import set_seed
+from arctic_platform.testing_utils import torch_assert_close
+from arctic_platform.testing_utils import torch_assert_equal
+
+
+def _info(rank=2, ranks=(2, 0), world=4):
+    return {
+        "rank": rank,
+        "world_size": world,
+        "sp_size": len(ranks),
+        "sp_rank": ranks.index(rank),
+        "sp_ranks": list(ranks),
+    }
+
+
+def _batch():
+    return {
+        "input_ids": torch.tensor([[1, 2, 3, 0, 0], [4, 5, 6, 7, 8]]),
+        "attention_mask": torch.tensor([[1, 1, 1, 0, 0], [1, 1, 1, 1, 1]]),
+        "loss_mask": torch.tensor([[1, 1, 0, 0, 0], [1, 1, 1, 1, 0]], dtype=torch.float32),
+        "advantages": torch.ones(2, 5),
+        "routed_experts": torch.arange(2 * 5 * 3 * 2).reshape(2, 5, 3, 2),
+    }
+
+
+def test_token_partition_aligns_cross_slice_target_before_packing():
+    source = _batch()
+    original = deepcopy(source)
+    local, packed, mask, cu, part = sp.prepare_token_partition(source, sp_info=_info())
+    assert (part.start, part.stop, part.rank, part.ranks) == (0, 4, 2, (2, 0))
+    torch_assert_equal(local["input_ids"], torch.tensor([[1, 2, 3, 4]]))
+    # Token 4 predicts 5, which belongs to the next rank, not token 1.
+    torch_assert_equal(local["labels"], torch.tensor([[2, 3, -100, 5]]))
+    torch_assert_equal(packed["labels"], torch.tensor([[2, 3, -100, 5, 6, 7, 8, -100]]))
+    torch_assert_equal(cu, torch.tensor([0, 3, 8], dtype=torch.int32))
+    assert int(mask.sum()) == 8
+    assert set(source) == set(original)
+    for name in source:
+        torch_assert_equal(source[name], original[name])
+
+
+@pytest.mark.parametrize("rank", [2, 0])
+def test_token_partition_aligns_odd_length_with_ignored_separate_document(rank):
+    source = _batch()
+    source["attention_mask"][1, 4] = 0
+    source["loss_mask"][1, 3] = 0
+    original = deepcopy(source)
+    local, packed, mask, cu, part = sp.prepare_token_partition(source, sp_info=_info(rank=rank))
+    assert part.token_count == 7 and part.width == 4
+    assert packed["input_ids"].shape == (1, 7)
+    torch_assert_equal(cu, torch.tensor([0, 3, 7], dtype=torch.int32))
+    if rank == 0:
+        torch_assert_equal(local["position_ids"], torch.tensor([[1, 2, 3, 0]]))
+        torch_assert_equal(local["labels"], torch.tensor([[6, 7, -100, -100]]))
+        assert local["loss_mask"][0, -1] == 0
+        assert local["routed_experts"][0, -1].count_nonzero() == 0
+    restored = sp.restore_token_rows(packed["input_ids"], mask)
+    torch_assert_equal(restored[mask], source["input_ids"][mask])
+    for name in source:
+        torch_assert_equal(source[name], original[name])
+
+
+def test_token_partition_pads_completely_empty_local_slice():
+    batch = dict(input_ids=torch.tensor([[2]]), attention_mask=torch.ones(1, 1, dtype=torch.long))
+    local, packed, _, cu, part = sp.prepare_token_partition(batch, sp_info=_info(rank=0))
+    assert part.width == 1 and packed["input_ids"].shape == (1, 1)
+    torch_assert_equal(local["input_ids"], torch.tensor([[0]]))
+    torch_assert_equal(local["labels"], torch.tensor([[-100]]))
+    torch_assert_equal(local["position_ids"], torch.tensor([[0]]))
+    torch_assert_equal(cu, torch.tensor([0, 1], dtype=torch.int32))
+
+
+def test_token_partition_accepts_prediction_aligned_primerl_response_masks():
+    source = _batch()
+    # prime_rl.arctic.context rolls each rollout's response mask left and clears its final position.
+    current_masks = [torch.tensor([False, False, True]), torch.tensor([False, False, True, True, True])]
+    masks = torch.zeros_like(source["attention_mask"], dtype=torch.bool)
+    for row, current in enumerate(current_masks):
+        shifted = torch.roll(current, shifts=-1)
+        shifted[-1] = False
+        masks[row, : current.numel()] = shifted
+    source["loss_mask"] = masks
+    source["old_log_probs_shifted"] = torch.zeros_like(masks, dtype=torch.float32)
+    source["teacher_log_probs_shifted"] = torch.zeros_like(masks, dtype=torch.float32)
+    local, packed, mask, _, part = sp.prepare_token_partition(source, sp_info=_info())
+    torch_assert_equal(packed["loss_mask"], masks[mask].unsqueeze(0))
+    torch_assert_equal(local["loss_mask"], packed["loss_mask"][:, part.start : part.stop])
+    assert not bool((packed["loss_mask"] & (packed["labels"] == -100)).any())
+
+
+def test_token_partition_slices_router_layers_without_flattening_or_duplicate_rows():
+    source = _batch()
+    local, _, mask, _, part = sp.prepare_token_partition(source, sp_info=_info(rank=0))
+    assert (part.start, part.stop) == (4, 8)
+    torch_assert_equal(local["routed_experts"], source["routed_experts"][mask][4:].unsqueeze(0))
+    assert local["routed_experts"].shape == (1, 4, 3, 2)
+    torch_assert_equal(local["position_ids"], torch.tensor([[1, 2, 3, 4]]))
+
+
+def test_token_partition_preserves_explicit_prediction_targets_and_packed_document_resets():
+    source = _batch()
+    source["labels"] = torch.tensor([[9, 10, -100, -100, -100], [11, 12, 13, 14, -100]])
+    source["position_ids"] = torch.tensor([[0, 1, 2, 0, 0], [0, 1, 0, 1, 2]])
+    local, packed, _, cu, _ = sp.prepare_token_partition(source, sp_info=_info(rank=0))
+    torch_assert_equal(local["labels"], torch.tensor([[12, 13, 14, -100]]))
+    torch_assert_equal(packed["position_ids"], torch.tensor([[0, 1, 2, 0, 1, 0, 1, 2]]))
+    torch_assert_equal(cu, torch.tensor([0, 3, 5, 8], dtype=torch.int32))
+
+
+@pytest.mark.parametrize(
+    "positions,masked_target,expected_labels,expected_cu",
+    [
+        (
+            [[0, 1, 0, 0, 0], [0, 1, 2, 3, 4]],
+            (0, 1),
+            [2, -100, -100, 5, 6, 7, 8, -100],
+            [0, 2, 3, 8],
+        ),
+        (
+            [[0, 1, 2, 0, 0], [0, 0, 1, 2, 3]],
+            (1, 0),
+            [2, 3, -100, -100, 6, 7, 8, -100],
+            [0, 3, 4, 8],
+        ),
+        (
+            [[0, 1, 2, 0, 0], [0, 1, 0, 1, 2]],
+            (1, 1),
+            [2, 3, -100, 5, -100, 7, 8, -100],
+            [0, 3, 5, 8],
+        ),
+    ],
+    ids=["inside-first-slice", "at-slice-boundary", "inside-second-slice"],
+)
+@pytest.mark.parametrize("rank", [2, 0])
+def test_token_generated_labels_stop_at_document_reset(rank, positions, masked_target, expected_labels, expected_cu):
+    source = _batch()
+    source["position_ids"] = torch.tensor(positions)
+    source["loss_mask"][masked_target] = 0
+    original = deepcopy(source)
+    local, packed, mask, cu, part = sp.prepare_token_partition(source, sp_info=_info(rank=rank))
+    labels = torch.tensor([expected_labels])
+    torch_assert_equal(packed["labels"], labels)
+    torch_assert_equal(local["labels"], labels[:, part.start : part.stop])
+    torch_assert_equal(cu, torch.tensor(expected_cu, dtype=torch.int32))
+    torch_assert_equal(packed["input_ids"], source["input_ids"][mask].unsqueeze(0))
+    torch_assert_equal(packed["routed_experts"], source["routed_experts"][mask].unsqueeze(0))
+    assert set(source) == set(original)
+    for name in original:
+        torch_assert_equal(source[name], original[name])
+
+
+@pytest.mark.parametrize("reset_column", [1, 2])
+def test_token_generated_labels_reject_active_loss_across_document_reset(reset_column):
+    source = _batch()
+    source["position_ids"] = torch.tensor([[0, 1, 2, 0, 0], [0, 1, 2, 3, 4]])
+    source["position_ids"][1, reset_column:] -= reset_column
+    original = deepcopy(source)
+    with pytest.raises(ValueError, match="active loss positions need valid next-token targets"):
+        sp.prepare_token_partition(source, sp_info=_info())
+    assert "labels" not in source
+    for name in original:
+        torch_assert_equal(source[name], original[name])
+
+
+@pytest.mark.parametrize("fault", ["shape", "dtype", "negative"])
+def test_token_generated_labels_validate_reset_positions_before_target_generation(fault):
+    source = _batch()
+    source["position_ids"] = torch.tensor([[0, 1, 2, 0, 0], [0, 1, 0, 1, 2]])
+    if fault == "shape":
+        source["position_ids"] = source["position_ids"][:, :1]
+    elif fault == "dtype":
+        source["position_ids"] = source["position_ids"].float()
+    else:
+        source["position_ids"][1, 2] = -1
+    original = deepcopy(source)
+    with pytest.raises(ValueError):
+        sp.prepare_token_partition(source, sp_info=_info())
+    assert "labels" not in source
+    for name in original:
+        torch_assert_equal(source[name], original[name])
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "sampler_kl_weights",
+        "sft_mask",
+        "nll_mask",
+        "echo_observation_mask",
+        "echo_observation_token_counts",
+        "prompt_group_ids",
+        "prompt_token_counts",
+    ],
+)
+def test_token_partition_names_unsupported_optional_grpo_fields(field):
+    source = _batch()
+    source[field] = torch.ones(2, 5)
+    with pytest.raises(ValueError, match=f"undeclared SP token fields:.*{field}"):
+        sp.prepare_token_partition(source, sp_info=_info())
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["unknown", "left_padding", "empty_row", "nonbinary", "shape", "dtype", "active_end", "active_pad"],
+)
+def test_token_partition_rejects_unsupported_domains_without_input_mutation(fault):
+    source = _batch()
+    if fault == "unknown":
+        source["undeclared"] = torch.ones(2, 5)
+    elif fault == "left_padding":
+        source["attention_mask"][0] = torch.tensor([0, 1, 1, 1, 0])
+    elif fault == "empty_row":
+        source["attention_mask"][0].zero_()
+    elif fault == "nonbinary":
+        source["attention_mask"][0, 0] = 2
+    elif fault == "shape":
+        source["advantages"] = torch.ones(2)
+    elif fault == "dtype":
+        source["position_ids"] = torch.zeros(2, 5)
+    elif fault == "active_end":
+        source["loss_mask"][0, 2] = 1
+    else:
+        source["loss_mask"][0, 4] = 1
+    original = deepcopy(source)
+    with pytest.raises(ValueError):
+        sp.prepare_token_partition(source, sp_info=_info())
+    for name in source:
+        torch_assert_equal(source[name], original[name])
+
+
+@pytest.mark.parametrize("fault", ["bool_rank", "local", "order", "duplicate", "world"])
+def test_token_partition_rejects_false_rank_or_membership_binding(fault):
+    info = _info()
+    if fault == "bool_rank":
+        info["rank"] = True
+    elif fault == "local":
+        info["sp_rank"] = 1
+    elif fault == "order":
+        info["sp_ranks"].reverse()
+    elif fault == "duplicate":
+        info["sp_ranks"] = [2, 2]
+    else:
+        info["world_size"] = 3
+    with pytest.raises(ValueError):
+        sp.prepare_token_partition(_batch(), sp_info=info)
+
+
+def test_restore_token_rows_restores_padding_with_gradient():
+    assembled = torch.arange(8.0).reshape(1, 8, 1).requires_grad_()
+    _, _, mask, _, _ = sp.prepare_token_partition(_batch(), sp_info=_info())
+    restored = sp.restore_token_rows(assembled, mask)
+    torch_assert_equal(restored[:, :, 0], torch.tensor([[0.0, 1.0, 2.0, 0.0, 0.0], [3.0, 4.0, 5.0, 6.0, 7.0]]))
+    restored.sum().backward()
+    torch_assert_equal(assembled.grad, torch.ones_like(assembled))
+
+
+@pytest.mark.parametrize("shape", [(8,), (2, 4), (1, 7), (1, 9)])
+def test_restore_token_rows_rejects_incomplete_logical_rows(shape):
+    _, _, mask, _, _ = sp.prepare_token_partition(_batch(), sp_info=_info())
+    with pytest.raises(ValueError):
+        sp.restore_token_rows(torch.ones(shape), mask)
+
+
+class _Engine:
+    global_rank = 2
+
+    def __init__(self):
+        self.calls = []
+        self.backward_calls = []
+        self.weight = torch.arange(9 * 4, dtype=torch.float32).reshape(9, 4) / 40
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
+    def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        ids = kwargs["input_ids"]
+        logits = torch.nn.functional.one_hot(ids % 4, 4).float() @ self.weight.T
+        return {"logits": logits / kwargs.get("temperature", 1.0)}
+
+    def backward(self, loss, *, scale_wrt_gas):
+        self.backward_calls.append((loss.detach().clone(), scale_wrt_gas))
+
+
+def _live_group(monkeypatch, part):
+    group = object()
+    monkeypatch.setattr(sp.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(sp.dist, "get_rank", lambda group=None: part.rank if group is None else part.local_rank)
+    monkeypatch.setattr(sp.dist, "get_world_size", lambda group=None: part.world_size)
+    monkeypatch.setattr(sp.dist, "get_process_group_ranks", lambda group: list(part.ranks))
+    return group
+
+
+@pytest.mark.parametrize("temperature", [1.0, 0.7])
+@pytest.mark.parametrize("loss_sp_size", [1, 2])
+def test_token_local_pipeline_calls_model_once_and_preserves_full_logical_loss(monkeypatch, temperature, loss_sp_size):
+    from arctic_platform.rl.processors import functional
+    from arctic_platform.rl.processors import run_pipeline
+    from arctic_platform.rl.processors.compute_logprobs import compute_logprobs_post
+
+    # A native loss SP group must not add a differentiable reduction to this token-level objective.
+    monkeypatch.setattr(functional.groups, "_get_sequence_parallel_world_size", lambda: loss_sp_size)
+    monkeypatch.setattr(functional.groups, "_get_sequence_parallel_group", lambda: object())
+    monkeypatch.setattr(
+        functional, "_sequence_parallel_sum", lambda *args, **kwargs: pytest.fail("replicated loss reduced again")
+    )
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
+    source = _batch()
+    _, packed, mask, cu, part = sp.prepare_token_partition(source, sp_info=_info())
+    group = _live_group(monkeypatch, part)
+    baseline_engine = _Engine()
+    baseline = run_pipeline(
+        baseline_engine,
+        (),
+        packed,
+        {"cu_seqlens": cu, "dp_size": 2, "temperature": temperature},
+        {"post": ["compute_logprobs"], "loss_fn": "grpo", "config": {"loss_agg_mode": "token-mean"}},
+        "cpu",
+        pack=False,
+        backward=False,
+        return_tensors=True,
+    )
+    peer_logits = _Engine()(**{"input_ids": packed["input_ids"][:, 4:], "temperature": temperature})
+    peer_batch = {"labels": packed["labels"][:, 4:]}
+    peer_logprobs = compute_logprobs_post(peer_logits, peer_batch, {}, "cpu")["logprobs"]
+    gather_calls = []
+
+    def gather(value, *, group):
+        gather_calls.append((value.clone(), group))
+        return (value, peer_logprobs)
+
+    monkeypatch.setattr(sp.dist_nn, "all_gather", gather)
+    engine = _Engine()
+    result = sp.run_sequence_parallel_grpo(
+        engine,
+        source,
+        {"dp_size": 2, "temperature": temperature},
+        {"post": ["compute_logprobs"], "loss_fn": "grpo", "config": {"loss_agg_mode": "token-mean"}},
+        "cpu",
+        sp_info=_info(),
+        sp_group=group,
+    )
+    assert len(engine.calls) == len(gather_calls) == len(engine.backward_calls) == 1
+    assert engine.calls[0]["temperature"] == temperature
+    torch_assert_equal(engine.calls[0]["input_ids"], packed["input_ids"][:, :4])
+    torch_assert_equal(engine.calls[0]["labels"], packed["labels"][:, :4])
+    torch_assert_equal(engine.calls[0]["routed_experts"], packed["routed_experts"][:, :4])
+    assert gather_calls[0][0].shape == (1, 4)  # No full-vocabulary gather.
+    assert result["avg_loss"] == baseline["avg_loss"]
+    assert result["metrics"] == baseline["metrics"]
+    torch_assert_close(engine.backward_calls[0][0], torch.tensor(result["avg_loss"] / 2), rtol=0, atol=0)
+    assert engine.backward_calls[0][1] is False
+    torch_assert_equal(result["batch"]["logprobs"], sp.restore_token_rows(baseline["batch"]["logprobs"], mask))
+
+
+@pytest.mark.parametrize("difference", ["loss_scales", "processing", "meta"])
+def test_sp_signature_includes_request_loss_inputs(monkeypatch, difference):
+    group = object()
+    signatures = []
+    monkeypatch.setattr(sp.dist, "all_reduce", lambda *args, **kwargs: None)
+
+    def gather(outputs, signature, group):
+        if not signatures:
+            signatures.append(signature.clone())
+        for output in outputs:
+            output.copy_(signatures[0])
+
+    monkeypatch.setattr(sp.dist, "all_gather", gather)
+    meta = dict(dp_size=2, temperature=1.0)
+    processing = dict(post=["compute_logprobs"], loss_fn="grpo", config=dict(loss_agg_mode="token-mean"))
+    scales = [1.0]
+    arguments = dict(
+        sp_info=_info(),
+        synchronize=True,
+        device="cpu",
+        meta=meta,
+        processing=processing,
+        loss_scales=scales,
+        sp_group=group,
+    )
+    sp.validate_sequence_parallel_microbatches([_batch()], **arguments)
+    if difference == "loss_scales":
+        scales[0] = 0.25
+    elif difference == "processing":
+        processing["config"]["entropy_coeff"] = 0.01
+    else:
+        meta["temperature"] = 0.7
+    with pytest.raises(ValueError, match="identical token rows and loss inputs"):
+        sp.validate_sequence_parallel_microbatches([_batch()], **arguments)
+
+
+def test_sp_signature_failure_has_request_context_and_reaches_flag_reduce(monkeypatch):
+    reductions = []
+    monkeypatch.setattr(sp.dist, "all_reduce", lambda flag, **kwargs: reductions.append(flag.item()))
+    monkeypatch.setattr(sp.json, "dumps", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("hash failed")))
+    with pytest.raises(RuntimeError, match="SP request: hash failed"):
+        sp.validate_sequence_parallel_microbatches(
+            [_batch()], sp_info=_info(), synchronize=True, device="cpu", sp_group=object()
+        )
+    assert reductions == [1]
+
+
+def test_sp_signature_accepts_scalar_tensor_metadata():
+    batch = _batch()
+    plain = sp._request_signature([batch], dict(calculate_entropy=False), {}, [1.0], "cpu")
+    tensor = sp._request_signature([batch], dict(calculate_entropy=torch.tensor([False])), {}, [1.0], "cpu")
+    assert torch.equal(plain, tensor)
+
+
+def test_sp_tensor_signature_does_not_copy_payload_to_host(monkeypatch):
+    batch = _batch()
+    monkeypatch.setattr(torch.Tensor, "cpu", lambda *args, **kwargs: pytest.fail("host payload copy"))
+    signature = sp._request_signature([batch], {}, {}, [1.0], "cpu")
+    batch["routed_experts"][0, 0, 0, 0] += 1
+    assert signature.shape == (56,)
+    assert not torch.equal(signature, sp._request_signature([batch], {}, {}, [1.0], "cpu"))
+
+
+def test_token_partition_rejects_missing_document_boundary_at_later_row():
+    batch = _batch()
+    batch["position_ids"] = torch.tensor([[0, 1, 2, 0, 0], [0, 1, 2, 3, 4]])
+    batch["position_ids"][1, 0] = 1
+    with pytest.raises(ValueError, match="every row must begin"):
+        sp.prepare_token_partition(batch, sp_info=_info())
+
+
+@pytest.mark.parametrize("backward", [True, False])
+@pytest.mark.parametrize("scale", [0.0, 0.25, 1.0])
+def test_sp_execution_token_loss_scale_changes_only_backward(monkeypatch, backward, scale):
+    from arctic_platform.rl.processors import functional
+    from arctic_platform.rl.processors.compute_logprobs import compute_logprobs_post
+
+    monkeypatch.setattr(functional.groups, "_get_sequence_parallel_world_size", lambda: 1)
+    source = _batch()
+    _, packed, _, _, part = sp.prepare_token_partition(source, sp_info=_info())
+    group = _live_group(monkeypatch, part)
+    peer = compute_logprobs_post(
+        _Engine()(input_ids=packed["input_ids"][:, 4:]), {"labels": packed["labels"][:, 4:]}, {}, "cpu"
+    )["logprobs"]
+    monkeypatch.setattr(sp.dist_nn, "all_gather", lambda value, *, group: (value, peer))
+    engine = _Engine()
+    result = sp.run_sequence_parallel_grpo(
+        engine,
+        source,
+        {"dp_size": 2},
+        {"post": ["compute_logprobs"], "loss_fn": "grpo", "config": {"loss_agg_mode": "token-mean"}},
+        "cpu",
+        sp_info=_info(),
+        sp_group=group,
+        backward=backward,
+        loss_scale=scale,
+    )
+    assert len(engine.calls) == 1
+    assert "loss_tensor" not in result
+    assert math.isfinite(result["avg_loss"])
+    assert result["avg_loss"] != 0
+    assert result["batch"]["logprobs"].shape == source["input_ids"].shape
+    if backward:
+        assert len(engine.backward_calls) == 1
+        loss, gas_scale = engine.backward_calls[0]
+        torch_assert_equal(loss, torch.tensor(result["avg_loss"] * scale / 2))
+        assert gas_scale is False
+    else:
+        assert not engine.backward_calls
+
+
+@pytest.mark.parametrize("scale", [True, -1.0, float("inf"), float("nan")])
+def test_sp_execution_rejects_invalid_loss_scale_before_model(monkeypatch, scale):
+    part = sp.prepare_token_partition(_batch(), sp_info=_info())[-1]
+    group = _live_group(monkeypatch, part)
+    engine = _Engine()
+    with pytest.raises(ValueError, match="packed loss scale"):
+        sp.run_sequence_parallel_grpo(
+            engine,
+            _batch(),
+            {"dp_size": 2},
+            {"post": ["compute_logprobs"], "loss_fn": "grpo"},
+            "cpu",
+            sp_info=_info(),
+            sp_group=group,
+            loss_scale=scale,
+        )
+    assert not engine.calls
+    assert not engine.backward_calls
+
+
+def test_sp_execution_rejects_configured_dp_scale_mismatch_before_model(monkeypatch):
+    part = sp.prepare_token_partition(_batch(), sp_info=_info())[-1]
+    group = _live_group(monkeypatch, part)
+    engine = _Engine()
+    with pytest.raises(ValueError, match="logical-DP membership"):
+        sp.run_sequence_parallel_grpo(
+            engine,
+            _batch(),
+            {"dp_size": 2},
+            {"post": ["compute_logprobs"], "loss_fn": "grpo", "config": {"dp_size": 4}},
+            "cpu",
+            sp_info=_info(),
+            sp_group=group,
+        )
+    assert not engine.calls
+
+
+def _selected_sp_reducer(monkeypatch):
+    from deepspeed.runtime.zero import stage_1_and_2
+
+    class SelectedZero:
+        pass
+
+    monkeypatch.setattr(stage_1_and_2, "DeepSpeedZeroOptimizer", SelectedZero)
+    info = _info()
+    group, dp_group = object(), object()
+    sp_group = group
+    monkeypatch.setattr(sp.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(sp.dist, "get_rank", lambda group=None: 2 if group in (None, dp_group) else 0)
+    monkeypatch.setattr(sp.dist, "get_world_size", lambda group=None: 2 if group is sp_group else 4)
+    monkeypatch.setattr(
+        sp.dist,
+        "get_process_group_ranks",
+        lambda group: list(info["sp_ranks"]) if group is sp_group else list(range(4)),
+    )
+    optimizer = SelectedZero()
+    optimizer.sequence_parallel_size = 2
+    optimizer.partition_gradients = True
+    optimizer.reduce_scatter = True
+    optimizer.postscale_gradients = True
+    optimizer.gradient_average = True
+    optimizer.gradient_predivide_factor = 1.0
+    optimizer.dp_process_group = dp_group
+    engine = SimpleNamespace(
+        optimizer=optimizer,
+        sequence_parallel_size=2,
+        seq_data_parallel_group=dp_group,
+        zero_optimization_stage=lambda: 2,
+    )
+    return engine, info, group
+
+
+def test_sp_execution_selected_reducer_binds_dense_sequence_data_group(monkeypatch):
+    engine, info, group = _selected_sp_reducer(monkeypatch)
+    sp.verify_sequence_parallel_reduction(engine, sp_info=info, sp_group=group)
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "class",
+        "stage",
+        "engine_sp",
+        "optimizer_sp",
+        "partition",
+        "scatter",
+        "postscale",
+        "sum",
+        "predivide",
+        "group",
+        "members",
+    ],
+)
+def test_sp_execution_rejects_unselected_reducer_or_group_settings(monkeypatch, fault):
+    engine, info, group = _selected_sp_reducer(monkeypatch)
+    optimizer = engine.optimizer
+    if fault == "class":
+        engine.optimizer = SimpleNamespace(**vars(optimizer))
+    elif fault == "stage":
+        engine.zero_optimization_stage = lambda: 1
+    elif fault == "engine_sp":
+        engine.sequence_parallel_size = 1
+    elif fault == "optimizer_sp":
+        optimizer.sequence_parallel_size = 1
+    elif fault == "partition":
+        optimizer.partition_gradients = False
+    elif fault == "scatter":
+        optimizer.reduce_scatter = False
+    elif fault == "postscale":
+        optimizer.postscale_gradients = False
+    elif fault == "sum":
+        optimizer.gradient_average = False
+    elif fault == "predivide":
+        optimizer.gradient_predivide_factor = 2.0
+    elif fault == "group":
+        optimizer.dp_process_group = object()
+    else:
+        monkeypatch.setattr(
+            sp.dist,
+            "get_process_group_ranks",
+            lambda selected: list(info["sp_ranks"]) if selected is group else [0, 2],
+        )
+    with pytest.raises(ValueError, match="native ZeRO2"):
+        sp.verify_sequence_parallel_reduction(engine, sp_info=info, sp_group=group)
+
+
+@pytest.mark.parametrize("fault", ["post", "loss", "aggregation", "entropy", "meta_token", "dp", "group"])
+def test_token_local_pipeline_rejects_unsupported_route_before_model(monkeypatch, fault):
+    part = sp.prepare_token_partition(_batch(), sp_info=_info())[-1]
+    group = _live_group(monkeypatch, part)
+    processing = {"post": ["compute_logprobs"], "loss_fn": "grpo", "config": {"loss_agg_mode": "token-mean"}}
+    meta = {"dp_size": 2}
+    if fault == "post":
+        processing["post"] = ["ap_compute_logprobs"]
+    elif fault == "loss":
+        processing["loss_fn"] = "sft_ce"
+    elif fault == "aggregation":
+        processing["config"]["loss_agg_mode"] = "seq-mean-token-mean"
+    elif fault == "entropy":
+        meta["calculate_entropy"] = True
+    elif fault == "meta_token":
+        meta["advantages"] = torch.ones(2, 5)
+    elif fault == "dp":
+        meta["dp_size"] = 4
+    else:
+        monkeypatch.setattr(sp.dist, "get_process_group_ranks", lambda group: [0, 2])
+    engine = _Engine()
+    with pytest.raises(ValueError):
+        sp.run_sequence_parallel_grpo(
+            engine,
+            _batch(),
+            meta,
+            processing,
+            "cpu",
+            sp_info=_info(),
+            sp_group=group,
+        )
+    assert engine.calls == []
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"importance_sampling_level": "sequence"},
+        {"m2_threshold": 0.1},
+        {"ratio_m2_threshold": 0.1},
+        {"ratio_seq_mask": True},
+        {"aux_ce_weight": 0},
+        {"echo_global_num_sequences": 4},
+        {"dp_size": True},
+        {"dp_size": 0},
+        {"dp_size": 1.5},
+    ],
+)
+def test_sp_rejects_sequence_level_and_echo_loss_config_before_dispatch(config):
+    with pytest.raises(ValueError, match="token-level|positive integer"):
+        sp.validate_sequence_parallel_grpo(
+            {}, dict(post=["compute_logprobs"], loss_fn="grpo", config=config), backward=True
+        )
+
+
+class TestNativeSequenceParallelReduction(TestCasePlus):
+    @require_deepspeed
+    @require_torch_multi_gpu
+    def test_grpo_loss_gradients_and_norm_match_unpartitioned_reference(self):
+        if torch.cuda.device_count() < 4:
+            self.skipTest("native SP2/DP2 and SP4/DP1 parity requires four CUDA devices")
+        for size, odd in ((2, False), (4, False), (2, True), (4, True)):
+            env = self.get_env()
+            env["NATIVE_SP_SIZE"] = str(size)
+            env["NATIVE_SP_ODD"] = str(int(odd))
+            execute_subprocess_async(
+                [
+                    sys.executable,
+                    "-m",
+                    "torch.distributed.run",
+                    "--standalone",
+                    "--nproc-per-node=4",
+                    __file__,
+                    "--native-sp-parity",
+                ],
+                env=env,
+                timeout=180,
+            )
+
+
+def _native_sequence_parallel_parity():
+    import deepspeed
+    from deepspeed.utils import safe_get_full_grad
+
+    from arctic_platform.model.parallel.groups import setup_parallel_groups
+    from arctic_platform.rl.processors import run_pipeline
+
+    rank = int(os.environ["RANK"])
+    size = int(os.environ["NATIVE_SP_SIZE"])
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    deepspeed.init_distributed("nccl", auto_mpi_discovery=False)
+    world = sp.dist.get_world_size()
+    assert world == 4 and size in (2, 4)
+    mpu, group, _, local_rank = setup_parallel_groups(size, 1, world_size=world, gpus_per_node=4)
+    ranks = sp.dist.get_process_group_ranks(group)
+    info = dict(rank=rank, world_size=world, sp_size=size, sp_rank=local_rank, sp_ranks=ranks)
+
+    class TinyPolicy(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.projection = torch.nn.Linear(4, 8)
+
+        def forward(self, input_ids, **kwargs):
+            hidden = torch.nn.functional.one_hot(input_ids % 4, 4).float()
+            return dict(logits=self.projection(hidden))
+
+        def backward(self, loss, *, scale_wrt_gas):
+            assert scale_wrt_gas is False
+            loss.backward()
+
+    set_seed(11)
+    model = TinyPolicy().cuda()
+    reference = deepcopy(model)
+    engine, *_ = deepspeed.initialize(
+        model=model,
+        optimizer=torch.optim.AdamW(model.parameters(), lr=0.001),
+        mpu=mpu,
+        config=dict(
+            train_micro_batch_size_per_gpu=1,
+            gradient_accumulation_steps=1,
+            gradient_clipping=0,
+            zero_allow_untested_optimizer=True,
+            zero_optimization=dict(stage=2, reduce_scatter=True),
+        ),
+    )
+    sp.verify_sequence_parallel_reduction(engine, sp_info=info, sp_group=group)
+    engine.set_gradient_accumulation_boundary(True)
+    full = dict(
+        input_ids=torch.tensor([[1, 2, 3, 4], [5, 6, 7, 1], [2, 4, 6, 7], [3, 5, 1, 2]], device="cuda"),
+        attention_mask=torch.ones(4, 4, dtype=torch.long, device="cuda"),
+        loss_mask=torch.tensor([[1, 1, 1, 0]] * 4, device="cuda"),
+        advantages=torch.tensor([[0.5] * 4, [1.0] * 4, [1.5] * 4, [2.0] * 4], device="cuda"),
+        old_log_probs_shifted=torch.full((4, 4), -2.0, device="cuda"),
+    )
+    odd = os.environ.get("NATIVE_SP_ODD") == "1"
+    if odd:
+        full["attention_mask"][0, 3] = 0
+        full["attention_mask"][2, 2:] = 0
+        full["loss_mask"][0, 2:] = 0
+        full["loss_mask"][2, 1:] = 0
+    active_tokens = int(full["loss_mask"].sum().item())
+    singleton = dict(rank=0, world_size=1, sp_size=1, sp_rank=0, sp_ranks=[0])
+    _, packed, _, cu, _ = sp.prepare_token_partition(full, sp_info=singleton)
+    processing = dict(post=["compute_logprobs"], loss_fn="grpo", config=dict(loss_agg_mode="token-mean"))
+    baseline = run_pipeline(
+        reference,
+        (),
+        packed,
+        dict(cu_seqlens=cu, dp_size=1, batch_num_tokens=active_tokens),
+        processing,
+        "cuda",
+        pack=False,
+        backward=True,
+    )
+    dp_size = world // size
+    replica = ranks[0] // size
+    rows = 4 // dp_size
+    batch = {name: value[replica * rows : (replica + 1) * rows] for name, value in full.items()}
+    candidate = sp.run_sequence_parallel_grpo(
+        engine,
+        batch,
+        dict(dp_size=dp_size, batch_num_tokens=active_tokens),
+        processing,
+        "cuda",
+        sp_info=info,
+        sp_group=group,
+    )
+    averaged_loss = torch.tensor(candidate["avg_loss"] / world, device="cuda")
+    sp.dist.all_reduce(averaged_loss)
+    # FP32 GEMM/reduction ordering differs between complete rows and token slices.
+    torch_assert_close(averaged_loss, torch.tensor(baseline["avg_loss"], device="cuda"), rtol=0, atol=1e-6)
+    for (name, parameter), (_, expected) in zip(model.named_parameters(), reference.named_parameters()):
+        torch_assert_close(
+            safe_get_full_grad(parameter), expected.grad, rtol=0, atol=1e-6, msg=lambda msg: f"{name}: {msg}"
+        )
+    expected_norm = torch.linalg.vector_norm(torch.cat([p.grad.flatten() for p in reference.parameters()]))
+    engine.step()
+    torch_assert_close(
+        torch.as_tensor(engine.optimizer._global_grad_norm, device="cuda"), expected_norm, rtol=0, atol=1e-6
+    )
+    if rank == 0:
+        print(
+            f"NATIVE_SP_PARITY_PASS sp={size} dp={dp_size} odd={odd} "
+            f"loss={averaged_loss.item()} norm={expected_norm.item()}"
+        )
+    sp.dist.destroy_process_group()
+
+
+if __name__ == "__main__" and "--native-sp-parity" in sys.argv:
+    _native_sequence_parallel_parity()
