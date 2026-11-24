@@ -56,6 +56,11 @@ from arctic_platform.common.utils.server_models import JobConfig
 from arctic_platform.common.utils.server_models import LogProbsRequest
 from arctic_platform.common.utils.server_models import WeightSyncRequest
 from arctic_platform.common.utils.server_models import build_model_config
+from arctic_platform.debug.lora import maybe_lora_max_param_bytes
+from arctic_platform.debug.lora import maybe_lora_replica_pool
+from arctic_platform.debug.lora import maybe_lora_sync_result
+from arctic_platform.debug.lora import maybe_prepare_lora_training
+from arctic_platform.debug.lora import maybe_project_lora_transfer_schedule
 
 if TYPE_CHECKING:
     from arctic_platform.inference.server.replica_pool import ReplicaPool
@@ -66,7 +71,7 @@ def _replica_pool_cls():
     require_any_dep_group("rl")
     from arctic_platform.inference.server.replica_pool import ReplicaPool
 
-    return ReplicaPool
+    return maybe_lora_replica_pool(ReplicaPool)
 
 
 def _transfer_schedule_cls():
@@ -1504,12 +1509,15 @@ class ArcticRLRayServer:
             inference_replicas=pool.num_replicas,
             inference_tp=pool.tp_size,
         )
+        schedule = maybe_project_lora_transfer_schedule(schedule)
+        await maybe_prepare_lora_training(self, workers, pool, schedule)
         sender_ranks = [g.sender_train_rank for g in schedule.groups]
         sender_ips = await self._await_training_refs(lambda: [workers[r].get_ip.remote() for r in sender_ranks])
         group_master_addrs = {g.group_id: ip for g, ip in zip(schedule.groups, sender_ips)}
 
         if not self.weight_sync_ready:
             max_param = (await self._await_training_refs(lambda: [workers[0].max_param_bytes.remote()]))[0]
+            max_param = maybe_lora_max_param_bytes(self, max_param)
             bucket_size = max(max_param, _WEIGHT_SYNC_BUCKET_SIZE)
             self.weight_sync_bucket_size = bucket_size
 
@@ -1598,7 +1606,7 @@ class ArcticRLRayServer:
             },
             received_checksums([f"sampling replica {i}" for i in range(len(workers_results))], workers_results),
         )
-        return {"status": "ok", **checksum}
+        return maybe_lora_sync_result(self, {"status": "ok", **checksum}, pool_response, send_results)
 
     async def log_probs(self, job_id: int, request: dict[str, Any]) -> dict[str, Any]:
         self._verify_job(job_id, "log_prob")

@@ -18,6 +18,12 @@ from pathlib import Path
 
 import pytest
 
+_OPTIONAL_DEBUG_DSS_IMPORTS = {
+    ("debug/training.py", ("participation_coordinator_class", "_spawn_workers"), "dss.ray_dss.jobs.gpu"),
+    ("debug/training.py", ("main",), "dss.ray_dss"),
+}
+
+
 _DSS_COMPARISON_ADAPTERS = {
     "correctness/harness/engine_admission.py",
     "correctness/harness/gateway.py",
@@ -28,45 +34,77 @@ _DSS_COMPARISON_ADAPTERS = {
 }
 
 
-def _dss_import_violations(source: str, path: Path) -> list[str]:
-    # Only the correctness integration can depend on the optional DSS runtime,
-    # and its imports must wait until a runtime-dependent function is called.
-    optional_adapter = path.as_posix() in _DSS_COMPARISON_ADAPTERS
-    violations = []
-
-    def visit(node, inside_function=False):
-        inside_function = inside_function or isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+def _dss_imports(tree, functions=()):
+    for node in ast.iter_child_nodes(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            yield from _dss_imports(node, (*functions, node.name))
+            continue
         if isinstance(node, ast.Import):
             imported = [alias.name for alias in node.names]
         elif isinstance(node, ast.ImportFrom):
             imported = [node.module or ""]
         else:
             imported = []
-        violations.extend(
-            f"{path}:{node.lineno}: {module}"
-            for module in imported
-            if (module == "dss" or module.startswith("dss.")) and not (optional_adapter and inside_function)
-        )
-        for child in ast.iter_child_nodes(node):
-            visit(child, inside_function)
+        for module in imported:
+            if module == "dss" or module.startswith("dss."):
+                yield node.lineno, functions, module
+        yield from _dss_imports(node, functions)
 
-    visit(ast.parse(source, filename=str(path)))
-    return violations
+
+def _dss_import_violations(source: str, path: Path) -> list[str]:
+    relative = path.as_posix()
+    return [
+        f"{path}:{line}: {module}"
+        for line, functions, module in _dss_imports(ast.parse(source, filename=str(path)))
+        if not (
+            (relative in _DSS_COMPARISON_ADAPTERS and functions)
+            or (relative, functions, module) in _OPTIONAL_DEBUG_DSS_IMPORTS
+        )
+    ]
 
 
 def test_arctic_platform_does_not_import_dss():
     package_root = Path(__file__).resolve().parents[2] / "arctic_platform"
-    violations = [
-        violation
-        for path in package_root.rglob("*.py")
-        for violation in _dss_import_violations(path.read_text(), path.relative_to(package_root))
-    ]
+    violations = []
+    optional = set()
+    for path in package_root.rglob("*.py"):
+        relative = path.relative_to(package_root).as_posix()
+        tree = ast.parse(path.read_text(), filename=str(path))
+        violations.extend(_dss_import_violations(path.read_text(), Path(relative)))
+        for line, functions, module in _dss_imports(tree):
+            identity = relative, functions, module
+            if identity in _OPTIONAL_DEBUG_DSS_IMPORTS:
+                optional.add(identity)
     assert violations == []
+    assert optional == _OPTIONAL_DEBUG_DSS_IMPORTS
+
+
+@pytest.mark.parametrize(
+    ("relative", "code"),
+    [
+        ("model/factory.py", "import dss"),
+        ("common/deepspeed_worker.py", "def load():\n    from dss.ray_dss import training"),
+        ("debug/training.py", "from dss.ray_dss import gateway_server"),
+        ("debug/training.py", "def unrelated():\n    from dss.ray_dss import gateway_server"),
+        ("debug/other.py", "def main():\n    from dss.ray_dss import gateway_server"),
+    ],
+)
+def test_ownership_exceptions_do_not_admit_ordinary_or_eager_dss_imports(relative, code):
+    imports = list(_dss_imports(ast.parse(code)))
+    assert imports
+    assert all((relative, functions, module) not in _OPTIONAL_DEBUG_DSS_IMPORTS for _, functions, module in imports)
+    assert _dss_import_violations(code, Path(relative))
 
 
 @pytest.mark.parametrize(
     "path",
-    ["model/loader.py", "common/deepspeed_engine.py", "correctness/harness/runner.py", *_DSS_COMPARISON_ADAPTERS],
+    [
+        "model/loader.py",
+        "common/deepspeed_engine.py",
+        "correctness/harness/runner.py",
+        "debug/training.py",
+        *_DSS_COMPARISON_ADAPTERS,
+    ],
 )
 @pytest.mark.parametrize("statement", ["import dss", "from dss.ray_dss.models import JobConfig"])
 @pytest.mark.parametrize("scope", ["module", "function", "async-function"])

@@ -30,6 +30,7 @@ import torch
 
 from arctic_platform.common.peft import normalize_lora_peft_config
 from arctic_platform.common.weight_checksum import tensor_l2_sq as _tensor_l2_sq
+from arctic_platform.debug.inference import maybe_install_inference_warmup_observer
 from arctic_platform.debug.weight_sync import maybe_admit_broadcast_receiver
 from arctic_platform.debug.weight_sync import maybe_bind_broadcast_loader
 from arctic_platform.debug.weight_sync import maybe_bind_fp8_updater
@@ -413,6 +414,7 @@ def _refresh_cached_weight_copies(model) -> int:
 
 def _ensure_engine_process_vllm_patches() -> None:
     require_supported_vllm_version("WeightSyncExtension")
+    maybe_install_inference_warmup_observer()
 
     from arctic_platform.inference.vllm.router_replay import (
         ensure_router_replay_vllm_patches,

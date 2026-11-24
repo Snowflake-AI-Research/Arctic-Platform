@@ -24,6 +24,7 @@ import pytest
 import torch
 
 from arctic_platform.debug import training as evidence
+from arctic_platform.debug.lora import maybe_release_lora_worker
 
 
 class TokenChoiceTopKRouter(torch.nn.Module):
@@ -278,6 +279,7 @@ def test_router_observer_close_failure_cannot_prevent_native_worker_destroy(_con
     method = next(node for node in worker_class.body if isinstance(node, ast.FunctionDef) and node.name == "destroy")
     namespace = {
         "maybe_finish_router_replay_after_destroy": evidence.maybe_finish_router_replay_after_destroy,
+        "maybe_release_lora_worker": maybe_release_lora_worker,
         "dist": SimpleNamespace(is_initialized=lambda: True, destroy_process_group=lambda: events.append("group")),
     }
     exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"), namespace)

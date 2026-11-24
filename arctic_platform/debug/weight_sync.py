@@ -13,14 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Opt-in native broadcast inventories and receiver verification."""
+"""Weight transfer, collective inventories, and sampler verification."""
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import hashlib
 import importlib
 import inspect
+import json
 import math
 import os
 from contextlib import contextmanager
@@ -29,10 +31,13 @@ from copy import deepcopy
 from dataclasses import dataclass
 from dataclasses import field
 from pathlib import Path
+from types import FunctionType
 from typing import Any
+from uuid import uuid4
+
+# Weight Sync Evidence
 
 VERIFY_ENV = "ARCTIC_INFERENCE_WEIGHT_SYNC_VERIFY"
-
 _MANIFEST_CHUNK_BYTES = 8 << 20
 
 
@@ -140,6 +145,40 @@ def verify_sources(pins: dict[str, str]) -> None:
     for path, expected in pins.items():
         if hashlib.sha256(Path(path).read_bytes()).hexdigest() != expected:
             raise RuntimeError(f"weight-sync source changed: {path}")
+
+
+@contextmanager
+def maybe_observe_weight_send(worker, weights):
+    """Observe a production-owned send without calling the transport."""
+    evidence = {}
+    if not enabled():
+        yield evidence
+        return
+    sender = worker._weight_sender
+    parameters = list(worker.engine.module.named_parameters())
+    if any(hasattr(value, "ds_id") for _, value in parameters):
+        raise ValueError("weight-sync evidence does not admit post-gather ZeRO3 tensor views")
+    if any(getattr(value, "allreduce", True) is False for _, value in parameters):
+        raise ValueError("a single sender cannot prove complete expert-parallel trainer holdings")
+    origins = source_files(type(sender).send, type(worker).get_weights)
+    manifest = {}
+    for name, value in weights:
+        if not isinstance(name, str) or not name or name in manifest:
+            raise ValueError("weight-sync names must be nonempty and unique")
+        manifest[name] = tensor_manifest(value)
+    verify_sources(origins)
+    yield evidence
+    verify_sources(origins)
+    if manifest != {name: tensor_manifest(value) for name, value in weights}:
+        raise RuntimeError("actually sent tensors changed during weight sync")
+    evidence.update(
+        sent_manifest=manifest,
+        trainer_parameters={
+            "numel": sum(value.numel() for _, value in parameters),
+            "count": len(parameters),
+        },
+        evidence_sources=origins,
+    )
 
 
 def maybe_annotate_weight_sync_result(result, evidence):
@@ -810,6 +849,66 @@ class ShadowVerifier:
         }
 
 
+@functools.lru_cache(maxsize=1)
+def receiver_extension():
+    """Resolve the optional external dependency only in an enabled sampling worker."""
+    from arctic_inference.server.weight_sync.receiver import WeightSyncExtension
+
+    class WeightSyncEvidenceExtension(WeightSyncExtension):
+        def sync_weights(self, *args, **kwargs):
+            if not enabled():
+                return super().sync_weights(*args, **kwargs)
+            if self.model_config.quantization:
+                raise ValueError("quantized weight-loader shadow evidence is not implemented")
+            self._ap_weight_verification = None
+            origins = source_files(WeightSyncExtension.sync_weights, WeightSyncExtension._load_batched)
+            verify_sources(origins)
+            result = super().sync_weights(*args, **kwargs)
+            verify_sources(origins)
+            if result.get("status") == "engine_ready":
+                return result
+            if self._ap_weight_verification is None:
+                raise RuntimeError("receiver completed without dispatcher-observed verification")
+            return {**result, "weight_sync_verification": self._ap_weight_verification}
+
+        def _load_batched(self, model, engine, received_names=None):
+            if not enabled():
+                return super()._load_batched(model, engine, received_names)
+            limit = int(os.environ.get("ARCTIC_PLATFORM_WEIGHT_SYNC_SHADOW_MAX_BYTES", str(1 << 30)))
+            verifier = ShadowVerifier(model, max_shadow_bytes=limit)
+            verifier.sources.update(source_files(type(engine).receive_weights))
+            verify_sources(verifier.sources)
+            loaded = 0
+            for name, value in engine.receive_weights():
+                verifier.load(name, value)
+                if received_names is not None:
+                    received_names.append(name)
+                loaded += 1
+            self._ap_weight_verification = verifier.finish()
+            return loaded
+
+        def _load_direct(self, model, engine, received_names=None):
+            if not enabled():
+                return super()._load_direct(model, engine, received_names)
+            raise ValueError("direct parameter writer needs a separate supported shadow observer")
+
+        def _load_direct_zero_copy(self, model, engine):
+            if not enabled():
+                return super()._load_direct_zero_copy(model, engine)
+            raise ValueError("zero-copy receive bypasses observable shadow loads")
+
+    return WeightSyncEvidenceExtension
+
+
+def __getattr__(name):
+    if name == "WeightSyncEvidenceExtension":
+        return receiver_extension()
+    raise AttributeError(name)
+
+
+# Ep Weight Sync Evidence
+
+
 def global_inventory(records: list[dict]) -> dict:
     """Bind full rank coverage and count EP shards once, not once per DP replica."""
     if not isinstance(records, list) or not records:
@@ -907,12 +1006,594 @@ def global_inventory(records: list[dict]) -> dict:
     return result
 
 
+def _bind_sources(admitted: dict, selected: dict) -> dict:
+    if (
+        not isinstance(admitted, dict)
+        or not admitted
+        or any(admitted.get(path) != sha for path, sha in selected.items())
+    ):
+        raise ValueError("selected source origins do not match caller-admitted sources")
+    verify_sources(admitted)
+    return dict(admitted)
+
+
+def pack_layer_with_evidence(converter, layer_sd: dict, layer_idx: int, *, layer_prefix=None):
+    """Observe the actual converter's lossless cat/split operations and bytes.
+
+    Only whole inputs, concatenation and dimension-zero input splits are
+    supported. Unknown arithmetic/mutations fail before dispatch. No element
+    IDs, tensor-sized provenance storage or alternate packing recipe is used.
+    """
+    import torch
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    if not isinstance(layer_sd, dict) or not layer_sd:
+        raise ValueError("packing requires the actual nonempty gathered layer")
+    sources = source_files(converter, pack_layer_with_evidence, TorchDispatchMode)
+    verify_sources(sources)
+    inputs = dict(layer_sd)
+    before = {name: tensor_manifest(value) for name, value in inputs.items()}
+    plans = {}
+    held = {}
+    for name, value in inputs.items():
+        if not isinstance(name, str) or not name or value.numel() <= 0 or id(value) in plans:
+            raise ValueError("packing input names and tensor objects must be unique and nonempty")
+        plans[id(value)] = ("input", name)
+        held[id(value)] = value
+
+    def plan(value):
+        if id(value) not in plans or held[id(value)] is not value:
+            raise ValueError("converter emitted or consumed an untracked tensor")
+        return plans[id(value)]
+
+    class ObservePacking(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            kwargs = kwargs or {}
+            if func is torch.ops.aten.cat.default:
+                values = args[0] if args else kwargs["tensors"]
+                dim = args[1] if len(args) > 1 else kwargs.get("dim", 0)
+                children = [(plan(value), tuple(value.shape)) for value in values]
+                if not children:
+                    raise ValueError("empty packing concatenation")
+                dim %= len(values[0].shape)
+                result = func(*args, **kwargs)
+                plans[id(result)] = ("cat", dim, children)
+                held[id(result)] = result
+                return result
+            if func in (torch.ops.aten.split.Tensor, torch.ops.aten.split_with_sizes.default):
+                value = args[0] if args else kwargs["self"]
+                dim = args[2] if len(args) > 2 else kwargs.get("dim", 0)
+                origin = plan(value)
+                if origin[0] != "input" or dim % value.ndim != 0:
+                    raise ValueError("packing only supports dimension-zero splits of actual inputs")
+                result = func(*args, **kwargs)
+                start = 0
+                for part in result:
+                    stop = start + part.shape[0]
+                    plans[id(part)] = ("slice", origin[1], start, stop)
+                    held[id(part)] = part
+                    start = stop
+                return result
+            raise ValueError(f"unsupported packing operation before dispatch: {func}")
+
+    with torch.no_grad(), ObservePacking():
+        output = converter(layer_sd, layer_idx, layer_prefix=layer_prefix)
+    if output is not layer_sd:
+        raise ValueError("native converter did not return the actual packing dictionary")
+    if before != {name: tensor_manifest(value) for name, value in inputs.items()}:
+        raise RuntimeError("converter changed the actual gathered input bytes")
+    coverage: dict[str, list[tuple[int, int]]] = {name: [] for name in inputs}
+    wire = {}
+
+    def check(actual, expression, pieces):
+        kind = expression[0]
+        if kind == "cat":
+            _, dim, children = expression
+            start = 0
+            for child, shape in children:
+                check(actual.narrow(dim, start, shape[dim]), child, pieces)
+                start += shape[dim]
+            if start != actual.shape[dim]:
+                raise ValueError("packing concatenation geometry changed")
+            return
+        name = expression[1]
+        source = inputs[name]
+        size = source.shape[0] if source.ndim else 1
+        start, stop = (0, size) if kind == "input" else expression[2:]
+        expected = source if kind == "input" else source.narrow(0, start, stop - start)
+        if tensor_manifest(actual) != tensor_manifest(expected):
+            raise RuntimeError("actual packed byte region differs from its source tensor")
+        coverage[name].append((start, stop))
+        pieces.append({"source": name, "dim0_start": start, "dim0_stop": stop, **tensor_manifest(expected)})
+
+    for name, value in output.items():
+        if not isinstance(name, str) or not name:
+            raise ValueError("converter emitted an empty or non-string wire name")
+        pieces: list[dict] = []
+        check(value, plan(value), pieces)
+        wire[name] = {"manifest": tensor_manifest(value), "pieces": pieces}
+    for name, regions in coverage.items():
+        cursor = 0
+        for start, stop in sorted(regions):
+            if start != cursor or stop <= start:
+                raise ValueError(f"converter dropped or duplicated input byte regions: {name}")
+            cursor = stop
+        size = inputs[name].shape[0] if inputs[name].ndim else 1
+        if cursor != size:
+            raise ValueError(f"converter did not emit every actual input element: {name}")
+    verify_sources(sources)
+    return {"inputs": before, "wire": wire, "source_files": sources}
+
+
+def verify_gathered_layer(layer_sd: dict, wire_sources: dict) -> dict:
+    """Bind the native builder's actual dim-zero gather to each rank's bytes."""
+    result = {}
+    for name, value in layer_sd.items():
+        if name not in wire_sources:
+            raise ValueError("native gathered tensor has no actual inventory origin")
+        shards = wire_sources[name]["ordered_shards"]
+        if not shards:
+            raise ValueError("native gathered tensor has no actual shard records")
+        shape = list(shards[0]["shape"])
+        expected_shape = list(shape)
+        if len(shards) > 1:
+            if not shape:
+                raise ValueError("native dim-zero EP gather cannot gather scalar shards")
+            expected_shape[0] *= len(shards)
+        if list(value.shape) != expected_shape:
+            raise ValueError("native gathered tensor geometry differs from its actual shards")
+        actual = []
+        for index, entry in enumerate(shards):
+            part = value if len(shards) == 1 else value.narrow(0, index * shape[0], shape[0])
+            descriptor = tensor_manifest(part)
+            if descriptor != {key: entry[key] for key in ("shape", "dtype", "numel", "sha256")}:
+                raise ValueError(f"native gathered shard bytes do not bind actual rank holdings: {name}")
+            actual.append(descriptor)
+        result[name] = actual
+    return result
+
+
+def _observed_iterator(model, builder, converter, proofs, wire_sources):
+    """Reuse native iterator code/globals with only its converter cell observed."""
+    native = builder(model)
+    if not isinstance(native, FunctionType) or native.__globals__ is not builder.__globals__:
+        raise ValueError("selected builder does not expose the source-bound native iterator")
+    freevars = native.__code__.co_freevars
+    if "convert_layer" not in freevars or native.__closure__ is None:
+        raise ValueError("native iterator has no explicit converter closure")
+    cells = list(native.__closure__)
+    index = freevars.index("convert_layer")
+    if cells[index].cell_contents is not converter:
+        raise ValueError("native iterator selected a different actual converter")
+
+    def observe(layer_sd, layer_idx, *, layer_prefix=None):
+        gathered = verify_gathered_layer(layer_sd, wire_sources)
+        proof = pack_layer_with_evidence(converter, layer_sd, layer_idx, layer_prefix=layer_prefix)
+        proof["gathered_shards"] = gathered
+        proofs.append(proof)
+        return layer_sd
+
+    def make_cell(value):
+        return (lambda: value).__closure__[0]
+
+    cells[index] = make_cell(observe)
+    observed = FunctionType(native.__code__, native.__globals__, native.__name__, native.__defaults__, tuple(cells))
+    observed.__kwdefaults__ = native.__kwdefaults__
+    return observed()
+
+
+@dataclass
+class PreparedWeights:
+    """Actor-local actual tensors; not a runtime/capacity/admission receipt."""
+
+    rank: int
+    weight_format: str
+    weights: list
+    manifest: dict
+    inventory: dict
+    rank_records: list
+    sources: dict
+    packing: list
+    wire_sources: dict
+    metadata_sha256: str = field(init=False)
+
+    def __post_init__(self):
+        self.metadata_sha256 = self._digest()
+
+    def _digest(self):
+        return hashlib.sha256(
+            json.dumps(
+                [
+                    self.rank,
+                    self.weight_format,
+                    self.manifest,
+                    self.inventory,
+                    self.rank_records,
+                    self.sources,
+                    self.packing,
+                    self.wire_sources,
+                ],
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+
+    def verify(self):
+        if self.metadata_sha256 != self._digest():
+            raise RuntimeError("prepared collective metadata changed after actual export")
+        if {name: tensor_manifest(value) for name, value in self.weights} != self.manifest:
+            raise RuntimeError("prepared actual tensor bytes or names changed after export")
+        if len(self.weights) != len(self.manifest):
+            raise RuntimeError("prepared actual wire names are duplicated")
+        verify_sources(self.sources)
+
+    def receipt(self):
+        self.verify()
+        return {
+            "rank": self.rank,
+            "weight_format": self.weight_format,
+            "emitted_manifest": self.manifest,
+            "global_inventory": self.inventory,
+            "rank_records": self.rank_records,
+            "source_files": self.sources,
+            "metadata_sha256": self.metadata_sha256,
+            "packing": self.packing,
+            "wire_sources": self.wire_sources,
+            "non_wire_buffers": {
+                name: entry
+                for name, entry in self.inventory["buffers"].items()
+                if not any(
+                    origin["kind"] == "buffers" and origin["name"] == name for origin in self.wire_sources.values()
+                )
+            },
+            "iterator_binding": {
+                "native_code_and_globals_reused": True,
+                "observed_closure_cells": ["convert_layer"],
+                "unchanged_native_iterator": False,
+            },
+            "receiver_format_admitted": False,
+            "wire_replica_values_checked": True,
+            "router_application_admitted": False,
+            "capacity_admitted": False,
+        }
+
+
+def prepare_collective_weights(
+    model,
+    *,
+    weight_format: str,
+    max_weight_bytes: int,
+    admitted_sources: dict,
+    expected_world_size: int = 8,
+    expected_ep_size: int = 8,
+    is_zero3: bool = False,
+    checkpoint_dir: str | None = None,
+) -> PreparedWeights:
+    """Every training rank must call this once before any sender dispatch.
+
+    The selected full-weight exporter owns gathering dimensions and packing.
+    LoRA is deliberately not supported here. All emitted weights remain
+    actor-local; only rank zero can send them.
+    """
+    import deepspeed.utils.groups as ds_groups
+    import torch.distributed as dist
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    from arctic_platform.model.implementations.glm53.vllm_weights import convert_glm5_next_layer_to_vllm
+    from arctic_platform.model.implementations.moe.vllm_weights import build_iter_full_vllm_weights
+    from arctic_platform.model.implementations.moe.vllm_weights import named_weight_sync_tensors
+    from arctic_platform.model.implementations.moe.vllm_weights import vllm_layer_converter
+    from arctic_platform.model.weight_export import weight_export_contract
+
+    if weight_format != "vllm" or is_zero3 is not False or checkpoint_dir is not None:
+        raise ValueError("this source-supported GLM path requires explicit vllm, non-ZeRO3, no checkpoint fallback")
+    if type(max_weight_bytes) is not int or max_weight_bytes <= 0:
+        raise ValueError("a positive explicit emitted-weight byte limit is required")
+    if (
+        expected_world_size != 8
+        or expected_ep_size != 8
+        or any(type(size) is not int for size in (expected_world_size, expected_ep_size))
+    ):
+        raise ValueError("this canonical preparation is restricted to the explicit EP8 training domain")
+    if not dist.is_initialized():
+        raise RuntimeError("actual training process group is not initialized")
+    rank, world = dist.get_rank(), dist.get_world_size()
+    if world != expected_world_size:
+        raise ValueError("actual training world does not match the EP8 request")
+    contract = weight_export_contract(model)
+    builder = getattr(contract, weight_format, None) if contract is not None else None
+    converter = vllm_layer_converter(model)
+    if builder is not build_iter_full_vllm_weights or converter is not convert_glm5_next_layer_to_vllm:
+        raise ValueError("the actual registered family exporter/converter is not the selected GLM vLLM route")
+    if getattr(model, "peft_config", None) or getattr(model, "_is_vlm", False):
+        raise ValueError("GLM EP8 preparation does not reinterpret LoRA or VLM export semantics")
+    selected = source_files(
+        type(model),
+        type(model).named_parameters,
+        type(model).named_buffers,
+        type(model).get_submodule,
+        builder,
+        converter,
+        named_weight_sync_tensors,
+        vllm_layer_converter,
+        weight_export_contract,
+        prepare_collective_weights,
+        TorchDispatchMode,
+        dist.all_gather,
+        dist.all_gather_object,
+        dist.get_process_group_ranks,
+        ds_groups._get_expert_parallel_group,
+    )
+    sources = _bind_sources(admitted_sources, selected)
+    if (
+        "1654b373bec81a411f4d5369270f3ec96b0345a48af192144c3d3495ea741e51" not in source_files(builder).values()
+        or "543c34347f9d5f67e35a6e9cdcc3f5d47bc45c608751ff78ffd1369ee4975a5a" not in source_files(converter).values()
+    ):
+        raise ValueError("actual native gather/GLM packing source differs from this selected recipe")
+
+    def local_inventory():
+        objects = {"parameters": dict(model.named_parameters()), "buffers": dict(model.named_buffers())}
+        output = {}
+        for kind, tensors in objects.items():
+            output[kind] = {}
+            for name, tensor in tensors.items():
+                if hasattr(tensor, "ds_id"):
+                    raise ValueError("post-gather ZeRO3 tensor lifetimes are unsupported")
+                members = None
+                if getattr(tensor, "allreduce", True) is False:
+                    if not isinstance(getattr(tensor, "group_name", None), str) or not tensor.group_name:
+                        raise ValueError("expert shard has no actual named process group")
+                    group = ds_groups._get_expert_parallel_group(tensor.group_name)
+                    members = list(dist.get_process_group_ranks(group))
+                    if len(members) != expected_ep_size:
+                        raise ValueError("actual expert process group is not EP8")
+                output[kind][name] = {
+                    **tensor_manifest(tensor),
+                    "requires_grad": tensor.requires_grad,
+                    "ep_ranks": members,
+                }
+        selected_tensors = list(named_weight_sync_tensors(model))
+        if len({name for name, _ in selected_tensors}) != len(selected_tensors):
+            raise ValueError("native exporter selected duplicate tensor names")
+        for name, tensor in selected_tensors:
+            if not any(objects[kind].get(name) is tensor for kind in objects):
+                raise ValueError("native exporter selected an unregistered tensor")
+        names = [name for name, _ in selected_tensors]
+        if not set(objects["parameters"]).issubset(names):
+            raise ValueError("native exporter excludes a registered parameter")
+        return objects, output, names
+
+    before_objects, local, names = local_inventory()
+    if not before_objects["parameters"]:
+        raise ValueError("canonical GLM export requires actual registered parameters")
+    verify_sources(sources)
+    rank_record = {"rank": rank, "world_size": world, "wire_inputs": names, **local}
+    records: list[Any] = [None] * world
+    dist.all_gather_object(records, rank_record)
+    inventory = global_inventory(records)
+    by_rank = {record["rank"]: record for record in records}
+    if any(record.get("wire_inputs") != names for record in records):
+        raise ValueError("native exporter input order differs across actual training ranks")
+    wire_sources = {}
+    for kind in inventory:
+        for name in inventory[kind]:
+            if name not in names:
+                continue
+            entry = by_rank[0][kind][name]
+            members = entry["ep_ranks"]
+            if members is None and any(record[kind][name]["sha256"] != entry["sha256"] for record in records):
+                raise ValueError(f"actual replicated wire-input bytes disagree across ranks: {name}")
+            normalized = name.replace("._checkpoint_wrapped_module", "")
+            if normalized in wire_sources:
+                raise ValueError("activation-checkpoint unwrapping collides in the native exporter")
+            wire_sources[normalized] = {
+                "name": name,
+                "kind": kind,
+                "ordered_shards": [
+                    {"rank": member, **by_rank[member][kind][name]}
+                    for member in (members if members is not None else [0])
+                ],
+            }
+    wire_bytes = sum(
+        inventory[kind][name]["global_numel"] * before_objects[kind][name].element_size()
+        for kind in inventory
+        for name in inventory[kind]
+        if name in names
+    )
+    if wire_bytes > max_weight_bytes:
+        raise ValueError("actual lossless wire inventory exceeds its explicit emitted-weight byte limit")
+    weights = []
+    manifest = {}
+    packing: list[dict] = []
+    emitted_bytes = 0
+    iterator = _observed_iterator(model, builder, converter, packing, wire_sources)
+    for name, tensor in iterator:
+        if rank != 0:
+            raise RuntimeError("family exporter emitted weights on a non-sender training rank")
+        if not isinstance(name, str) or not name or name in manifest:
+            raise ValueError("family exporter emitted a duplicate or empty wire name")
+        emitted_bytes += tensor.numel() * tensor.element_size()
+        if emitted_bytes > max_weight_bytes:
+            raise ValueError("actual emitted stream exceeds its explicit byte limit")
+        # Exporters may yield temporary views: retain a private value copy.
+        value = tensor.detach().clone()
+        weights.append((name, value))
+        manifest[name] = tensor_manifest(value)
+    if rank == 0:
+        full_inputs = {}
+        for proof in packing:
+            for name, entry in proof["inputs"].items():
+                if name in full_inputs:
+                    raise ValueError("native layer grouping emitted an input twice")
+                full_inputs[name] = entry
+            sources = _bind_sources(sources, proof["source_files"])
+        if set(full_inputs) != set(wire_sources):
+            raise ValueError("native packing did not cover the exact registered wire-input domain")
+        packed_manifest = {name: entry["manifest"] for proof in packing for name, entry in proof["wire"].items()}
+        if packed_manifest != manifest or emitted_bytes != wire_bytes:
+            raise ValueError("actual native emitted stream differs from its complete packing byte proof")
+    after_objects, after, after_names = local_inventory()
+    if (
+        local != after
+        or names != after_names
+        or weight_export_contract(model) is not contract
+        or any(
+            set(before_objects[kind]) != set(after_objects[kind])
+            or any(after_objects[kind][name] is not tensor for name, tensor in before_objects[kind].items())
+            for kind in before_objects
+        )
+    ):
+        raise RuntimeError("actual parameter/buffer identity, bytes, geometry or exporter changed during export")
+    if vllm_layer_converter(model) is not converter:
+        raise RuntimeError("actual family converter selection changed during export")
+    verify_sources(sources)
+    return PreparedWeights(rank, weight_format, weights, manifest, inventory, records, sources, packing, wire_sources)
+
+
+def send_prepared_weights(sender, prepared: PreparedWeights):
+    """Send exactly the freshly retained stream, with truthful separate holdings."""
+    if not isinstance(prepared, PreparedWeights) or prepared.rank != 0 or not prepared.weights:
+        raise ValueError("only the actual rank-zero nonempty prepared stream can be sent")
+    prepared.verify()
+    sources = _bind_sources(prepared.sources, source_files(type(sender).send, send_prepared_weights))
+    selected_send = sender.send
+    before = {name: tensor_manifest(value) for name, value in prepared.weights}
+    if len(before) != len(prepared.weights) or before != prepared.manifest:
+        raise RuntimeError("prepared actual tensor bytes or wire names changed before sending")
+    result = selected_send(prepared.weights)
+    if not isinstance(result, dict):
+        raise TypeError("actual sender did not return a dictionary")
+    if before != {name: tensor_manifest(value) for name, value in prepared.weights}:
+        raise RuntimeError("prepared actual tensor bytes changed while sending")
+    if sender.send != selected_send:
+        raise RuntimeError("actual sender callable changed while sending")
+    prepared.verify()
+    verify_sources(sources)
+    parameters = prepared.inventory["parameters"]
+    buffers = prepared.inventory["buffers"]
+    return {
+        **result,
+        "sent_manifest": before,
+        "trainer_parameters": {
+            "numel": sum(entry["global_numel"] for entry in parameters.values()),
+            "count": len(parameters),
+        },
+        "trainer_buffers": {
+            "numel": sum(entry["global_numel"] for entry in buffers.values()),
+            "count": len(buffers),
+            "wire_numel": sum(
+                buffers[entry["name"]]["global_numel"]
+                for entry in prepared.wire_sources.values()
+                if entry["kind"] == "buffers"
+            ),
+        },
+        "collective_preparation": prepared.receipt(),
+    }
+
+
+def bind_receiver_results(
+    prepared: PreparedWeights,
+    rank_results: list[dict],
+    *,
+    expected_sampler_ranks: int,
+    admitted_sources: dict,
+) -> dict:
+    """Bind retained actual stream bytes to every caller-held native rank result.
+
+    This consumes the existing dispatcher's receiver evidence, not a new load.
+    Native rank identity, format selection, runtime and capacity remain the
+    operations owner's admission responsibilities.
+    """
+    if not isinstance(prepared, PreparedWeights) or prepared.rank != 0 or not prepared.weights:
+        raise ValueError("receiver binding requires the actual rank-zero prepared stream")
+    if (
+        type(expected_sampler_ranks) is not int
+        or expected_sampler_ranks <= 0
+        or not isinstance(rank_results, list)
+        or len(rank_results) != expected_sampler_ranks
+    ):
+        raise ValueError("receiver binding requires every selected sampling rank")
+    sources = _bind_sources(admitted_sources, {**prepared.sources, **source_files(bind_receiver_results)})
+    prepared.verify()
+    actual = {name: tensor_manifest(value) for name, value in prepared.weights}
+    if len(actual) != len(prepared.weights) or actual != prepared.manifest:
+        raise RuntimeError("prepared stream changed before receiver binding")
+    records = []
+    for index, result in enumerate(rank_results):
+        record = result.get("weight_sync_verification") if isinstance(result, dict) else None
+        if (
+            not isinstance(result, dict)
+            or result.get("status") != "done"
+            or not isinstance(record, dict)
+            or record.get("status") != "ok"
+        ):
+            raise ValueError("a selected sampling rank supplied no successful actual byte evidence")
+        origins = record.get("evidence_sources")
+        if not isinstance(origins, dict) or not origins:
+            raise ValueError("receiver evidence does not bind actual selected loader sources")
+        _bind_sources(sources, origins)
+        received = record.get("received")
+        if not isinstance(received, dict) or set(received) != set(actual):
+            raise ValueError("receiver wire names differ from the actual prepared stream")
+        reached = set()
+        for name, entry in received.items():
+            if not isinstance(entry, dict) or any(entry.get(key) != value for key, value in actual[name].items()):
+                raise ValueError("receiver actual bytes/shape/dtype/count differ from the prepared stream")
+            destinations = entry.get("destinations")
+            if (
+                not isinstance(destinations, list)
+                or not destinations
+                or any(not isinstance(destination, str) or not destination for destination in destinations)
+            ):
+                raise ValueError("an actual received tensor reached no native parameter")
+            reached.update(destinations)
+        destinations = record.get("destinations")
+        if not isinstance(destinations, dict) or set(destinations) != reached:
+            raise ValueError("receiver destination coverage does not bind every observed write")
+        for value in destinations.values():
+            if (
+                not isinstance(value, dict)
+                or type(value.get("uncovered")) is not int
+                or value["uncovered"] != 0
+                or type(value.get("mismatched")) is not int
+                or value["mismatched"] != 0
+            ):
+                raise ValueError("native receiver shadow coverage/bytes are not complete")
+        for field_name, empty in (
+            ("untouched_parameters", {}),
+            ("unverifiable_destinations", []),
+            ("non_parameter_destinations", []),
+        ):
+            if field_name not in record or type(record[field_name]) is not type(empty) or record[field_name] != empty:
+                raise ValueError("native receiver has unproved or untouched destinations")
+        if record.get("changed_after_verification", []) != []:
+            raise ValueError("native receiver destinations changed after their shadow verification")
+        records.append({"result_index": index, "actual_result": result})
+    verify_sources(sources)
+    prepared.verify()
+    if actual != {name: tensor_manifest(value) for name, value in prepared.weights}:
+        raise RuntimeError("prepared stream changed during receiver binding")
+    return {
+        "sent_manifest": actual,
+        "actual_rank_results": records,
+        "packing": prepared.packing,
+        "wire_sources": prepared.wire_sources,
+        "source_files": sources,
+        "wire_bytes_and_shadow_coverage_bound": True,
+        "native_rank_identity_admitted": False,
+        "receiver_format_admitted": False,
+        "router_application_admitted": False,
+        "capacity_admitted": False,
+        "overall_admission": False,
+    }
+
+
+# Broadcast Weight Sync Evidence
+
 _SEND = ContextVar("native_broadcast_weight_evidence", default=None)
-
 _EXPORT = ContextVar("native_broadcast_export_inventory", default=None)
-
 TRAINING_OPTION = "arctic_platform_weight_sync_verify"
-
 SHADOW_MAX_BYTES_ENV = "ARCTIC_PLATFORM_WEIGHT_SYNC_SHADOW_MAX_BYTES"
 
 
@@ -1360,6 +2041,13 @@ def maybe_bind_broadcast_loader(verifier, writer):
         verify_sources(verifier.sources)
 
 
+def maybe_run_broadcast_load(loader, model, engine, verifier):
+    """Pass debug evidence only when enabled, preserving ordinary loader arguments."""
+    if verifier is None:
+        return loader(model, engine)
+    return loader(model, engine, verifier=verifier)
+
+
 _BROADCAST_LOAD_VERIFIER: ContextVar[ShadowVerifier | None] = ContextVar("broadcast_load_verifier", default=None)
 
 
@@ -1387,6 +2075,12 @@ def maybe_observe_broadcast_tensor(verifier, loader, name, value):
         yield
 
 
+def maybe_load_broadcast_tensor(verifier, loader, name, value):
+    with maybe_observe_broadcast_tensor(verifier, loader, name, value):
+        return loader(name, value)
+
+
+# The vLLM ``_C`` FP8 quantization kernels ``scaled_fp8_quant`` dispatches; nothing else non-ATen is admitted.
 FP8_QUANT_OPERATIONS = (
     "_C",
     ("dynamic_scaled_fp8_quant", "static_scaled_fp8_quant", "dynamic_per_token_scaled_fp8_quant"),
@@ -1449,11 +2143,22 @@ def maybe_observe_fp8_tensor(verifier, updater, replay, name, value):
         yield
 
 
+def maybe_feed_fp8_tensor(verifier, updater, replay, name, value):
+    with maybe_observe_fp8_tensor(verifier, updater, replay, name, value):
+        return updater.feed(name, value)
+
+
 def maybe_broadcast_receiver_result(result, verifier, *, rank):
     if verifier is None:
         return result
     result.update(rank=rank, weight_sync_verification={**verifier.finish(), "rank": rank})
     return result
+
+
+def maybe_retain_weight_sync_failure(verifier, error):
+    """Retain unplaced-source evidence for the verifier; ordinary loading remains strict."""
+    if verifier is None:
+        raise error
 
 
 def maybe_collect_broadcast_verification(results, *, engine_only, llm, rank_offset):
@@ -1554,6 +2259,19 @@ class _LoRABuildEvidence:
 _LORA_BUILD_EVIDENCE: ContextVar[_LoRABuildEvidence | None] = ContextVar("lora_build_evidence", default=None)
 
 
+def maybe_build_lora_model(builder, **kwargs):
+    """Observe the native builder without changing its signature or tensor inputs."""
+    if not enabled():
+        return builder(**kwargs), None
+    evidence = _LoRABuildEvidence(received=maybe_lora_received_manifest(kwargs["tensors"]))
+    token = _LORA_BUILD_EVIDENCE.set(evidence)
+    try:
+        model = builder(**kwargs)
+    finally:
+        _LORA_BUILD_EVIDENCE.reset(token)
+    return model, evidence
+
+
 @contextmanager
 def maybe_observe_lora_build(tensors):
     """Capture build evidence while the caller invokes its native builder."""
@@ -1627,3 +2345,290 @@ def maybe_lora_built_receiver_result(result, evidence, **kwargs):
         return result
     result.update(maybe_lora_receiver_result(result, evidence.received, evidence.factors, **kwargs))
     return result
+
+
+# Rl Sampler Evidence
+
+_EXTENSION = "arctic_platform.debug.weight_sync.WeightSyncEvidenceExtension"
+
+
+def maybe_replica_pool(pool_class):
+    """Keep the actual external pool/scheduler; inject only its public worker protocol."""
+    if not enabled():
+        return pool_class
+    return functools.partial(pool_class, worker_cls=_worker_actor())
+
+
+def _worker_actor():
+    import ray
+
+    environment = {VERIFY_ENV: "1"}
+    limit_key = "ARCTIC_PLATFORM_WEIGHT_SYNC_SHADOW_MAX_BYTES"
+    if limit_key in os.environ:
+        environment[limit_key] = os.environ[limit_key]
+    return ray.remote(runtime_env={"env_vars": environment})(SamplerEvidenceWorker)
+
+
+def maybe_sync_weights_result(received, sent):
+    """Format completed receipts without changing the server's transfer awaiters."""
+    if not enabled():
+        return {"status": "ok"}
+    if not isinstance(received, dict) or not isinstance(received.get("workers"), list) or not received["workers"]:
+        raise RuntimeError("external pool did not return actual worker sync results")
+    for worker in received["workers"]:
+        if not isinstance(worker, dict) or not worker.get("all_rank_weight_sync_verification"):
+            raise RuntimeError("a sampling worker returned no all-rank byte verification")
+    return {
+        "status": "ok",
+        "weight_format": "nccl",
+        "targets": [{"send": sent, "recv": received}],
+    }
+
+
+class SamplerEvidenceWorker:
+    """External ReplicaPool worker protocol, without unwrapping its Ray actor.
+
+    The external TransferSchedule, sender, NCCL engine, receiver superclass and
+    scheduler remain selected. A per-actor lock excludes generate/sleep during
+    sync. This worker does not implement native router replay or speculative sync.
+    """
+
+    def __init__(self):
+        self.llm = None
+        self.state = "uninitialized"
+        self._lock = asyncio.Lock()
+        self._origins = None
+        self._tp = None
+
+    async def initialize(self, engine_kwargs, extra_env=None):
+        if self.llm is not None:
+            raise RuntimeError("sampler evidence worker is already initialized")
+        if extra_env:
+            os.environ.update(extra_env)
+        if not enabled():
+            raise RuntimeError("sampler evidence opt-in must propagate into the actual worker")
+        import vllm.plugins
+        from arctic_inference.envs import arctic_inference_effective_enabled
+        from arctic_inference.server.metrics import RingStatLogger
+
+        vllm.plugins.load_general_plugins()
+        from vllm.v1.engine.async_llm import AsyncLLM
+
+        if arctic_inference_effective_enabled():
+            from arctic_inference.vllm.args import ArcticAsyncEngineArgs as EngineArgs
+        else:
+            from vllm.engine.arg_utils import AsyncEngineArgs as EngineArgs
+
+        kwargs = dict(engine_kwargs)
+        existing = kwargs.get("worker_extension_cls")
+        if existing not in (None, _EXTENSION, "arctic_inference.server.weight_sync.WeightSyncExtension"):
+            raise ValueError("sampler evidence cannot replace another selected worker extension")
+        if kwargs.get("speculative_config"):
+            raise ValueError("speculative weight-sync evidence is not implemented")
+        if os.environ.get("VLLM_BATCH_INVARIANT") == "1":
+            kwargs.setdefault("attention_config", {"backend": "FLASH_ATTN"})
+        kwargs["worker_extension_cls"] = _EXTENSION
+        # Unlike a compatibility fallback, never silently remove engine recipe fields.
+        args = EngineArgs(**kwargs)
+        self._tp = args.tensor_parallel_size
+        if type(self._tp) is not int or self._tp < 1:
+            raise ValueError("native engine tensor-parallel size must be positive")
+        if self._tp == 1:
+            raise ValueError("native TP1 selects an unsupported direct weight loader")
+        self._origins = source_files(type(self), EngineArgs, AsyncLLM.from_vllm_config)
+        verify_sources(self._origins)
+        from arctic_platform.debug.lora import maybe_admit_sampler_construction
+        from arctic_platform.debug.lora import maybe_verify_sampler_construction
+
+        maybe_admit_sampler_construction(self, args, AsyncLLM.from_vllm_config, engine_kwargs)
+        self.llm = AsyncLLM.from_vllm_config(args.create_engine_config(), stat_loggers=[RingStatLogger])
+        try:
+            maybe_verify_sampler_construction(self)
+            verify_sources(self._origins)
+        except BaseException:
+            self.shutdown()
+            raise
+        self.state = "ready"
+
+    def _ready(self):
+        if self.llm is None or self.state != "ready":
+            raise RuntimeError(f"sampler not ready: {self.state}")
+        verify_sources(self._origins)
+
+    async def generate(self, prompt, sampling_params):
+        # Native routing/cache/application must be supplied, not simulated by a marker.
+        if any(key.startswith("dss_") for key in sampling_params):
+            raise ValueError("external native router replay producer/transport/application is not implemented")
+        from vllm import SamplingParams
+
+        async with self._lock:
+            self._ready()
+            params = SamplingParams(**dict(sampling_params))
+            request_id = str(uuid4())
+            prompt_input = {"prompt_token_ids": prompt} if isinstance(prompt, list) else prompt
+            final = None
+            try:
+                async for output in self.llm.generate(prompt_input, params, request_id=request_id):
+                    final = output
+            except BaseException:
+                await self.llm.abort(request_id)
+                raise
+            verify_sources(self._origins)
+            if final is None or not final.outputs:
+                raise RuntimeError("empty generation output")
+            choice = final.outputs[0]
+            result = {
+                "text": choice.text,
+                "token_ids": list(choice.token_ids),
+                "finish_reason": choice.finish_reason,
+                "prompt_len": len(final.prompt_token_ids or []),
+                "generation_len": len(choice.token_ids),
+                "prefix_cache_len": int(getattr(final, "num_cached_tokens", None) or 0),
+            }
+            for key, positions in (("prompt_logprobs", final.prompt_logprobs), ("logprobs", choice.logprobs)):
+                if positions is not None:
+                    result[key] = [
+                        (
+                            None
+                            if position is None
+                            else {
+                                token: (
+                                    {"logprob": value.logprob, "rank": value.rank}
+                                    if hasattr(value, "logprob")
+                                    else {"logprob": float(value), "rank": None}
+                                )
+                                for token, value in position.items()
+                            }
+                        )
+                        for position in positions
+                    ]
+            return result
+
+    async def sync_weights(
+        self,
+        master_addr,
+        master_port,
+        rank_offset,
+        world_size,
+        bucket_size=256 * 1024 * 1024,
+        engine_only=False,
+        direct_mode=False,
+        reverse=False,
+    ):
+        async with self._lock:
+            self._ready()
+            results = await self.llm.collective_rpc(
+                "sync_weights",
+                args=(
+                    master_addr,
+                    master_port,
+                    rank_offset,
+                    world_size,
+                    bucket_size,
+                    engine_only,
+                    direct_mode,
+                    reverse,
+                ),
+            )
+            verify_sources(self._origins)
+            if not isinstance(results, list) or len(results) != self._tp:
+                raise RuntimeError("collective RPC did not return every selected TP rank")
+            if engine_only:
+                if any(not isinstance(row, dict) or row.get("status") != "engine_ready" for row in results):
+                    raise RuntimeError("native receiver engine initialization failed")
+                return {"status": "engine_ready", "rank_results": results}
+            if any(
+                not isinstance(row, dict)
+                or row.get("status") != "done"
+                or not isinstance(row.get("weight_sync_verification"), dict)
+                for row in results
+            ):
+                raise RuntimeError("a native TP rank did not return receiver byte/shadow evidence")
+            return {
+                "status": "done",
+                "rank_results": results,
+                "all_rank_weight_sync_verification": [row["weight_sync_verification"] for row in results],
+            }
+
+    async def sleep(self, level=1, offload_weights=False):
+        async with self._lock:
+            self._ready()
+            if offload_weights:
+                await self.llm.collective_rpc("offload_model_weights")
+            await self.llm.collective_rpc("sleep", kwargs={"level": level})
+            verify_sources(self._origins)
+            self.state = "sleeping"
+            return {"status": "sleeping", "level": level}
+
+    async def wake_up(self, tags=None, restore_weights=False):
+        async with self._lock:
+            if self.state == "ready":
+                return {"status": "already_ready"}
+            if self.state not in {"sleeping", "weights_ready"}:
+                raise RuntimeError(f"cannot wake sampler in {self.state}")
+            verify_sources(self._origins)
+            await self.llm.collective_rpc("wake_up", kwargs={"tags": tags})
+            if restore_weights:
+                await self.llm.collective_rpc("backload_model_weights")
+            verify_sources(self._origins)
+            self.state = "weights_ready" if set(tags or []) == {"weights"} else "ready"
+            return {"status": self.state}
+
+    async def reset_prefix_cache(self):
+        async with self._lock:
+            if self.llm is None:
+                raise RuntimeError("sampler is not initialized")
+            verify_sources(self._origins)
+            await self.llm.reset_prefix_cache()
+            verify_sources(self._origins)
+            return {"status": "prefix_cache_reset"}
+
+    async def close_weight_sync(self):
+        async with self._lock:
+            if self.llm is None:
+                raise RuntimeError("sampler is not initialized")
+            # Resource cleanup is not conditional on a fresh source-admission check.
+            results = await self.llm.collective_rpc("close_weight_sync")
+            return {"status": "ok", "rank_results": results}
+
+    async def compute_weight_norm(self):
+        async with self._lock:
+            self._ready()
+            results = await self.llm.collective_rpc("compute_weight_norm")
+            verify_sources(self._origins)
+            squared = sum(row["sq_sum"] for row in results)
+            return {
+                "norm": squared**0.5,
+                "sq_sum": squared,
+                "num_params": sum(row["num_params"] for row in results),
+            }
+
+    def is_healthy(self):
+        return self.llm is not None and self.state in {"ready", "sleeping", "weights_ready"}
+
+    def get_state(self):
+        return self.state
+
+    def get_stats(self):
+        from arctic_inference.server.metrics import get_collector
+
+        return {"state": self.state, "pid": os.getpid(), **get_collector().latest()}
+
+    def drain_metrics(self):
+        from arctic_inference.server.metrics import get_collector
+
+        return {"pid": os.getpid(), "snapshots": get_collector().drain_snapshots()}
+
+    def set_replica_id(self, replica_id):
+        from arctic_inference.server.metrics import get_collector
+
+        get_collector().set_replica_id(int(replica_id))
+
+    def pid(self):
+        return os.getpid()
+
+    def shutdown(self):
+        if self.llm is not None:
+            self.llm.shutdown()
+            self.llm = None
+        self.state = "uninitialized"
