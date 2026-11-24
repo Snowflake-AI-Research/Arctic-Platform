@@ -27,7 +27,7 @@ import pytest
 import torch
 
 from arctic_platform.model import loader as loader_mod
-from tests.model.test_glm5_next import _tiny_config as _glm_tiny_config
+from arctic_platform.testing_utils import tiny_glm5_next_config as _glm_tiny_config
 
 
 def _assert_rounded_once(actual: torch.Tensor, reference: torch.Tensor) -> None:
@@ -233,7 +233,7 @@ def _hyper_connection_sites(fp32_parity: bool, dtype=torch.bfloat16, hc_count=4)
     """Layer 0 and the final mixer of a tiny Qwen3.8-Flash-Next built by the trainer class, with each site recorded."""
     from arctic_platform.model.implementations.moe.vlm import get_language_model
     from arctic_platform.model.implementations.qwen38.modeling_qwen4_exp import Qwen4ExpForConditionalGenerationPrimeRL
-    from tests.model.test_qwen4_exp import _tiny_config as _qwen38_tiny_config
+    from arctic_platform.testing_utils import tiny_qwen4_exp_config as _qwen38_tiny_config
 
     torch.manual_seed(11)
     config = _qwen38_tiny_config()
@@ -406,7 +406,7 @@ def _flash_moe(model: str, fp32_routed_weighting: bool, use_grouped_mm: bool):
         from arctic_platform.model.implementations.qwen38.modeling_qwen4_exp import (
             Qwen4ExpForConditionalGenerationPrimeRL as model_cls,
         )
-        from tests.model.test_qwen4_exp import _tiny_config as _qwen_tiny_config
+        from arctic_platform.testing_utils import tiny_qwen4_exp_config as _qwen_tiny_config
 
         config = _qwen_tiny_config()
     config.use_grouped_mm = use_grouped_mm

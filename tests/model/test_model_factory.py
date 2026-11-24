@@ -23,7 +23,6 @@ import types
 import pytest
 import torch.nn as nn
 from pydantic import ValidationError
-from transformers.loss.loss_utils import ForCausalLMLoss
 
 from arctic_platform.model import LoadedModel
 from arctic_platform.model import LoaderContext
@@ -262,6 +261,8 @@ class TestHuggingFaceLoader:
 
     @pytest.mark.parametrize(("loader_options", "fp32_beta"), [({}, True), ({"fp32_parity": False}, False)])
     def test_loader_applies_required_sequence_parallel_setup(self, monkeypatch, loader_options, fp32_beta):
+        from transformers.loss.loss_utils import ForCausalLMLoss
+
         from arctic_platform.model import ParallelismConfig
         from arctic_platform.model.loaders.huggingface import load_huggingface
 

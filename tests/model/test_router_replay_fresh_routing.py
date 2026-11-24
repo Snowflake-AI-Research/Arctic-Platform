@@ -455,6 +455,7 @@ def test_aborted_forward_without_replay_does_not_leak_experts_into_the_next_call
 
     (_, _, forward_idx), (_, _, recompute_idx) = block.router.calls[-2:]
     torch_assert_equal(recompute_idx, forward_idx)
+    gc.collect()
     assert len(block.router._self_replay_captures) == 0
 
 
