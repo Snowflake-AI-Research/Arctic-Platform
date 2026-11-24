@@ -30,6 +30,7 @@ from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
 
 # field -> (module, reader, value when set, value when off)
 SWITCHES = {
+    "frozen_expert_offload": ("moe.frozen_offload", "frozen_expert_offload_requested", True, False),
     "w8a8_experts": ("kernels.fp8_grouped_w8a8", "w8a8_experts_requested", True, False),
     "ultraep_spares": ("moe.ultraep_replicas", "ultraep_spares", 2, 0),
 }
