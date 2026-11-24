@@ -338,6 +338,8 @@ def test_a_dry_run_records_the_configs_and_the_plan_and_submits_nothing(monkeypa
     assert "env         not derived (kubectl is not on PATH)\n" in text
     assert "node cache  not checked: kubectl is not on PATH" in text
     assert "skeletons: not checked (kubectl is not on PATH)" in text
+    assert "\nbackend inventory: not checked: kubectl is not on PATH\n" in text
+    assert plan["backend_inventory"] == {"checked": False, "note": "not checked: kubectl is not on PATH"}
     assert plan["node_cache"]["checked"] is False and plan["jobs"][2]["skeleton"] == "not checked"
     assert set(plan["jobs"][2]["cfg12_candidates"]) == {"none", *keys.CHAT_REASONERS[1:]}
     assert f"publish: {pub}" in text and f"onboard: {onb}" in text
@@ -470,6 +472,7 @@ def test_a_publish_only_run_passes_when_every_config_published(monkeypatch, tmp_
     assert json.loads((tmp_path / "out" / "result.json").read_text())["failed"] == []
     plan = json.loads((tmp_path / "out" / "plan.json").read_text())
     assert "node_cache" not in plan and "visibility" not in plan and all("cfg12" not in j for j in plan["jobs"])
+    assert "backend_inventory" not in plan and "backend inventory" not in (tmp_path / "out" / "plan.txt").read_text()
     assert "| line | job | model_name | max_seq_len | n_gpus | TP |\n" in (tmp_path / "out" / "plan.txt").read_text()
 
 

@@ -479,7 +479,10 @@ def test_a_restricted_dry_run_reports_only_this_images_own_skeletons(tmp_path, m
     assert "skeletons: 1 will restore (all nodes), 1 exist but not on all nodes, 0 will dump\n" in text
     dumped = json.dumps(plan)
     assert "env_candidates" not in plan["node_cache"] and plan["node_cache"]["restricted"] is True
-    for other in (OLD, OLD[:10], "another image", "GLM", "Inkling", "9" * 12):
+    # The backend inventory lists GLM-5.3's skeleton of this env and counts Inkling's cut label, nothing else of them.
+    assert [m["model"] for m in plan["backend_inventory"]["models"]] == [DS, "GLM-5.3", QWEN]
+    assert plan["backend_inventory"]["unattributed"] == {"labels": 2, "models": [INK, NEMO], "kind_unknown": 0}
+    for other in (OLD, OLD[:10], "another image", "9" * 12):
         assert other not in dumped and other not in text, other
 
 
@@ -537,6 +540,174 @@ def test_show_all_restores_the_full_output_for_a_restricted_list(tmp_path, monke
     assert plan["visibility"]["official"] is False and plan["visibility"]["show_all"] is True
     assert "is not the official catalog on main; show_all=true (admin override)\n" in text
     assert any("show_all=true (admin override)" in r.getMessage() for r in caplog.records)
+
+
+LIGHT = "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16"
+OTHER_TAG, OTHER_DIGEST = "dev_20261115_234921_a2c56b581ba-h", "e" * 64
+OTHER = keys.env_hash(OTHER_DIGEST, "580.159.03")
+QWEN_OLD_ONLY, GLM_OLD_ONLY, M_OLD_ONLY = "0123456789ab", "b74ddf49aa1e", "c" * 12
+
+
+def _two_env_cluster(images=((TAG, DIGEST), (OLD_TAG, OLD_DIGEST), (OTHER_TAG, OTHER_DIGEST))):
+    """Four cache nodes with skeletons of ENV and OLD, their labels cut every way, and one node
+    without model labels; the first two list ``images``. Every label's shape:
+
+    Qwen3-0.6B  cut inside env12 (10 shown); 4b84547e3782 on 2 nodes; one cfg12 only under OLD
+    DeepSeek    cut inside cfg12 (9 shown), completed by trying every value; ENV on 3 nodes
+    GLM-5.3     cut after a whole env12, wt12 from its weight label
+    m           not cut
+    mini        cut inside wt12 (3 shown), whose weight label is not on the nodes
+    Inkling     cut after cfg12: one of OTHER (an image the nodes list), one of an unknown env12
+    Nemotron    cut inside ``skeleton``, its weight label cut too: unattributable
+    Lightning   cut before saying skeleton or weight: unattributable
+    """
+    weights = [_label(QWEN, "4aa63a1e185a", "weight"), _label(DS, "4008d4360385", "weight"),
+               _label("GLM-5.3", "c65f56541db7", "weight"), _label("m", "b" * 12, "weight"),
+               _label(INK, "1b4fc9b3215d", "weight"), _label(NEMO, "885c2ca97043", "weight"), f"nvidia.{LIGHT}"]
+    every = [_label(QWEN, f"a65858a869ba_{ENV}_4aa63a1e185a"), _label(QWEN, f"a65858a869ba_{OLD}_4aa63a1e185a"),
+             _label(QWEN, f"{QWEN_OLD_ONLY}_{OLD}_4aa63a1e185a"), _label(DS, f"ed76d47780e3_{OLD}_4008d4360385"),
+             _label("GLM-5.3", f"44c0d7a2a3c1_{ENV}_c65f56541db7"),
+             _label("GLM-5.3", f"{GLM_OLD_ONLY}_{OLD}_c65f56541db7"),
+             _label("m", f"{'a' * 12}_{ENV}_{'b' * 12}"), _label("m", f"{M_OLD_ONLY}_{OLD}_{'b' * 12}"),
+             _label("mini", f"{'d' * 12}_{ENV}_{'e' * 12}"),
+             _label(INK, f"ef8257249a3c_{OTHER}_1b4fc9b3215d"), _label(INK, f"155abe39cfc9_{'9' * 12}_1b4fc9b3215d"),
+             _label(NEMO, f"876cb6ac4a4f_{ENV}_885c2ca97043"), _label(LIGHT, f"{'f' * 12}_{ENV}_{'1' * 12}")]
+    two = [_label(QWEN, f"4b84547e3782_{ENV}_4aa63a1e185a")]
+    three = [_label(DS, f"ed76d47780e3_{ENV}_4008d4360385")]
+    nodes = [_node(*weights, *every, *two, *three), _node(*weights, *every, *two, *three),
+             _node(*weights, *every, *three), _node(*weights, *every), {"metadata": {"labels": {"workergroup": "cpu"}}}]
+    return [_pulled(n, *images) if i < 2 else n for i, n in enumerate(nodes)]
+
+
+def test_the_fixture_labels_are_cut_where_the_docstring_says():
+    shown = {slug: _label(slug, key).rsplit("-", 1)[0][len(f"image-cache.{slug}."):] for slug, key in (
+        (QWEN, f"a65858a869ba_{ENV}_4aa63a1e185a"), (DS, f"ed76d47780e3_{ENV}_4008d4360385"),
+        ("GLM-5.3", f"44c0d7a2a3c1_{ENV}_c65f56541db7"), ("mini", f"{'d' * 12}_{ENV}_{'e' * 12}"),
+        (INK, f"155abe39cfc9_{'9' * 12}_1b4fc9b3215d"), (NEMO, f"876cb6ac4a4f_{ENV}_885c2ca97043"))}
+    assert shown == {QWEN: f"skeleton.a65858a869ba_{ENV[:10]}", DS: "skeleton.ed76d4778",
+                     "GLM-5.3": f"skeleton.44c0d7a2a3c1_{ENV}", "mini": f"skeleton.{'d' * 12}_{ENV}_eee",
+                     INK: "skeleton.155abe39cfc9", NEMO: "skeleto"}
+    assert _label("m", f"{'a' * 12}_{ENV}_{'b' * 12}") == f"image-cache.m.skeleton.{'a' * 12}_{ENV}_{'b' * 12}"
+    assert _label(LIGHT, "x").rsplit("-", 1)[0] == f"image-cache.{LIGHT}"
+    assert keys.repository_digests(_two_env_cluster(), TAG) == {DIGEST, OLD_DIGEST, OTHER_DIGEST}
+    assert keys.repository_digests(_two_env_cluster(), "release_20260101_000000_0123456789a-h") == set()
+
+
+def test_inventory_reads_every_models_skeletons_of_one_env():
+    cache = keys.NodeCache(_two_env_cluster(), [ENV])
+    inv = cache.inventory({ENV}, others={OTHER})
+    assert [(s.slug, s.cfg12, s.env12, s.wt12, s.wt_exact, s.nodes) for s in inv.skeletons] == [
+        (DS, "ed76d47780e3", ENV, "4008d4360385", True, 3),
+        ("GLM-5.3", "44c0d7a2a3c1", ENV, "c65f56541db7", True, 4),
+        ("m", "a" * 12, ENV, "b" * 12, True, 4),
+        ("mini", "d" * 12, ENV, "eee", False, 4),
+        (QWEN, "4b84547e3782", ENV, "4aa63a1e185a", True, 2),
+        (QWEN, "a65858a869ba", ENV, "4aa63a1e185a", True, 4)]
+    assert inv.weights == {(DS, "4008d4360385"): 4, ("GLM-5.3", "c65f56541db7"): 4, ("m", "b" * 12): 4,
+                           ("mini", "eee"): None, (QWEN, "4aa63a1e185a"): 4}
+    assert inv.unattributed == {INK: 1, NEMO: 1, LIGHT: 1} and inv.either == 1
+    # Without the other image's env12 its Inkling label cannot be told either.
+    assert cache.inventory({ENV}).unattributed == {INK: 2, NEMO: 1, LIGHT: 1}
+    old = cache.inventory({OLD}, others={OTHER})
+    assert {(s.slug, s.cfg12) for s in old.skeletons} == {
+        (QWEN, "a65858a869ba"), (QWEN, QWEN_OLD_ONLY), (DS, "ed76d47780e3"), ("GLM-5.3", GLM_OLD_ONLY), ("m", M_OLD_ONLY)}
+    assert old.unattributed == inv.unattributed
+
+
+INVENTORY_ROWS = [
+    f"backend inventory (env {ENV}, image {TAG})",
+    "| model | kind | cfg12 | wt12 | nodes | this list |",
+    "|---|---|---|---|---|---|",
+    f"| {DS} | skeleton | ed76d47780e3 | 4008d4360385 | 3/4 | in this list |",
+    f"| {DS} | weights | - | 4008d4360385 | 4/4 | |",
+    "| GLM-5.3 | skeleton | 44c0d7a2a3c1 | c65f56541db7 | 4/4 | |",
+    "| GLM-5.3 | weights | - | c65f56541db7 | 4/4 | |",
+    f"| m | skeleton | {'a' * 12} | {'b' * 12} | 4/4 | |",
+    f"| m | weights | - | {'b' * 12} | 4/4 | |",
+    f"| mini | skeleton | {'d' * 12} | eee.. | 4/4 | |",
+    "| mini | weights | - | eee.. | ? | |",
+    f"| {QWEN} | skeleton | 4b84547e3782 | 4aa63a1e185a | 2/4 | |",
+    f"| {QWEN} | skeleton | a65858a869ba | 4aa63a1e185a | 4/4 | in this list |",
+    f"| {QWEN} | weights | - | 4aa63a1e185a | 4/4 | |",
+    "backend inventory: 6 skeletons across 5 models (4 on all nodes), 5 weight sets",
+    f"3 skeleton label(s) of models {INK}, {NEMO}, {LIGHT} could not be attributed to an image (labels cut; 1 of "
+    "them are cut before saying skeleton or weight, so they may be weight labels)",
+]
+
+
+def _inventory_text(text):
+    lines = text.splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith("backend inventory"))
+    return lines[start:lines.index("", start)]
+
+
+def test_a_restricted_dry_run_lists_this_envs_skeletons_of_every_model_and_nothing_else(tmp_path, monkeypatch):
+    plan, text = _dry_run(tmp_path, monkeypatch, lambda ctx: _two_env_cluster(), configs=FORK)
+    assert plan["visibility"]["official"] is False
+    assert _inventory_text(text) == INVENTORY_ROWS
+    assert text.index("skeletons: ") < text.index("backend inventory (") < text.index("publish: ")
+    inv = plan["backend_inventory"]
+    assert {k: inv[k] for k in ("checked", "pulled", "image_tag", "env12", "nodes")} == {
+        "checked": True, "pulled": True, "image_tag": TAG, "env12": [ENV], "nodes": 4}
+    assert inv["totals"] == {"skeletons": 6, "models": 5, "on_all_nodes": 4, "weights": 5}
+    assert inv["unattributed"] == {"labels": 3, "models": [INK, NEMO, LIGHT], "kind_unknown": 1}
+    assert [m["model"] for m in inv["models"]] == [DS, "GLM-5.3", "m", "mini", QWEN]
+    qwen = inv["models"][-1]
+    assert qwen["skeletons"][1] == {"cfg12": "a65858a869ba", "env12": ENV, "wt12": "4aa63a1e185a", "wt12_exact": True,
+                                    "nodes": 4, "of": 4, "in_list": True, "jobs": ["qwen3-0.6b-32k-full"]}
+    assert qwen["weights"] == [{"wt12": "4aa63a1e185a", "wt12_exact": True, "nodes": 4, "of": 4}]
+    assert inv["models"][3]["weights"] == [{"wt12": "eee", "wt12_exact": False, "nodes": None, "of": 4}]
+    # The per-job lookup stays restricted to the jobs' own keys.
+    assert "| a65858a869ba | exists: 4/4 nodes |" in text and "| ed76d47780e3 | exists: 3/4 nodes |" in text
+    dumped = json.dumps(plan)
+    for other in (OLD, OLD[:10], OTHER, OTHER[:10], "9" * 12, QWEN_OLD_ONLY, GLM_OLD_ONLY, M_OLD_ONLY,
+                  "155abe39cfc9", "ef8257249a3c", "876cb6ac4a4f", "image-cache.", "another image"):
+        assert other not in dumped and other not in text, other
+
+
+def test_the_inventory_is_the_same_for_official_and_show_all_lists(tmp_path, monkeypatch):
+    for run in ("fork", "official", "show_all"):
+        (tmp_path / run).mkdir()
+    fork, fork_text = _dry_run(tmp_path / "fork", monkeypatch, lambda ctx: _two_env_cluster(), configs=FORK)
+    official, official_text = _dry_run(tmp_path / "official", monkeypatch, lambda ctx: _two_env_cluster())
+    admin, admin_text = _dry_run(tmp_path / "show_all", monkeypatch, lambda ctx: _two_env_cluster(), configs=FORK,
+                                 show_all="true")
+    assert official["visibility"]["official"] is True and admin["visibility"]["show_all"] is True
+    assert fork["backend_inventory"] == official["backend_inventory"] == admin["backend_inventory"]
+    assert _inventory_text(fork_text) == _inventory_text(official_text) == _inventory_text(admin_text) == INVENTORY_ROWS
+    # The official per-job lookup still names the other image.
+    assert "exists for another image: 263a697cd9 4/4" in official_text
+
+
+def test_the_inventory_says_none_when_the_image_is_not_pulled(tmp_path, monkeypatch):
+    plan, text = _dry_run(tmp_path, monkeypatch, lambda ctx: _two_env_cluster(images=((OLD_TAG, OLD_DIGEST),)),
+                          configs=FORK)
+    assert plan["backend_inventory"] == {"checked": True, "pulled": False,
+                                         "note": "none (image not pulled on any node yet)"}
+    assert "\nbackend inventory: none (image not pulled on any node yet)\n" in text
+    assert "backend inventory (" not in text
+    for other in (OLD, OLD[:10], ENV, ENV[:10], "Inkling", "GLM"):
+        assert other not in json.dumps(plan) and other not in text, other
+
+
+def test_the_inventory_is_not_checked_without_kubectl(tmp_path, monkeypatch):
+    def nodes(context):
+        raise semip_job.NodesUnavailable("kubectl is not on PATH")
+
+    plan, text = _dry_run(tmp_path, monkeypatch, nodes, configs=FORK)
+    assert plan["backend_inventory"] == {"checked": False, "note": "not checked: kubectl is not on PATH"}
+    assert "\nbackend inventory: not checked: kubectl is not on PATH\n" in text
+
+
+def test_the_inventory_of_an_ambiguous_tag_holds_each_candidates_skeletons(tmp_path, monkeypatch):
+    nodes = _two_env_cluster(images=())
+    nodes[0], nodes[1] = _pulled(nodes[0], (TAG, DIGEST)), _pulled(nodes[1], (TAG, OLD_DIGEST))
+    plan, text = _dry_run(tmp_path, monkeypatch, lambda ctx: nodes, configs=FORK)
+    inv = plan["backend_inventory"]
+    assert inv["env12"] == sorted([ENV, OLD]) and inv["totals"]["skeletons"] == 11
+    assert f"backend inventory (env {' or '.join(sorted([ENV, OLD]))}, image {TAG})" in text
+    assert "| model | kind | cfg12 | env12 | wt12 | nodes | this list |" in text
+    assert f"| GLM-5.3 | skeleton | {GLM_OLD_ONLY} | {OLD} | c65f56541db7 | 4/4 | |" in text
 
 
 def test_label_shows_the_cfg12_and_env12_characters_left_by_the_cut():

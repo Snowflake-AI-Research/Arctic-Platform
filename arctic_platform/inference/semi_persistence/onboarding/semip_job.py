@@ -93,6 +93,16 @@ each job gets only its own skeleton under this image's env12 (``exists: N/M
 nodes`` or ``none (will dump)``), and nothing about other images or labels.
 Without kubectl either lookup is skipped with a note. ``visibility`` in the
 plan says which, and ``show_all=true`` forces the full lookup.
+
+After the jobs, every list's plan holds the backend inventory: every skeleton
+the nodes verified under this image's env12, for every model (cfg12, wt12,
+nodes, and ``in this list`` when it is one of these jobs'), and the weight sets
+they use, then ``backend inventory: S skeletons across K models (F on all
+nodes), W weight sets``. It is the same for official, restricted and show_all
+lists and holds nothing of another env12. Cut labels are read by recomputing
+their digest (``keys.NodeCache.inventory``); those whose env12 still cannot be
+told are only counted, per model. It is ``none`` when the image is not pulled
+and ``not checked`` without kubectl; ``backend_inventory`` in the plan.
 """
 
 from __future__ import annotations
@@ -158,6 +168,7 @@ ENV_PREFIX_CHARS = 6
 # The H200 driver both clusters run (publish logs); assumed when no cluster source names it.
 DEFAULT_DRIVER_VERSION = "580.159.03"
 NOT_PULLED = "none (will dump; image not pulled on any node yet)"
+INVENTORY_NOT_PULLED = "none (image not pulled on any node yet)"
 
 
 @dataclass(frozen=True)
@@ -486,6 +497,8 @@ class SemipJob:
         self.options = onboard_options(self.tests)
         self.warnings: list[str] = []
         self.envs: set[str] = set()
+        self.other_envs: set[str] = set()
+        self._keyings: dict[str, keys.Keying] = {}
 
     def fetch(self) -> list[ModelSpec]:
         """Resolve and fetch the configs, record where they came from, parse every line."""
@@ -551,6 +564,7 @@ class SemipJob:
             cache, note = self.node_cache(plan)
             lookup = self.skeletons if full else self.own_skeletons
             skeletons = lookup(specs, plan, cache, note)
+            plan["backend_inventory"] = self.inventory(specs, plan, cache, note)
         for s in specs:
             entry = {"name": s.name, "line": line_number(s), "model_name": s.sub_job.get("model_name"),
                      "max_seq_len": s.max_seq_len, "n_gpus": s.n_gpus, "tensor_parallel_size": s.tensor_parallel_size}
@@ -582,14 +596,57 @@ class SemipJob:
         plan["env"] = env
         self.warnings.extend(env_warnings(env))
         self.envs = set(env["env12"])
+        self.other_envs = {keys.env_hash(d, v) for d in keys.repository_digests(items, self.image_tag)
+                           for v in env["drivers"]} - self.envs
         logger.info("env %s", env_text_line(env))
         return keys.NodeCache(items, env["env12"]), None
+
+    def keyings(self, specs: list[ModelSpec]) -> dict[str, keys.Keying]:
+        """Each job's skeleton key as far as its body determines it, by job (computed once)."""
+        for s in specs:
+            if s.name not in self._keyings:
+                self._keyings[s.name] = keys.keying(s.sub_job, json.loads(self.lines[s.name]).get("hardware"))
+        return {s.name: self._keyings[s.name] for s in specs}
+
+    def inventory(self, specs: list[ModelSpec], plan: dict, cache: keys.NodeCache | None,
+                  note: str | None) -> dict:
+        """Every skeleton the nodes verified under this image's env12, for every model, with the
+        weight sets they use, and whether it is one of these jobs'. The same for every list:
+        nothing of another env12 is in it. Recorded as ``plan["backend_inventory"]``."""
+        if cache is None:
+            return {"checked": False, "note": note}
+        if not plan["env"].get("pulled"):
+            return {"checked": True, "pulled": False, "note": INVENTORY_NOT_PULLED}
+        jobs: dict[tuple[str, str], list[str]] = {}
+        for name, k in self.keyings(specs).items():
+            for cfg in [k.cfg12] if k.cfg12 else k.candidates.values():
+                jobs.setdefault((k.slug, cfg), []).append(name)
+        cfgs: dict[str, set[str]] = {}
+        for slug, cfg in jobs:
+            cfgs.setdefault(slug, set()).add(cfg)
+        inv = cache.inventory(self.envs, cfgs, self.other_envs)
+        models: dict[str, dict] = {}
+        for sk in inv.skeletons:
+            model = models.setdefault(sk.slug, {"model": sk.slug, "skeletons": [], "weights": []})
+            mine = jobs.get((sk.slug, sk.cfg12), [])
+            model["skeletons"].append({"cfg12": sk.cfg12, "env12": sk.env12, "wt12": sk.wt12, "wt12_exact": sk.wt_exact,
+                                       "nodes": sk.nodes, "of": cache.nodes, "in_list": bool(mine), "jobs": mine})
+        for (slug, wt), nodes in sorted(inv.weights.items()):
+            models[slug]["weights"].append({"wt12": wt, "wt12_exact": nodes is not None, "nodes": nodes,
+                                            "of": cache.nodes})
+        rows = [models[m] for m in sorted(models, key=lambda m: (m.lower(), m))]
+        totals = {"skeletons": len(inv.skeletons), "models": len(rows),
+                  "on_all_nodes": sum(sk.nodes == cache.nodes for sk in inv.skeletons), "weights": len(inv.weights)}
+        unattributed = {"labels": sum(inv.unattributed.values()), "models": list(inv.unattributed),
+                        "kind_unknown": inv.either}
+        return {"checked": True, "pulled": True, "image_tag": self.image_tag, "env12": sorted(self.envs),
+                "nodes": cache.nodes, "models": rows, "totals": totals, "unattributed": unattributed}
 
     def skeletons(self, specs: list[ModelSpec], plan: dict, cache: keys.NodeCache | None,
                   note: str | None) -> dict[str, dict]:
         """Each job's cfg12 and the skeletons the node cache verified for it, by job;
         sets ``plan["node_cache"]``."""
-        keyings = {s.name: keys.keying(s.sub_job, json.loads(self.lines[s.name]).get("hardware")) for s in specs}
+        keyings = self.keyings(specs)
         pulled = bool(plan["env"].get("pulled"))
         lookups: dict[str, dict] = {}
         chosen: dict[str, set] = {}
@@ -659,7 +716,7 @@ class SemipJob:
         """``skeletons`` for a list that is not the official catalog: only each job's own
         skeleton under this image's env12. Nothing about other images, other cfg12
         candidates or other labels is reported."""
-        keyings = {s.name: keys.keying(s.sub_job, json.loads(self.lines[s.name]).get("hardware")) for s in specs}
+        keyings = self.keyings(specs)
         pulled = bool(plan["env"].get("pulled"))
         hits: dict[str, dict] = {}
         chosen: dict[str, set] = {}
@@ -803,6 +860,8 @@ def plan_text(plan: dict) -> str:
                    else "no candidate's skeleton was found for this image" if cache["checked"]
                    else "the node labels were not checked")
             lines.append(f"cfg12 ?: the job names no reasoning_parser and {why} (plan.json lists the candidates)")
+    if "backend_inventory" in plan:
+        lines += ["", *inventory_lines(plan["backend_inventory"])]
     lines += ["", f"publish: {plan['commands']['publish']}"]
     if "onboard" in plan["commands"]:
         lines.append(f"onboard: {plan['commands']['onboard']}")
@@ -823,6 +882,37 @@ def skeleton_summary(cache: dict) -> str:
     if not cache["pulled"]:
         text += " (image not pulled on any node yet, so no skeleton of it is on the cluster)"
     return text
+
+
+def inventory_lines(inv: dict) -> list[str]:
+    """The plan's backend inventory: this image's skeletons and weight sets per model, the totals,
+    and how many labels could not be told; or the one line saying why there is none."""
+    if not inv["checked"] or not inv["pulled"]:
+        return [f"backend inventory: {inv['note']}"]
+    envs = len(inv["env12"]) > 1
+
+    def wt(entry: dict) -> str:
+        return entry["wt12"] if entry["wt12_exact"] else f"{entry['wt12']}.." if entry["wt12"] else "?"
+
+    lines = [f"backend inventory (env {' or '.join(inv['env12'])}, image {inv['image_tag']})"]
+    if inv["models"]:
+        lines += ["| model | kind | cfg12 |" + (" env12 |" if envs else "") + " wt12 | nodes | this list |",
+                  "|---|---|---|" + ("---|" if envs else "") + "---|---|---|"]
+    for m in inv["models"]:
+        for sk in m["skeletons"]:
+            lines.append(f"| {m['model']} | skeleton | {sk['cfg12']} |" + (f" {sk['env12']} |" if envs else "")
+                         + f" {wt(sk)} | {sk['nodes']}/{sk['of']} |" + (" in this list |" if sk["in_list"] else " |"))
+        for w in m["weights"]:
+            nodes = f"{w['nodes']}/{w['of']}" if w["nodes"] is not None else "?"
+            lines.append(f"| {m['model']} | weights | - |" + (" - |" if envs else "") + f" {wt(w)} | {nodes} | |")
+    t, u = inv["totals"], inv["unattributed"]
+    lines.append(f"backend inventory: {t['skeletons']} skeletons across {t['models']} models "
+                 f"({t['on_all_nodes']} on all nodes), {t['weights']} weight sets")
+    if u["labels"]:
+        lines.append(f"{u['labels']} skeleton label(s) of models {', '.join(u['models'])} could not be attributed to "
+                     "an image (labels cut" + (f"; {u['kind_unknown']} of them are cut before saying skeleton or "
+                                               "weight, so they may be weight labels)" if u["kind_unknown"] else ")"))
+    return lines
 
 
 def env_text_line(env: dict) -> str:

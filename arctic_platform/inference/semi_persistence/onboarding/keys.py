@@ -39,14 +39,20 @@ hashes the staged weights, so it is not computed. The model-cache DaemonSet labe
 characters, cut to 55 plus ``-`` and 7 hex of the directory's sha256. A cut label
 still shows the model, the start of cfg12 and usually of env12, and a key whose
 env12 and wt12 are known (from other labels) is confirmed by recomputing it.
+
+``NodeCache.inventory`` reads every skeleton label that way, for every model: the
+skeletons of one image's env12s and the weight sets they use, and how many
+labels are cut too short to tell whose they are.
 """
 
 from __future__ import annotations
 
 import functools
 import hashlib
+import itertools
 import json
 import re
+from collections import Counter
 from dataclasses import dataclass
 from dataclasses import field
 from typing import Any
@@ -129,6 +135,16 @@ MIN_CFG_CHARS = 8
 _SHOWN_ENV = re.compile(r"\.skeleton\.[0-9a-f]{12}_([0-9a-f]{12})(?:_[0-9a-f]{0,12})?(?:-[0-9a-f]{7})?")
 # The start of an env12 a cut skeleton label shows after a whole cfg12.
 _SHOWN_ENV_START = re.compile(r"\.skeleton\.[0-9a-f]{12}_([0-9a-f]{1,11})-[0-9a-f]{7}")
+# A cut label: what it shows, and 7 hex of the directory's sha256.
+_CUT_LABEL = re.compile(r"(.+)-([0-9a-f]{7})")
+# The part of a skeleton key a label shows: cfg12, env12, wt12, each maybe cut.
+_KEY_SHOWN = re.compile(r"([0-9a-f]{0,12})(?:_([0-9a-f]{0,12})(?:_([0-9a-f]{0,12}))?)?")
+# A base model's label, ``<org>.<model>``.
+_BASE_MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*\.(.+)")
+# A cfg12 cut by at most this many characters is completed with every value (16**n digests per env12 and wt12).
+GUESSED_CFG_CHARS = 3
+# Other images' env12s are tried on a label only while that takes at most this many digests.
+OTHER_ENV_BUDGET = 1 << 16
 
 # semip_engine._NVRM_VERSION_RE: the driver version as the engine hashes it.
 DRIVER_VERSION = re.compile(r"\d+\.\d+(?:\.\d+)?")
@@ -389,6 +405,16 @@ def image_digests(items: list[dict], tag: str) -> dict[str, int]:
     return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
 
 
+def repository_digests(items: list[dict], tag: str) -> set[str]:
+    """Every sha256 digest the nodes list in the repositories image tag ``tag`` is in: the
+    images of the same backend, whichever tag they have."""
+    names = [n for node in items for image in (node.get("status") or {}).get("images") or []
+             for n in image.get("names") or []]
+    repos = {n[:-len(tag) - 1] for n in names if n.endswith(f":{tag}") and "@" not in n}
+    return {d for n in names if "@sha256:" in n for repo, d in [n.rsplit("@sha256:", 1)]
+            if repo in repos and _DIGEST.fullmatch(d)}
+
+
 def node_driver(labels: dict) -> tuple[str, str] | None:
     """``(version, label)`` from a node's GPU Feature Discovery labels, or None."""
     full = labels.get(DRIVER_FULL_LABEL) or ""
@@ -433,6 +459,33 @@ class Lookup:
     unreadable: int = 0
 
 
+@dataclass(frozen=True)
+class Skeleton:
+    """A verified skeleton ``<slug>/skeleton/<cfg12>_<env12>_<wt12>``; ``wt12`` is only the
+    start its label shows when ``wt_exact`` is false."""
+
+    slug: str
+    cfg12: str
+    env12: str
+    wt12: str
+    wt_exact: bool
+    nodes: int
+
+
+@dataclass
+class Inventory:
+    """``NodeCache.inventory``: the skeletons of the asked env12s, the weight sets they use
+    (``(slug, wt12) -> nodes``, None when only the start of wt12 is known; a skeleton whose
+    label shows none of wt12 adds none), and per model the
+    skeleton labels whose env12 could not be told (``either`` of them are cut before the
+    label says skeleton or weight)."""
+
+    skeletons: list
+    weights: dict
+    unattributed: dict
+    either: int = 0
+
+
 class NodeCache:
     """The model-cache nodes' ``ready`` labels, read once from ``kubectl get nodes -o json``."""
 
@@ -442,6 +495,7 @@ class NodeCache:
                  for node in labels if any(k.startswith(LABEL_PREFIX) for k in node)]
         self.ready = cache
         self.nodes = len(cache)
+        self.count = Counter(s for node in cache for s in node)
         self.all = set().union(*cache) if cache else set()
         self.shown_envs = {m.group(1) for s in self.all for m in [_SHOWN_ENV.search(s)] if m}
         self.envs = self.shown_envs | set(envs)
@@ -507,3 +561,145 @@ class NodeCache:
         found = sorted((Found(env, is_exact, n) for (env, is_exact), n in per_env.items()),
                        key=lambda f: (-f.nodes, f.env))
         return Lookup(found, unreadable)
+
+    def slugs(self) -> set[str]:
+        """The model names labels show whole: image-cache skeleton and weight labels (also
+        those cut inside ``skeleton`` or ``weight``), and base models' ``<org>.<model>``
+        labels that are not cut."""
+        pub = _publisher()
+        root = _segment_prefix(f"{pub.DEFAULT_PREFIX}/")
+        kinds = re.compile(rf"(.+?)\.(?:{pub.SKELETON_DIR}|{pub.WEIGHT_DIR})\.")
+        out = set()
+        for s in self.all:
+            m = kinds.match(s, len(root)) if s.startswith(root) else None
+            cut = _CUT_LABEL.fullmatch(s)
+            if m:
+                out.add(m.group(1))
+            elif s.startswith(root) and cut:
+                head, _, tail = cut.group(1)[len(root):].rpartition(".")
+                if head and tail and (pub.SKELETON_DIR.startswith(tail) or pub.WEIGHT_DIR.startswith(tail)):
+                    out.add(head)
+            elif not s.startswith(root) and not (cut and len(s) > _CUT):
+                base = _BASE_MODEL.fullmatch(s)
+                if base:
+                    out.add(base.group(1))
+        return out
+
+    @staticmethod
+    def _readings(segment: str, root: str, slugs: set[str]) -> list[tuple[str, str, str, str | None]]:
+        """``(slug, kind, key shown, digest)`` for each model ``segment`` can be a label of: kind
+        ``skeleton``, ``weight``, or ``either`` when it is cut before saying which; digest is
+        the 7 hex of a cut label, else None."""
+        pub = _publisher()
+        cut = _CUT_LABEL.fullmatch(segment)
+        shown, digest = (cut.group(1), cut.group(2)) if cut else (segment, None)
+        out = []
+        for slug in slugs:
+            head = f"{root}{slug}."
+            if shown.startswith(head):
+                tail = shown[len(head):]
+                for kind in (pub.SKELETON_DIR, pub.WEIGHT_DIR):
+                    if tail.startswith(f"{kind}."):
+                        out.append((slug, kind, tail[len(kind) + 1:], digest))
+                    elif digest and kind.startswith(tail):
+                        out.append((slug, kind, "", digest))
+            elif digest and head.startswith(shown) and len(shown) > len(root):
+                out.append((slug, "either", "", digest))
+        return out
+
+    def inventory(self, envs: set[str] | list[str], cfgs: dict[str, set[str]] | None = None,
+                  others: set[str] | list[str] = ()) -> Inventory:
+        """Every skeleton the nodes verified whose env12 is in ``envs``, for every model, and the
+        weight sets they use.
+
+        A label is read as the key whose recomputed label (``sanitize_label_segment``) it is,
+        trying the cfg12s labels or ``cfgs`` (slug -> cfg12s) show whole, every completion of a
+        cfg12 cut by at most ``GUESSED_CFG_CHARS``, the env12s of ``self.envs`` and ``envs``
+        (and of ``others``, other images, within ``OTHER_ENV_BUDGET`` digests), and the wt12s
+        labels show whole. A label no single key fits is still of ``envs`` if it shows one of
+        them whole, of another image if the start of env12 it shows begins none of them, and
+        otherwise counted in ``unattributed`` under its model.
+        """
+        pub = _publisher()
+        root = _segment_prefix(f"{pub.DEFAULT_PREFIX}/")
+        targets = set(envs)
+        all_envs = sorted(self.envs | targets)
+        other_envs = sorted(set(others) - set(all_envs))
+        cfgs = cfgs or {}
+        slugs = self.slugs() | set(cfgs)
+        readings = {s: self._readings(s, root, slugs) for s in self.all if s.startswith(root)}
+        known_cfgs = {slug: set(c) for slug, c in cfgs.items()}
+        known_wts: dict[str, set[str]] = {}
+        for found in readings.values():
+            for slug, kind, shown, digest in found:
+                if kind == pub.WEIGHT_DIR and digest is None and _HEX12.fullmatch(shown):
+                    known_wts.setdefault(slug, set()).add(shown)
+                key = _KEY_SHOWN.fullmatch(shown) if kind == pub.SKELETON_DIR else None
+                if key and len(key.group(1)) == HASH_LEN:
+                    known_cfgs.setdefault(slug, set()).add(key.group(1))
+                    if len(key.group(3) or "") == HASH_LEN:
+                        known_wts.setdefault(slug, set()).add(key.group(3))
+        weight_label = {(slug, wt): pub.sanitize_label_segment(f"{pub.DEFAULT_PREFIX}/{slug}/{pub.WEIGHT_DIR}/{wt}")
+                        for slug, wts in known_wts.items() for wt in wts}
+        weight_labels = set(weight_label.values())
+        skeletons, weights, unattributed, either = [], {}, Counter(), 0
+        for segment in sorted(readings):
+            found = [r for r in readings[segment] if r[1] != pub.WEIGHT_DIR]
+            if segment in weight_labels or (not found and (readings[segment] or not _CUT_LABEL.fullmatch(segment))):
+                continue
+            fits, exact, starts = set(), set(), []
+            for slug, kind, shown, digest in found:
+                key = _KEY_SHOWN.fullmatch(shown)
+                if not key:
+                    continue
+                cfg, env, wt = (part or "" for part in key.groups())
+                if digest is None:
+                    if len(cfg) == len(env) == len(wt) == HASH_LEN:
+                        fits.add((slug, cfg, env, wt))
+                    continue
+                starts.append(env)
+                if len(env) == HASH_LEN:
+                    exact.add((slug, cfg, env, wt))
+                cfg_options = _completions(cfg, known_cfgs.get(slug, set()))
+                wt_options = [wt] if len(wt) == HASH_LEN else sorted(w for w in known_wts.get(slug, ()) if w.startswith(wt))
+                env_options = [env] if len(env) == HASH_LEN else [e for e in all_envs if e.startswith(env)]
+                if len(env) < HASH_LEN:
+                    more = [e for e in other_envs if e.startswith(env)]
+                    if len(cfg_options) * len(more) * len(wt_options) <= OTHER_ENV_BUDGET:
+                        env_options += more
+                for c, e, w in itertools.product(cfg_options, env_options, wt_options):
+                    name = f"{pub.DEFAULT_PREFIX}/{slug}/{pub.SKELETON_DIR}/{c}_{e}_{w}"
+                    if hashlib.sha256(name.encode()).hexdigest()[:7] == digest and pub.sanitize_label_segment(name) == segment:
+                        fits.add((slug, c, e, w))
+            mine = {k for k in fits if k[2] in targets}
+            if len(fits) == 1 or (fits and not mine):
+                if mine:
+                    slug, cfg, env, wt = next(iter(mine))
+                    skeletons.append(Skeleton(slug, cfg, env, wt, True, self.count[segment]))
+                    weights[(slug, wt)] = self.count.get(weight_label[(slug, wt)], 0)
+                continue
+            if not fits and len(exact) == 1:
+                slug, cfg, env, wt = next(iter(exact))
+                if env in targets:
+                    skeletons.append(Skeleton(slug, cfg, env, wt, False, self.count[segment]))
+                    if wt:
+                        weights.setdefault((slug, wt), None)
+                continue
+            if starts and all(s and not any(t.startswith(s) for t in targets) for s in starts):
+                continue
+            models = sorted({r[0] for r in found})
+            unattributed[models[0] if len(models) == 1 else segment[len(root):].rsplit("-", 1)[0] + ".."] += 1
+            either += all(r[1] == "either" for r in found)
+        skeletons.sort(key=lambda s: (s.slug.lower(), s.slug, s.cfg12, s.env12))
+        return Inventory(skeletons, weights, dict(sorted(unattributed.items(), key=lambda kv: kv[0].lower())), either)
+
+
+def _completions(shown: str, known: set[str]) -> list[str]:
+    """The cfg12s a label showing ``shown`` of one can name: the ``known`` ones starting with it,
+    and every completion when at most ``GUESSED_CFG_CHARS`` are cut."""
+    if len(shown) == HASH_LEN:
+        return [shown]
+    out = {c for c in known if c.startswith(shown)}
+    if HASH_LEN - len(shown) <= GUESSED_CFG_CHARS:
+        out.update(shown + "".join(t) for t in itertools.product("0123456789abcdef", repeat=HASH_LEN - len(shown)))
+    return sorted(out)

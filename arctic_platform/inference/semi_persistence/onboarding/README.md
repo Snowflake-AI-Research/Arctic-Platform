@@ -295,6 +295,39 @@ labels or reasoning_parser candidates; without `kubectl` it says
 is for admins: it forces the full output for any list and is logged; it only
 changes what is printed, not who can read the node labels.
 
+Every list's plan then has a backend inventory: every skeleton the nodes
+verified under this image's env12, for every model, not only the list's. Each
+row gives the model, cfg12, wt12 and on how many model-cache nodes it is, and
+says `in this list` when it is one of the list's jobs' keys. Each model's
+skeletons are followed by the weight sets they use. The section is the same
+for official, restricted and `show_all` lists, and never includes another
+env12's skeletons:
+
+```
+backend inventory (env fc37441c0c27, image release_20261119_163502_6ed8c6d2361-h)
+| model | kind | cfg12 | wt12 | nodes | this list |
+|---|---|---|---|---|---|
+| Qwen3-0.6B | skeleton | 4b84547e3782 | 4aa63a1e185a | 14/14 | in this list |
+| Qwen3-0.6B | skeleton | a65858a869ba | 4aa63a1e185a | 14/14 | in this list |
+| Qwen3-0.6B | weights | - | 4aa63a1e185a | 14/14 | |
+backend inventory: 44 skeletons across 19 models (44 on all nodes), 26 weight sets
+12 skeleton label(s) of models NVIDIA-Nemotron-3-Nano-30B-A3B-BF16, NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16 could not be attributed to an image (labels cut; ...)
+```
+
+A cut label is read as the key whose recomputed label (including its 7-hex
+digest) it is. The candidates are the cfg12s that labels or the list's jobs
+show whole, every completion of a cfg12 that is cut by at most 3 characters,
+the env12s of skeleton labels and of the backend's other images on the nodes,
+and the wt12s that labels show whole. A label is still this image's if it
+shows the env12 whole (wt12 is then `..`-cut when it cannot be recovered). It
+is another image's if the start of env12 it shows does not match. Otherwise it
+is only counted, per model, without its key. That happens to labels cut before
+cfg12 whose weight label is cut too, and to labels cut before they say
+`skeleton` or `weight`. Without `kubectl` the section is `backend inventory:
+not checked: <reason>`. When no node lists the image, it is `backend inventory:
+none (image not pulled on any node yet)`. `plan.json` holds the same data as
+`backend_inventory`.
+
 ## Model configs
 
 Configs come from the model catalog (`model-catalog/models/` in cortex-training):
