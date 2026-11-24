@@ -18,6 +18,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.device_mesh import DeviceMesh
 
+from arctic_platform.model.implementations.moe.deepspeed_integration import prepare_moe_weights as _prepare_moe_weights
+
+from .model_builder import prepare_weight_conversion
+from .model_builder import resolve_weight_source
+
 from .config import DebugModelConfig, ModelConfig
 from .sequence_parallel import apply_sequence_parallelism
 from .model_builder import (
@@ -266,6 +271,8 @@ def _adapter() -> MoEDeepSpeedAdapter:
         shared_expert_type=FeedForward,
         shared_expert_forward=shared_expert_mlp_forward,
         build_model_config=_build_model_config,
+        resolve_weight_source=resolve_weight_source,
+        prepare_weight_conversion=prepare_weight_conversion,
         vllm_weight_export=_build_iter_full_vllm_weights,
     )
 
@@ -420,3 +427,13 @@ def load_generic_moe_model(
     )
     maybe_apply_row_invariant_projections(model, options.model_dump())
     return model
+
+
+def prepare_qwen3_5_moe_weights(**kwargs):
+    """Fill the converted-weight cache ``load_qwen3_5_moe_model`` loads from; see ``prepare_moe_weights``."""
+    return _prepare_moe_weights(_adapter(), **kwargs)
+
+
+def prepare_generic_moe_weights(**kwargs):
+    """Fill the converted-weight cache ``load_generic_moe_model`` loads from; see ``prepare_moe_weights``."""
+    return _prepare_moe_weights(_generic_adapter(), **kwargs)

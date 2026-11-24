@@ -354,7 +354,7 @@ def test_direct_load_vlm_names_and_export_roundtrip(tmp_path):
 
 
 @pytest.mark.parametrize("builder_name", ["qwen35", "glm52"])
-@pytest.mark.parametrize("cache_location", ["missing", "sibling", "hashed", "incomplete"])
+@pytest.mark.parametrize("cache_location", ["missing", "sibling", "hashed", "incomplete", "prepared"])
 def test_builder_load_expert_step_and_native_resume(
     tmp_path, monkeypatch, builder_name, single_rank_group, cache_location
 ):
@@ -405,6 +405,16 @@ def test_builder_load_expert_step_and_native_resume(
         convert_checkpoint(checkpoint)
     elif cache_location == "hashed":
         convert_checkpoint(checkpoint, dest=hashed_conversion_cache_path(cache_root, checkpoint, "prime"))
+    elif cache_location == "prepared":
+        prepared = builder.prepare_weight_conversion(
+            new_model("meta"),
+            ModelConfig(name=str(checkpoint), fsdp_cpu_offload=True, weight_conversion_cache_dir=str(cache_root)),
+            checkpoint,
+            rank=0,
+            local_rank=0,
+        )
+        assert prepared == hashed_conversion_cache_path(cache_root, checkpoint, "prime")
+        assert builder.conversion_cache_ready(prepared)
     elif cache_location == "incomplete":
         incomplete = checkpoint / "prime"
         incomplete.mkdir()

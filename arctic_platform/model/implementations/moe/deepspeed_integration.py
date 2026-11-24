@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from typing import Callable
 from typing import Mapping
@@ -19,6 +20,7 @@ from arctic_platform.model.implementations.gpu.tiled_mlp import enable_tiled_mlp
 
 from .config import DISPATCH_EP_BACKENDS
 from .distributed.ep_backend import uses_dispatch_ep
+from .conversion_cache import record_conversion_preparation_failure
 from .distributed.expert_parallel import DeepEPExpertParallel
 from .distributed.expert_parallel import DeepEPShardParallel
 from .layers.moe import LatentMoE
@@ -46,6 +48,9 @@ class MoEDeepSpeedAdapter:
     shared_expert_forward: Callable[[nn.Module, torch.Tensor], torch.Tensor]
     build_model_config: Callable[[str, int, int, str, str, Any], Any]
     vllm_weight_export: Callable[[nn.Module], Callable] | None = None
+    # Conversion runs without a process group before the distributed load.
+    resolve_weight_source: Callable[[Any], Path] | None = None
+    prepare_weight_conversion: Callable[..., Path | None] | None = None
 
 
 # Largest EP-group gather assembled on the master GPU in one piece during weight export.
@@ -271,6 +276,20 @@ def build_iter_full_hf_weights(model: nn.Module):
     return iterator
 
 
+def _configure_model_for_weight_loading(adapter, model, config, *, fused_cross_entropy=False):
+    adapter.configure_moe_ep_backend(model, config)
+    adapter.configure_family_backend(config)
+    chunk_size = (
+        config.fused_lm_head_token_chunk_size if isinstance(config.fused_lm_head_token_chunk_size, int) else None
+    )
+    adapter.inject_lm_head(
+        model,
+        chunk_size=chunk_size,
+        fused_cross_entropy=fused_cross_entropy,
+        fp32_lm_head=config.fp32_lm_head,
+    )
+
+
 def setup_model_local_no_train(
     adapter: MoEDeepSpeedAdapter,
     config: Any,
@@ -288,18 +307,7 @@ def setup_model_local_no_train(
         device=torch.device("meta"),
         dtype=adapter.dtype_map[config.optimization_dtype],
     )
-    adapter.configure_moe_ep_backend(model, config)
-    adapter.configure_family_backend(config)
-
-    chunk_size = (
-        config.fused_lm_head_token_chunk_size if isinstance(config.fused_lm_head_token_chunk_size, int) else None
-    )
-    adapter.inject_lm_head(
-        model,
-        chunk_size=chunk_size,
-        fused_cross_entropy=fused_cross_entropy,
-        fp32_lm_head=config.fp32_lm_head,
-    )
+    _configure_model_for_weight_loading(adapter, model, config, fused_cross_entropy=fused_cross_entropy)
     if parallel_dims.ep_enabled:
         apply_ep_with_mesh(model, config, ep_mesh)
     adapter.apply_sequence_parallelism(model, sp_size, sp_group)
@@ -355,6 +363,59 @@ def load_moe_model_for_deepspeed(
         ),
     )
     return model
+
+
+@record_conversion_preparation_failure(distributed=False, heartbeat=False)
+def prepare_moe_weights(
+    adapter: MoEDeepSpeedAdapter,
+    *,
+    model_name: str,
+    optimization_dtype: str,
+    attn_implementation: str,
+    ep_size: int,
+    world_size: int,
+    options: Any,
+    rank: int,
+    local_rank: int,
+) -> Path | None:
+    """Fill the converted-weight cache that ``load_moe_model`` with the same arguments loads from.
+
+    Runs without a process group, on a meta-device model, so one process per node can convert before the training
+    job starts and the distributed load then finds a ready cache. Returns the cache path, or None when the family
+    has no conversion step, the checkpoint already matches the model's format, or the model is randomly initialized.
+
+    ``rank`` is the global training rank, not a per-node counter. Shared caches have one global-rank-zero
+    writer; other ranks wait for readiness. Node-local caches use one file-lock-selected writer on each node.
+    Before distributed initialization, shared-cache processes must receive one common
+    ``DSS_WEIGHT_CONVERSION_ATTEMPT_ID`` from their launcher, changed on every retry. The writer's heartbeat
+    and failure records use this identity, not shared-lock coherence or synchronized wall clocks.
+    """
+    if adapter.resolve_weight_source is None or adapter.prepare_weight_conversion is None:
+        return None
+    if world_size % ep_size:
+        raise ValueError(f"world_size={world_size} must be divisible by ep_size={ep_size}")
+    if not 0 <= rank < world_size:
+        raise ValueError(f"global rank={rank} must be in [0, world_size={world_size})")
+    model_config = adapter.build_model_config(
+        model_name,
+        ep_size,
+        world_size // ep_size,
+        optimization_dtype,
+        attn_implementation,
+        options,
+    )
+    if model_config.debug.random_init:
+        return None
+    source_path = adapter.resolve_weight_source(model_config)
+    model = adapter.get_model(
+        model_config,
+        device=torch.device("meta"),
+        dtype=adapter.dtype_map[model_config.optimization_dtype],
+    )
+    _configure_model_for_weight_loading(adapter, model, model_config)
+    # EP/SP, activation checkpointing and fused CE do not affect today's substring-based format classifier.
+    # Keep this setup aligned with loading if classification ever becomes sensitive to the full parameter keys.
+    return adapter.prepare_weight_conversion(model, model_config, source_path, rank=rank, local_rank=local_rank)
 
 
 def load_moe_model(
