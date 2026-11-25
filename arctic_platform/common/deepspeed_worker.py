@@ -61,6 +61,9 @@ from arctic_platform.model import ds_worker_dense_model_spec
 from arctic_platform.model import ds_worker_moe_model_spec
 from arctic_platform.model import preserve_fp8_params_through_ds_cast
 from arctic_platform.model.implementations.debug.gpu_memory import gpu_memory_debug_config
+from arctic_platform.model.implementations.gpu.sp.utils import run_sequence_parallel_grpo
+from arctic_platform.model.implementations.gpu.sp.utils import validate_sequence_parallel_microbatches
+from arctic_platform.model.implementations.gpu.sp.utils import verify_sequence_parallel_reduction
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +179,8 @@ class DeepSpeedWorker:
             ds_worker_config["sequence_parallel"] = ds_worker_config["sp_size"]
         self.ds_worker_config = ds_worker_config
         self.sp_size = sp_size_from_job_config({**job_config, "ds_worker_config": ds_worker_config})
+        if self.job_type == "log_prob" and self.sp_size > 1:
+            raise ValueError("Sequence-parallel log_prob jobs are not supported by the forward-only DeepSpeed engine")
 
         # Build the DeepSpeed config per job type. Training engines get an
         # optimizer; the reference/log-prob engine is forward-only and is
@@ -193,12 +198,9 @@ class DeepSpeedWorker:
         debug_config = job_config.get("training_config")
         debug = gpu_memory_debug_config(debug_config if debug_config is not None else ds_worker_config)
         ep_size = int(ds_worker_config.get("ep_size", 1))
-        # The MoE loader owns expert- and sequence-parallel layout, so only dense loading is gated here.
         if ep_size > 1:
             spec = ds_worker_moe_model_spec(model_name, {**ds_worker_config, "debug": debug})
         else:
-            if self.sp_size != 1:
-                raise ValueError("on-prem sequence-parallel data dispatch is not wired; sp_size must be 1")
             model_provider = ds_worker_config.get("model_provider", "huggingface")
             if model_provider not in {"huggingface", "liger"}:
                 raise ValueError(f"on-prem dense training does not support model_provider={model_provider!r}")
@@ -295,6 +297,10 @@ class DeepSpeedWorker:
 
         ep_size = spec.parallelism.expert_parallel
         sp_size = spec.parallelism.sequence_parallel
+        if ep_size > 1 and sp_size > 1:
+            raise ValueError("SP GRPO currently requires ep_size=1; EP>1 gradient parity is not established")
+        if sp_size > 1 and (ds_config.get("zero_optimization") or {}).get("stage") != 2:
+            raise ValueError("SP GRPO requires ZeRO stage 2 before model initialization")
         self.mpu, self.sp_group, self.sp_rank, self.ep_group = None, None, 0, None
         if ep_size == sp_size == 1:
             return None
@@ -498,50 +504,79 @@ class DeepSpeedWorker:
     def _forward_maybe_backward(self, batch: dict, backward: bool) -> dict:
         # torch.autograd.set_detect_anomaly(True)
 
-        pr0(f"_forward_maybe_backward mode: {backward=}")
         PROFILE = False
-        # if backward:
-        #     PROFILE = True
-        if PROFILE:
-            torch.cuda.memory._record_memory_history(max_entries=int(1e12))
-        see_memory_usage("_forward_maybe_backward start", force=True)
 
         from arctic_platform import sft_profile
         from arctic_platform.rl.processors.base_loss import _pop_loss_object
 
-        loss_object = _pop_loss_object(batch)
-        args, batch_data, meta_data, processing = unpack_batch(batch)
-        with sft_profile.timed("h2d"):
-            if isinstance(batch_data, list):
-                batch_data = [self._move_batch_to_device(mb, self._device) for mb in batch_data]
-            else:
-                batch_data = self._move_batch_to_device(batch_data, self._device)
-            if sft_profile.enabled() and torch.cuda.is_available():
-                torch.cuda.synchronize()
-
         tag = "forward_only" if not backward else "forward_backward"
+        loss_object = None
+        args, meta_data, processing = {}, {}, {}
+        batch_data = None
+        grad_accum_steps = None
+        micro_batch_data = []
 
-        if isinstance(batch_data, list):
-            for i, mb in enumerate(batch_data):
-                log_dp_shard_tokens(self.rank, f"{tag} shard mb{i}", mb, meta_data)
-            pr0(f"[DeepSpeedWorker] {tag}: gas_list={len(batch_data)} {meta_data.keys()=} {processing.keys()=}")
-        else:
-            log_dp_shard_tokens(self.rank, f"{tag} shard", batch_data, meta_data)
-            pr0(f"[DeepSpeedWorker] {tag}: {batch_data.keys()=} {meta_data.keys()=} {processing.keys()=}")
-            for k, v in batch_data.items():
-                pr0(f"[DeepSpeedWorker] {tag}: {k=}: shape={getattr(v, 'shape', type(v).__name__)}")
+        def prepare_request():
+            nonlocal loss_object, args, batch_data, grad_accum_steps, meta_data, processing
+            pr0(f"_forward_maybe_backward mode: {backward=}")
+            if PROFILE:
+                torch.cuda.memory._record_memory_history(max_entries=int(1e12))
+            see_memory_usage("_forward_maybe_backward start", force=True)
+            loss_object = _pop_loss_object(batch)
+            args, batch_data, request_meta, request_processing = unpack_batch(batch)
+            if self.sp_size > 1:
+                # Keep the dictionaries passed to collective admission populated in place.
+                meta_data.update(request_meta)
+                processing.update(request_processing)
+                if args:
+                    raise ValueError("SP model route requires named token inputs, not positional arguments")
+            else:
+                meta_data, processing = request_meta, request_processing
+            with sft_profile.timed("h2d"):
+                if isinstance(batch_data, list):
+                    batch_data = [self._move_batch_to_device(mb, self._device) for mb in batch_data]
+                else:
+                    batch_data = self._move_batch_to_device(batch_data, self._device)
+                if sft_profile.enabled() and torch.cuda.is_available():
+                    torch.cuda.synchronize()
 
-        grad_accum_steps = self.engine.gradient_accumulation_steps()
-        # H3: list-of-microbatches from the client skips concat→split_dict.
-        if isinstance(batch_data, list):
-            micro_batch_data = batch_data
-            if len(micro_batch_data) != grad_accum_steps:
-                raise ValueError(
-                    f"Received {len(micro_batch_data)} GAS microbatches but "
-                    f"engine.gradient_accumulation_steps()={grad_accum_steps}"
-                )
+            if isinstance(batch_data, list):
+                for i, mb in enumerate(batch_data):
+                    log_dp_shard_tokens(self.rank, f"{tag} shard mb{i}", mb, meta_data)
+                pr0(f"[DeepSpeedWorker] {tag}: gas_list={len(batch_data)} {meta_data.keys()=} {processing.keys()=}")
+            else:
+                log_dp_shard_tokens(self.rank, f"{tag} shard", batch_data, meta_data)
+                pr0(f"[DeepSpeedWorker] {tag}: {batch_data.keys()=} {meta_data.keys()=} {processing.keys()=}")
+                for k, v in batch_data.items():
+                    pr0(f"[DeepSpeedWorker] {tag}: {k=}: shape={getattr(v, 'shape', type(v).__name__)}")
+
+            grad_accum_steps = self.engine.gradient_accumulation_steps()
+            if isinstance(batch_data, list):
+                if len(batch_data) != grad_accum_steps:
+                    raise ValueError(
+                        f"Received {len(batch_data)} GAS microbatches but "
+                        f"engine.gradient_accumulation_steps()={grad_accum_steps}"
+                    )
+                micro_batch_data.extend(batch_data)
+            else:
+                micro_batch_data.extend(split_dict(batch_data, grad_accum_steps))
+
+        sp_info = None
+        if self.sp_size > 1:
+            sp_info = validate_sequence_parallel_microbatches(
+                micro_batch_data,
+                sp_info=self.get_sequence_parallel_info,
+                synchronize=True,
+                device=self._device,
+                meta=meta_data,
+                processing=processing,
+                backward=backward,
+                ep_group=getattr(self, "ep_group", None),
+                sp_group=self.sp_group,
+                request_check=prepare_request,
+            )
         else:
-            micro_batch_data = split_dict(batch_data, grad_accum_steps)
+            prepare_request()
         num_micro_batches = len(micro_batch_data)
         pipeline_micro_batch_outputs = []
         return_tensors = meta_data.get("worker_return_tensors", False)
@@ -554,35 +589,52 @@ class DeepSpeedWorker:
         from arctic_platform.rl.processors import resolve_loss
         from arctic_platform.sft.processor import SFT_LOSS_FNS
 
-        if loss_object is None and loss_fn is not None:
-            loss_object = resolve_loss(loss_fn)
-        if loss_object is not None:
-            loss_object.model_call_count_callback(
-                [num_micro_batches],
-                processing.get("config") or {},
-            )
-        legacy_sft_loss = LOSS_FNS.get(loss_fn) if loss_fn in SFT_LOSS_FNS else None
-        use_sft_pipeline = (
-            legacy_sft_loss is not None
-            and loss_object is not None
-            and loss_object.is_legacy_adapter_for(legacy_sft_loss)
-        )
-
-        if use_sft_pipeline:
-            self._inject_sft_global_token_meta(loss_fn, batch_data, meta_data)
-
+        use_sft_pipeline = False
         loss_reduction = None
-        if not use_sft_pipeline:
-            from arctic_platform.rl.processors import resolve_packed_loss_reduction
 
-            loss_reduction = resolve_packed_loss_reduction(
-                processing,
-                [{**meta_data, **micro_batch} for micro_batch in micro_batch_data],
-                require_declared=False,
-                loss_object=loss_object,
+        def prepare_loss():
+            nonlocal loss_object, use_sft_pipeline, loss_reduction
+            if sp_info is not None and backward:
+                verify_sequence_parallel_reduction(self.engine, sp_info=sp_info, sp_group=self.sp_group)
+            if loss_object is None and loss_fn is not None:
+                loss_object = resolve_loss(loss_fn)
+            if loss_object is not None:
+                loss_object.model_call_count_callback([num_micro_batches], processing.get("config") or {})
+            legacy_sft_loss = LOSS_FNS.get(loss_fn) if loss_fn in SFT_LOSS_FNS else None
+            use_sft_pipeline = (
+                legacy_sft_loss is not None
+                and loss_object is not None
+                and loss_object.is_legacy_adapter_for(legacy_sft_loss)
             )
+            if use_sft_pipeline:
+                self._inject_sft_global_token_meta(loss_fn, batch_data, meta_data)
+            else:
+                from arctic_platform.rl.processors import resolve_packed_loss_reduction
+
+                loss_reduction = resolve_packed_loss_reduction(
+                    processing,
+                    [{**meta_data, **micro_batch} for micro_batch in micro_batch_data],
+                    require_declared=False,
+                    loss_object=loss_object,
+                )
 
         pr0(f"mbs {len(micro_batch_data)=} {grad_accum_steps=}")
+
+        if sp_info is not None:
+            validate_sequence_parallel_microbatches(
+                micro_batch_data,
+                sp_info=sp_info,
+                synchronize=True,
+                device=self._device,
+                request_check=prepare_loss,
+                loss_scales=lambda: loss_reduction.loss_scales if loss_reduction is not None else None,
+                sp_group=self.sp_group,
+                meta=meta_data,
+                processing=processing,
+                backward=backward,
+            )
+        else:
+            prepare_loss()
 
         for i, micro_batch in enumerate(micro_batch_data):
 
@@ -626,6 +678,21 @@ class DeepSpeedWorker:
                     processing,
                     device=self._device,
                     backward=backward,
+                )
+            elif sp_info is not None:
+                if backward:
+                    self.engine.set_gradient_accumulation_boundary(i == num_micro_batches - 1)
+                micro_batch_output = run_sequence_parallel_grpo(
+                    self.engine,
+                    micro_batch,
+                    meta_data,
+                    processing,
+                    self._device,
+                    sp_info=sp_info,
+                    sp_group=self.sp_group,
+                    backward=backward,
+                    loss_object=loss_object,
+                    loss_scale=1.0 if loss_reduction is None else loss_reduction.loss_scales[i],
                 )
             else:
                 from arctic_platform.rl.processors import apply_packed_loss_reduction
@@ -698,7 +765,6 @@ class DeepSpeedWorker:
             exit()
 
         pr0(f"[DeepSpeedWorker] {tag}: {pipeline_outputs.keys()=}")
-        from arctic_platform import sft_profile
 
         if sft_profile.enabled():
             metrics = pipeline_outputs.get("metrics")
@@ -707,6 +773,12 @@ class DeepSpeedWorker:
             metrics = sft_profile.merge_into_metrics(metrics)
             pipeline_outputs["metrics"] = metrics
             sft_profile.maybe_print(f"worker rank{self.rank} {tag}", metrics.get("_profile_ms"))
+        if sp_info is not None:
+            if self.get_sequence_parallel_info() != sp_info:
+                raise RuntimeError("SP worker membership changed during model execution")
+            if backward:
+                verify_sequence_parallel_reduction(self.engine, sp_info=sp_info, sp_group=self.sp_group)
+            pipeline_outputs["_sequence_parallel_info"] = sp_info
         return pipeline_outputs
 
     def forward_backward(self, batch: dict) -> dict:
