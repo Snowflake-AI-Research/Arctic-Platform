@@ -7,6 +7,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from arctic_platform.common.packing.layout import get_stashed_layout
+from arctic_platform.common.packing.layout import prefix_varlen_args
+from arctic_platform.common.packing.layout import register_native_prefix_attention
+from arctic_platform.common.packing.layout import require_dense_attention_layout
+
 from .norms import RMSNorm, RMSNormConfig
 from .rotary_emb import apply_rotary_pos_emb
 
@@ -24,8 +29,39 @@ except ImportError:
 
 try:
     from flash_attn.cute import flash_attn_varlen_func as flash_attn_4_varlen_func
-except ImportError:
+# Some flash_attn builds raise AttributeError, not ImportError, while importing ``flash_attn.cute``.
+except (ImportError, AttributeError):
     flash_attn_4_varlen_func = None  # type: ignore
+
+
+def flash_varlen_call(
+    call: Callable,
+    version: int,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    sharing: bool,
+    **kwargs,
+) -> torch.Tensor:
+    """Run ``version``'s varlen kernel ``call`` on [total_tokens, heads, dim] q/k/v; ``sharing`` is a prefix-sharing call."""
+    if version == 4:
+        # FA4's flash_attn_varlen_func has qv as the 4th positional arg,
+        # so cu_seqlens must be passed as keyword args to avoid misalignment.
+        kwargs["cu_seqlens_q"] = cu_seqlens_q
+        kwargs["cu_seqlens_k"] = cu_seqlens_k
+        # max_seqlen is GPU-checked only under prefix sharing, which using_layout allows only on a flash-attn-4
+        # that takes it; other FA4 calls keep sizing to the packed width.
+        if sharing:
+            kwargs["max_seqlen_q"] = max_seqlen_q
+            kwargs["max_seqlen_k"] = max_seqlen_k
+        out = call(q, k, v, **kwargs)
+    else:
+        out = call(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs)
+    return out[0] if isinstance(out, tuple) else out
 
 
 @dataclass
@@ -46,6 +82,7 @@ class AttentionConfig:
 # Otherwise, do ABC or something to make the signatures match
 
 
+@register_native_prefix_attention
 class FlashAttention(nn.Module):
     """Flash Attention"""
 
@@ -94,21 +131,27 @@ class FlashAttention(nn.Module):
 
     def _compute_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cu_seqlens, max_seqlen):
         """Run the flash attention kernel. q/k/v are [total_tokens, heads, dim]."""
+        layout = get_stashed_layout(self)
+        k, v, cu_seqlens, cu_seqlens_k, max_seqlen, max_seqlen_k = prefix_varlen_args(
+            k, v, cu_seqlens, max_seqlen, layout
+        )
         kwargs: dict = {"causal": True}
         sliding_window = getattr(self, "sliding_window", None)
         if sliding_window is not None:
             kwargs["window_size"] = (sliding_window - 1, 0)
-        if self._flash_attn_version == 4:
-            # FA4's flash_attn_varlen_func has qv as the 4th positional arg,
-            # so cu_seqlens must be passed as keyword args to avoid misalignment.
-            kwargs["cu_seqlens_q"] = cu_seqlens
-            kwargs["cu_seqlens_k"] = cu_seqlens
-            out = self._flash_attn_call(q, k, v, **kwargs)
-        else:
-            out = self._flash_attn_call(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, **kwargs)
-        if isinstance(out, tuple):
-            out = out[0]
-        return out
+        return flash_varlen_call(
+            self._flash_attn_call,
+            self._flash_attn_version,
+            q,
+            k,
+            v,
+            cu_seqlens,
+            cu_seqlens_k,
+            max_seqlen,
+            max_seqlen_k,
+            sharing=layout is not None and layout.has_sharing,
+            **kwargs,
+        )
 
     def _attention_core(
         self,
@@ -259,6 +302,7 @@ class SDPAAttention(nn.Module):
     ) -> torch.Tensor:
         key_states = key_states.repeat_interleave(self.num_key_value_groups, dim=1)
         value_states = value_states.repeat_interleave(self.num_key_value_groups, dim=1)
+        require_dense_attention_layout(type(self).__name__, get_stashed_layout(self))
         out = F.scaled_dot_product_attention(query_states, key_states, value_states, is_causal=True)
         out = out.transpose(1, 2).contiguous()
         return out.view(out.shape[0], out.shape[1], -1)

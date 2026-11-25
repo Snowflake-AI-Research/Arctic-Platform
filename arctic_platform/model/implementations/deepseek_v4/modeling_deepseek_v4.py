@@ -15,6 +15,7 @@ from transformers.generation import GenerationMixin
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import MoeModelOutputWithPast
 
+from arctic_platform.common.packing.layout import require_no_prefix_sharing
 from arctic_platform.model.implementations.moe.base import PreTrainedModelPrimeRL
 from arctic_platform.model.implementations.deepseek_v4.attention import DeepseekV4Attention, PackedContext
 from arctic_platform.model.implementations.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
@@ -40,6 +41,7 @@ from arctic_platform.model.implementations.layers.norms import RMSNorm, RMSNormC
 
 
 def _seq_lens_from_position_ids(position_ids: torch.Tensor) -> torch.Tensor:
+    require_no_prefix_sharing("DeepSeek V4 _seq_lens_from_position_ids")
     flat = position_ids.reshape(-1)
     starts = (flat == 0).nonzero(as_tuple=True)[0]
     if starts.numel() == 0 or int(starts[0].item()) != 0:
