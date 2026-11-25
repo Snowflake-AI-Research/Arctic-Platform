@@ -336,6 +336,27 @@ def reconstruct_position_ids_(batch_data: dict) -> None:
     batch_data["position_ids"] = (attention_mask_long.cumsum(dim=-1) - 1).clamp_(min=0) * attention_mask_long
 
 
+def _refuse_media_split(batch_data) -> None:
+    """Refuse to cut a batch with media leaves across DP workers.
+
+    The cutter slices every tensor by its first dimension, but media leaves count patches (``pixel_values``) or
+    items (grids, row ids) rather than rows, and row ids are global to the batch: a cut would hand each worker
+    pixels and grids of other rows. A caller that splits a media batch by its rows first (``select_rows`` and
+    ``select_media_rows`` in ``common.packing``, as a service's dispatch does) sends each worker its own batch.
+    """
+    from arctic_platform.common.packing import MEDIA_KEYS
+    from arctic_platform.common.packing import MediaBatchError
+
+    microbatches = batch_data if isinstance(batch_data, list) else [batch_data]
+    keys = sorted({key for mb in microbatches if isinstance(mb, dict) for key in mb if key in MEDIA_KEYS})
+    if keys:
+        raise MediaBatchError(
+            f"this server splits a batch across DP workers by its first dimension, which media leaves {keys} do not"
+            " share: split a media batch by its rows before sending it (select_rows and select_media_rows), or use"
+            " one worker"
+        )
+
+
 def _split_batch(batch: dict, num_workers: int, sp_size: int = 1) -> list[dict]:
     """Split a batch across workers and stamp the DP loss scale.
 
@@ -364,6 +385,8 @@ def _split_batch(batch: dict, num_workers: int, sp_size: int = 1) -> list[dict]:
             f"are replicated across an SP group. Got sp_size={sp_size}."
         )
     dp_sp_world_size(num_workers, sp_size)
+    if num_workers > 1:
+        _refuse_media_split(batch_data)
     meta_data.update(dp_size=num_workers)
 
     if isinstance(batch_data, list):
