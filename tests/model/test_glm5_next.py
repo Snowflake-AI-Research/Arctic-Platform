@@ -733,7 +733,7 @@ def test_glm53_streaming_checkpoint_matches_whole_state_conversion(tmp_path, mon
 
     set_seed(0)
     model_class = modeling_glm5_next.Glm5NextForConditionalGenerationPrimeRL
-    original = dict(model_class(_tiny_config()).state_dict())
+    original = dict(model_class(tiny_glm5_next_config()).state_dict())
     # Native expert tensors are allocated empty; conversion needs finite, distinct fixture values.
     original = {
         name: torch.arange(weight.numel(), dtype=weight.dtype).reshape(weight.shape) + index
@@ -958,7 +958,7 @@ def test_glm53_load_selects_streaming_checkpoint_converter(
     from arctic_platform.model.implementations.moe.weights import load_state_dict
 
     builder = importlib.import_module(f"arctic_platform.model.implementations.{builder_family}.model_builder")
-    model = Glm5NextForConditionalGenerationPrimeRL(_tiny_config())
+    model = Glm5NextForConditionalGenerationPrimeRL(tiny_glm5_next_config())
     state = {
         name: torch.arange(weight.numel(), dtype=weight.dtype).reshape(weight.shape)
         for name, weight in model.state_dict().items()
@@ -1005,7 +1005,7 @@ def test_glm53_load_selects_streaming_checkpoint_converter(
 
 def _auxiliary_model(count=1):
     model = torch.nn.Module()
-    model.config = _tiny_config()
+    model.config = tiny_glm5_next_config()
     text = model.config.text_config
     text.num_hidden_layers = 2
     text.num_nextn_predict_layers = count
@@ -1286,7 +1286,7 @@ def test_shared_conversion_cache_failure_stops_both_loaders_before_barrier(tmp_p
     from arctic_platform.model.implementations.moe import conversion_cache
 
     builder = importlib.import_module(f"arctic_platform.model.implementations.{builder_family}.model_builder")
-    models = [Glm5NextForConditionalGenerationPrimeRL(_tiny_config()) for _ in range(2)]
+    models = [Glm5NextForConditionalGenerationPrimeRL(tiny_glm5_next_config()) for _ in range(2)]
     source = tmp_path / "source"
     source.mkdir()
     hf_name = "model.language_model.layers.3.mlp.experts.0.gate_proj.weight"
