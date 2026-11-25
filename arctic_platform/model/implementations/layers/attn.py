@@ -1,4 +1,5 @@
 import functools
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
@@ -26,6 +27,31 @@ try:
     from flash_attn.cute import flash_attn_varlen_func as flash_attn_4_varlen_func
 except ImportError:
     flash_attn_4_varlen_func = None  # type: ignore
+
+
+def _fused_rope_applies(x: torch.Tensor, cos: torch.Tensor) -> bool:
+    """QuACK's rotary kernel for one packed row on CUDA (the per-token cos / sin are its table), unless
+    ``ARL_FUSED_ROPE=0`` (worker environment); the PyTorch composition elsewhere."""
+    if not x.is_cuda or x.shape[0] != 1 or cos.shape[0] != 1 or cos.shape[-1] % 16:
+        return False
+    if os.environ.get("ARL_FUSED_ROPE", "1") == "0":
+        return False
+    try:
+        from quack.rotary import apply_rotary_emb  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _fused_rope(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+    """``apply_rotary_pos_emb`` (half-split rotation of the first ``cos.shape[-1]`` dims) on ``[1, seq, heads, dim]``
+    q and k through QuACK: HF's cos / sin repeat their first half, which is QuACK's ``[seq, rotary_dim / 2]`` table.
+    """
+    from quack.rotary import apply_rotary_emb
+
+    half = cos.shape[-1] // 2
+    cos, sin = cos[0, :, :half], sin[0, :, :half]
+    return apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
 
 
 @dataclass
@@ -144,6 +170,11 @@ class FlashAttention(nn.Module):
         if self.use_qk_norm and self.qk_norm_type == "per_head":
             query_states = self.q_norm(query_states)
             key_states = self.k_norm(key_states)
+
+        if position_embeddings is not None and _fused_rope_applies(query_states, position_embeddings[0]):
+            # [batch, seq, heads, head_dim] as they are: one pass each way per tensor, FP32 math per element.
+            cos, sin = position_embeddings
+            return (*_fused_rope(query_states, key_states, cos, sin), value_states)
 
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)

@@ -61,17 +61,51 @@ def _compute_dtype(x: torch.Tensor) -> torch.dtype:
     return x.dtype
 
 
-def _fused_add_rms_norm_forward(ctx, x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float):
+def _add_norm_kernels():
+    """The Triton kernels of ``FusedAddRMSNorm``, or ``None`` where Triton cannot be imported."""
+    try:
+        from arctic_platform.model.implementations.kernels import fused_add_rms_norm_fp32
+    except ImportError:
+        return None
+    return fused_add_rms_norm_fp32
+
+
+def _uses_add_norm_kernels(x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor) -> bool:
+    # Under torch.compile the formula runs and the compiler builds the backward, as for the gated norm.
+    if not x.is_cuda or torch.compiler.is_compiling():
+        return False
+    kernels = _add_norm_kernels()
+    return kernels is not None and kernels.supported(x, residual, weight)
+
+
+def _fused_add_rms_norm_forward(
+    ctx, x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float, sum_dtype: torch.dtype
+):
+    """The normalized value in ``x``'s dtype and the fp32 sum (for 16-bit inputs) rounded to ``sum_dtype``.
+
+    On CUDA one Triton kernel computes both (``kernels/fused_add_rms_norm_fp32.py``) with the same fp32 math; the
+    PyTorch formula below is the reference, and runs on CPU and under torch.compile.
+    """
     compute_dtype = _compute_dtype(x)
+    ctx.kernels = _uses_add_norm_kernels(x, residual, weight)
+    if ctx.kernels:
+        out, summed, rstd = _add_norm_kernels().fused_add_rms_norm_fwd(x, residual, weight, eps, sum_dtype)
+        ctx.save_for_backward(x, residual, weight, rstd)
+        return out, summed
     summed = x.to(compute_dtype) + residual.to(compute_dtype)
     rstd = torch.rsqrt(summed.pow(2).mean(-1, keepdim=True) + eps)
     out = summed * rstd * (1.0 + weight.to(compute_dtype))
     ctx.save_for_backward(x, residual, weight, rstd)
-    return out.to(x.dtype), summed
+    return out.to(x.dtype), summed.to(sum_dtype)
 
 
 def _fused_add_rms_norm_backward(ctx, grad_out: torch.Tensor, grad_residual: torch.Tensor):
     x, residual, weight, rstd = ctx.saved_tensors
+    if ctx.kernels:
+        grad_x, grad_r, grad_weight = _add_norm_kernels().fused_add_rms_norm_bwd(
+            grad_out, grad_residual, x, residual, weight, rstd
+        )
+        return grad_x, grad_r, grad_weight, None
     compute_dtype = _compute_dtype(x)
     summed = x.to(compute_dtype) + residual.to(compute_dtype)
     normed = summed * rstd
@@ -103,8 +137,7 @@ class FusedAddRMSNorm(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float):
-        out, summed = _fused_add_rms_norm_forward(ctx, x, residual, weight, eps)
-        return out, summed.to(x.dtype)
+        return _fused_add_rms_norm_forward(ctx, x, residual, weight, eps, x.dtype)
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor, grad_residual: torch.Tensor):
@@ -120,7 +153,7 @@ class FusedAddRMSNormFp32Residual(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float):
-        return _fused_add_rms_norm_forward(ctx, x, residual, weight, eps)
+        return _fused_add_rms_norm_forward(ctx, x, residual, weight, eps, _compute_dtype(x))
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor, grad_residual: torch.Tensor):
