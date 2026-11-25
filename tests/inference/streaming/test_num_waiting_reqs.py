@@ -13,9 +13,10 @@ from arctic_platform.inference.server.metrics import WorkerMetricsCollector
 from arctic_platform.inference.server.replica_pool import ReplicaPool
 
 
-def _stats(num_waiting_reqs):
+def _stats(num_waiting_reqs, num_skipped_waiting_reqs=0):
     return SimpleNamespace(
         num_waiting_reqs=num_waiting_reqs,
+        num_skipped_waiting_reqs=num_skipped_waiting_reqs,
         num_running_reqs=0,
         kv_cache_usage=0.0,
         spec_decoding_stats=None,
@@ -36,6 +37,24 @@ class TestNumWaitingReqs:
         collector.push_snapshot(_stats(7), None)
         assert len(collector.drain_snapshots()) == 1
         assert collector.num_waiting_reqs == 7
+
+    def test_skipped_waiting_reqs_count_as_waiting(self):
+        """Requests vLLM reports as skipped (e.g. queued with a grammar) count in num_waiting_reqs."""
+        collector = WorkerMetricsCollector(min_interval_s=0)
+        collector.push_snapshot(_stats(1, num_skipped_waiting_reqs=5), None)
+        assert collector.num_waiting_reqs == 6
+        [snap] = collector.drain_snapshots()
+        assert snap["num_waiting_reqs"] == 6
+        assert snap["num_skipped_waiting_reqs"] == 5
+
+    def test_stats_without_skipped_field(self):
+        """A vLLM whose SchedulerStats has no num_skipped_waiting_reqs counts the waiting queue alone."""
+        collector = WorkerMetricsCollector(min_interval_s=0)
+        stats = _stats(4)
+        del stats.num_skipped_waiting_reqs
+        collector.push_snapshot(stats, None)
+        assert collector.num_waiting_reqs == 4
+        assert collector.drain_snapshots()[0]["num_skipped_waiting_reqs"] == 0
 
     def test_pool_returns_none_for_failed_replica(self):
         """A replica whose call raises reports None instead of failing the whole call."""
