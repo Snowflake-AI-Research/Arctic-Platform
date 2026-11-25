@@ -567,3 +567,69 @@ def test_media_only_on_meta_does_not_reach_the_model(model):
 
     (call,) = calls
     assert not {"pixel_values", "image_grid_thw", "image_row_ids"} & set(call)
+
+
+def _prepacked(model, rows, positions):
+    """``rows`` packed by the caller into one ``[1, T]`` call, as dss sends it: ``cu_seqlens`` on meta."""
+    tokens = [token for row in rows for token in row["tokens"]]
+    lengths = torch.tensor([len(row["tokens"]) for row in rows])
+    cu_seqlens = torch.nn.functional.pad(lengths.cumsum(0), (1, 0)).to(torch.int32)
+    input_ids = torch.tensor([tokens])
+    images = [row for row in rows if "image_grid" in row]
+    batch = dict(
+        input_ids=input_ids,
+        pixel_values=torch.cat([row["pixel_values"] for row in images]),
+        image_grid_thw=torch.cat([row["image_grid"] for row in images]),
+    )
+    if positions == "mrope":
+        batch["position_ids"] = mrope_position_ids(
+            _token_types(input_ids),
+            cu_seqlens,
+            spatial_merge_size=model.config.vision_config.spatial_merge_size,
+            image_grid_thw=batch["image_grid_thw"],
+        )
+    elif positions == "text":
+        batch["position_ids"] = torch.cat([torch.arange(n) for n in lengths.tolist()])[None]
+    return batch, {"pad_token_id": PAD_TOKEN_ID, "cu_seqlens": cu_seqlens}
+
+
+def _run_prepacked(model, batch, meta):
+    return run_pipeline(
+        model, (), batch, meta, PROCESSING, "cpu", backward=False, pack=False, max_tokens_per_mb=10240,
+        return_tensors=True,
+    )
+
+
+@pytest.mark.parametrize("positions", ["text", "none"])
+def test_prepacked_media_without_mrope_positions_is_refused(model, positions):
+    rows = _with_pixels(model, _rows())
+    batch, meta = _prepacked(model, [rows[0], rows[2]], positions)
+    calls, handle = _record_model_calls(model)
+    try:
+        with pytest.raises(ValueError, match=r"already-packed call .* needs \[4, 1, \d+\] M-RoPE position_ids"):
+            _run_prepacked(model, batch, meta)
+    finally:
+        handle.remove()
+    assert calls == []
+
+
+def test_prepacked_media_with_mrope_positions_reaches_the_model_as_sent(model):
+    rows = _with_pixels(model, _rows())
+    batch, meta = _prepacked(model, [rows[0], rows[2]], "mrope")
+    calls, handle = _record_model_calls(model)
+    try:
+        _run_prepacked(model, batch, meta)
+    finally:
+        handle.remove()
+    (call,) = calls
+    for key in ("input_ids", "pixel_values", "image_grid_thw", "position_ids"):
+        torch_assert_equal(call[key], batch[key])
+
+
+def test_prepacked_video_is_refused_for_a_model_type_with_no_media_spec(model):
+    other = _qwen3_5_moe_model()
+    rows = _with_pixels(model, _rows())
+    batch, meta = _prepacked(model, [rows[0]], "text")
+    batch.update(pixel_values_videos=torch.zeros(4, batch["pixel_values"].shape[-1]), video_grid_thw=VIDEO_GRIDS)
+    with pytest.raises(ValueError, match="model_type 'qwen3_5_moe' has no media spec.*pixel_values_videos"):
+        _run_prepacked(other, batch, meta)
