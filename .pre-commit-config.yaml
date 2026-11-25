@@ -48,3 +48,9 @@ repos:
         additional_dependencies: [types-PyYAML, pydantic]
         args: [--ignore-missing-imports]
         files: ^arctic_platform/(model/|common/(deepspeed_engine\.py|option_registry\.py|model_options\.py|profiles/))
+      # The model plugin hooks, and the example modules that implement them: a wrong hook signature fails here.
+      - id: mypy
+        name: mypy (model plugin interfaces)
+        additional_dependencies: [pydantic]
+        args: [--ignore-missing-imports, --follow-imports=silent]
+        files: ^(arctic_platform/model_plugin/interfaces\.py|examples/model_plugins/toy_hybrid_moe/toy_hybrid_moe/(modeling|parallel)\.py|examples/model_plugins/olmo2/olmo2_plugin/modeling\.py|examples/model_plugins/(olmoe/olmoe|lfm2/lfm2|gpt_oss/gpt_oss)_plugin/modeling\.py)$

@@ -1,0 +1,21 @@
+# LFM2 plugin manifest. The platform reads this before importing any plugin code.
+name = "custom/example/lfm2"
+version = "0.1.0"
+contract = "1.1"
+runtime_release = "runtime-2026.11"
+hf_model_types = ["lfm2"]
+
+[layer_types]
+full_attention = "platform:attention"   # the platform's attention core
+conv = "plugin"                         # gated short convolution: Lfm2ShortConv, on the head-parallel policy
+
+[capabilities]
+training = true
+sampling = true
+packing = true
+sequence_parallel = true
+
+[sampler]
+vllm_architecture = "Lfm2ForCausalLM"   # vLLM's built-in model: no vllm_plugin, no vLLM code in this package
+tensor_parallel = true
+# prefix_caching stays off: the convolution layers carry state, and this plugin has not passed the sampler tier with it.

@@ -1,0 +1,23 @@
+# Conformance fixture for OLMo-2: a tiny fp32 Olmo2Config.
+seed = 0
+# Three packed rows of unequal length; 16 tokens split evenly across 2 sequence-parallel ranks, with the middle
+# row crossing the shard boundary at token 8.
+sequence_lengths = [5, 6, 5]
+sp_sizes = [2]
+
+[fixture]
+vocab_size = 64
+hidden_size = 32
+intermediate_size = 64
+num_hidden_layers = 2
+num_attention_heads = 4
+num_key_value_heads = 2
+max_position_embeddings = 64
+
+# fp32 against a float64 reference: differences are fp32 rounding (~1e-7 relative).
+[tolerances]
+reference = 1e-5
+packing = 1e-5
+parallel = 1e-5
+rl_step = 1e-5
+chunking = 1e-6

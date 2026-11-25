@@ -26,6 +26,7 @@ live in the [project README](../README.md).
 | [**SFT**](sft.md) | Supervised fine-tuning — CPU client, wire batch, `sft` vs `sft_ce`, config |
 | [**RL**](rl.md) | Reinforcement learning — engines, client API, ZoRRo, prompt-deduplicated packets, integrations |
 | [**Common**](common.md) | Shared server infra — HTTP CLI, jobs/endpoints, DeepSpeed worker, metrics, env |
+| [**Model plugins**](model-plugins/spec.md) | Draft contract for bringing a new architecture as a plugin: manifest, hooks, SP/EP, weight sync, conformance |
 
 ## Quick paths
 

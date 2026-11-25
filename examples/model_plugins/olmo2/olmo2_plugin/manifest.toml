@@ -1,0 +1,20 @@
+# OLMo-2 plugin manifest. The platform reads this before importing any plugin code.
+name = "custom/example/olmo2"
+version = "0.1.0"
+contract = "1.1"
+runtime_release = "runtime-2026.11"
+hf_model_types = ["olmo2"]              # the config.json model_type this plugin serves
+
+[layer_types]
+full_attention = "platform:attention"   # every decoder layer: the platform's attention core
+
+[capabilities]
+training = true
+sampling = true
+packing = true
+sequence_parallel = true
+
+[sampler]
+vllm_architecture = "Olmo2ForCausalLM"  # vLLM's built-in model: no vllm_plugin, no vLLM code in this package
+tensor_parallel = true
+prefix_caching = true                   # attention only: vLLM's prefix cache is exact
