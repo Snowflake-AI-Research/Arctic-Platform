@@ -13,6 +13,7 @@ from typing import Any, Hashable
 
 import ray
 from arctic_platform.inference.server.chat import ChatPrompt
+from arctic_platform.inference.server.media_prompts import is_media_prompt
 from arctic_platform.inference.server.streaming import ClientStream, MAX_WORKER_STREAMS, StreamLimits, validate_request
 from arctic_platform.inference.server.token_prompts import is_token_tensor
 
@@ -70,13 +71,22 @@ def _compute_prefix_hash(prompt: Any) -> int:
 
     A tensor prompt hashes its int32 bytes, so the same tokens route the same
     way whatever integer dtype they arrive in. It hashes differently from the
-    same tokens sent as a list.
+    same tokens sent as a list. A media prompt hashes its ``prompt_token_ids``.
     """
     if isinstance(prompt, ChatPrompt):
         # Already validated as plain JSON.
         return hash(json.dumps(asdict(prompt), sort_keys=True))
     if isinstance(prompt, str):
         return hash(prompt)
+    if is_media_prompt(prompt):
+        # Hash the token ids alone: ``tuple(prompt)`` of a dict is its keys, the
+        # same for every media prompt, and the pixels are not hashable here.
+        # Tensor ids hash as their list, so a media prompt routes the same way
+        # whichever form its ids arrive in.
+        token_ids = prompt.get("prompt_token_ids")
+        if is_token_tensor(token_ids):
+            token_ids = token_ids.tolist()
+        return hash(tuple(token_ids if token_ids is not None else ()))
     if is_token_tensor(prompt):
         import torch
 

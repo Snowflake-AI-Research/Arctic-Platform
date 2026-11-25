@@ -13,7 +13,6 @@ import torch
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from arctic_platform.inference.server.config import ModelConfig
-from arctic_platform.inference.server.media_prompts import is_media_prompt
 from arctic_platform.inference.server.scheduler import Scheduler, WORKER_MAX_CONCURRENCY
 from arctic_platform.inference.server.token_prompts import compact_token_tensor, is_token_tensor
 from arctic_platform.inference.server.worker import InferenceWorker
@@ -140,20 +139,6 @@ def ensure_ray() -> int:
         raise RuntimeError("No GPUs available in the Ray cluster")
     logger.info(f"{total} GPUs available across {len(nodes)} node(s)")
     return total
-
-
-def _media_routing_key(prompt: Any, routing_key: str | None) -> str | None:
-    """Key an unkeyed media prompt by its token ids.
-
-    The scheduler's prefix hash of a dict covers only its keys, which would pin
-    every media prompt to one worker.
-    """
-    if routing_key is not None or not is_media_prompt(prompt):
-        return routing_key
-    token_ids = prompt.get("prompt_token_ids")
-    if is_token_tensor(token_ids):
-        token_ids = token_ids.tolist()
-    return f"media-prompt:{hash(tuple(token_ids or ()))}"
 
 
 class ReplicaPool:
@@ -1047,7 +1032,7 @@ class ReplicaPool:
         if isinstance(prompts, (str, dict)):
             return [self._scheduler.submit(
                 prompts, _single_params(),
-                routing_key=_media_routing_key(prompts, _single_key()), strict=strict,
+                routing_key=_single_key(), strict=strict,
             )]
         if prompts and isinstance(prompts[0], int):
             return [self._scheduler.submit(
@@ -1074,7 +1059,7 @@ class ReplicaPool:
             params_list = [params] * len(prompts)
         return [
             self._scheduler.submit(
-                prompt, param, routing_key=_media_routing_key(prompt, key), strict=strict,
+                prompt, param, routing_key=key, strict=strict,
             )
             for prompt, param, key in zip(prompts, params_list, keys)
         ]

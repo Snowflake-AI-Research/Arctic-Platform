@@ -16,6 +16,7 @@ import types
 import zlib
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -123,10 +124,10 @@ with _vllm_stand_in():
         sys.modules["arctic_platform.inference.server"] = server_package
         arctic_platform.inference.server = server_package
 
-    from arctic_platform.inference.server import replica_pool, streaming, worker as worker_module
+    from arctic_platform.inference.server import streaming, worker as worker_module
     from arctic_platform.inference.server.media_prompts import MediaDecodeError
     from arctic_platform.inference.server.replica_pool import ReplicaPool
-    from arctic_platform.inference.server.scheduler import Scheduler
+    from arctic_platform.inference.server.scheduler import Scheduler, _compute_prefix_hash
     from arctic_platform.inference.server.worker import InferenceWorker, WorkerLifecycleState
 
 WorkerClass = InferenceWorker.__ray_metadata__.modified_class
@@ -680,7 +681,9 @@ def test_pool_takes_one_media_prompt_as_one_request():
     assert len(pool.submit_generate_futures(prompt, {"max_tokens": 1})) == 1
     (sent, params, key), = pool._scheduler.submitted
     assert sent is prompt and params == {"max_tokens": 1}
-    assert key == replica_pool._media_routing_key(prompt, None)
+    # Unkeyed, like a text prompt: the scheduler keys it by its token ids only
+    # under prefix routing, and an explicit key would also make it sticky.
+    assert key is None
 
 
 def test_pool_takes_media_prompts_as_batch_members():
@@ -692,12 +695,20 @@ def test_pool_takes_media_prompts_as_batch_members():
     assert sent[1][2] is None and sent[2][2] == "turns-1"
 
 
-def test_media_routing_key_follows_token_ids():
-    a = replica_pool._media_routing_key(_media_prompt(), None)
-    assert a == replica_pool._media_routing_key(_media_prompt(multi_modal_data={"image": object()}), None)
-    assert a != replica_pool._media_routing_key(_media_prompt(prompt_token_ids=[9, IMAGE_PAD]), None)
-    assert replica_pool._media_routing_key(_media_prompt(), "key") == "key"
-    assert replica_pool._media_routing_key([1, 2], None) is None
+def test_media_prefix_hash_follows_token_ids():
+    a = _compute_prefix_hash(_media_prompt())
+    assert a == _compute_prefix_hash(_media_prompt(multi_modal_data={"image": object()}))
+    assert a != _compute_prefix_hash(_media_prompt(prompt_token_ids=[9, IMAGE_PAD]))
+    assert a == _compute_prefix_hash(_media_prompt()["prompt_token_ids"])
+
+
+def test_media_prompts_spread_under_prefix_routing():
+    scheduler = Scheduler([MagicMock() for _ in range(4)], 64, prefix_routing=True)
+    keys = {scheduler._request(_media_prompt(prompt_token_ids=[i, IMAGE_PAD]), {}, None, None, False).key
+            for i in range(16)}
+    assert len(keys) == 16
+    request = scheduler._request(_media_prompt(), {}, None, None, False)
+    assert not request.sticky
 
 
 def test_stream_refuses_media_prompt():
@@ -757,9 +768,7 @@ def test_pool_hands_dict_without_multimodal_data_to_the_worker_whole(prompt):
     assert len(pool.submit_generate_futures([prompt, [1, 2]], routing_key=[None, "k"])) == 2
     (one, _, one_key), (member, _, member_key), (_, _, list_key) = pool._scheduler.submitted
     assert one is prompt and member is prompt
-    # No media routing key: only a media prompt is keyed by its token ids.
     assert one_key is None and member_key is None and list_key == "k"
-    assert replica_pool._media_routing_key(prompt, None) is None
     with pytest.raises(TypeError, match="^Expected a text prompt, a token-id list, .* got dict$"):
         asyncio.run(_new_worker().generate(one, {"max_tokens": 1}))
 
@@ -772,7 +781,7 @@ def test_media_prompt_takes_token_tensor_ids():
     sent = calls[0][0]["prompt_token_ids"]
     assert sent == [1, 2, IMAGE_PAD, 3] and all(type(t) is int for t in sent)
     assert result["prompt_token_ids"] == EXPANDED
-    assert replica_pool._media_routing_key(prompt, None) == replica_pool._media_routing_key(_media_prompt(), None)
+    assert _compute_prefix_hash(prompt) == _compute_prefix_hash(_media_prompt())
     with pytest.raises((TypeError, ValueError)):
         _generate(_new_worker(), _media_prompt(prompt_token_ids=torch.tensor([1.0, 2.0])))
 
@@ -1455,7 +1464,7 @@ def _media_pool(workers, available, model_id="vl"):
     pool = ReplicaPool()
     pool._model_id = model_id
     pool._workers = handles
-    pool._scheduler = Scheduler(handles, dynamic_concurrency=False)
+    pool._scheduler = Scheduler(handles, 64)
     for index, ready in enumerate(available):
         if not ready:
             pool._scheduler.mark_worker_unavailable(index)
