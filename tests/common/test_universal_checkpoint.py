@@ -68,16 +68,20 @@ def _write_expert_parallel_checkpoint(tag_dir: Path) -> dict:
 class _FakeEngine:
     """Records each ``load_checkpoint`` call with the universal flag it saw."""
 
-    def __init__(self, dp: int, stage: int = 2, mpu=None, params: dict | None = None):
+    def __init__(self, dp: int, stage: int = 2, mpu=None, params: dict | None = None, node_local: bool = False):
         self.seq_dp_world_size = dp
         self.mpu = mpu
         self.module = SimpleNamespace(named_parameters=lambda: iter((params or {}).items()))
         self._stage = stage
+        self._node_local = node_local
         self._config = SimpleNamespace(load_universal_checkpoint=False)
         self.loads: list[tuple[str, str | None, bool, dict]] = []
 
     def zero_optimization_stage(self) -> int:
         return self._stage
+
+    def use_node_local_storage(self) -> bool:
+        return self._node_local
 
     def load_checkpoint(self, load_dir, tag=None, **kwargs):
         self.loads.append((load_dir, tag, self._config.load_universal_checkpoint, kwargs))
@@ -310,6 +314,21 @@ class TestLoadWithDpResize(TestCasePlus):
         with self.assertRaisesRegex(RuntimeError, r"convert_to_universal\(expert_shards=\.\.\.\)"):
             uc.load_checkpoint_with_dp_resize(engine, str(self.root))
         self.assertEqual((self.converted, engine.loads), ([], []))
+
+    def test_converter_follows_the_declared_storage(self):
+        # Ranks 0-3 on host a, 4-7 on host b; every process sees one GPU, so LOCAL_RANK would be 0 everywhere.
+        hosts = ["a"] * 4 + ["b"] * 4
+        original_world, original_gather = uc._world, uc._gather
+        self.addCleanup(setattr, uc, "_world", original_world)
+        self.addCleanup(setattr, uc, "_gather", original_gather)
+        uc._gather = lambda value: list(hosts)
+        for node_local, converters in ((False, [0]), (True, [0, 4])):
+            found = []
+            for rank in range(8):
+                uc._world = lambda rank=rank: (rank, 8)
+                if uc.is_universal_converter(_FakeEngine(dp=8, node_local=node_local)):
+                    found.append(rank)
+            self.assertEqual(found, converters, node_local)
 
     def test_partial_checkpoint_fails_before_loading(self):
         _write_checkpoint(self.root / TAG, dp=4, shards=[0, 1, 2])

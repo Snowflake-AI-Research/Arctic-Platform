@@ -19,8 +19,8 @@
 
 A checkpoint saved with ``engine.save_checkpoint`` at one DP size is loaded at other DP sizes. The fp32 masters, and
 the Adam moments and step when loaded, must come back bitwise, compared per parameter with the values gathered
-before the save. Every rank runs on one host, so the checkpoint directory is a shared filesystem and rank 0 alone
-converts. Tests needing four ranks skip on smaller machines.
+before the save. The engines keep DeepSpeed's default shared checkpoint storage, so rank 0 alone converts. Tests
+needing four ranks skip on smaller machines.
 """
 
 from __future__ import annotations

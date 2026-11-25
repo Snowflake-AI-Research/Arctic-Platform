@@ -328,7 +328,10 @@ class ArcticClient(_ArcticClientCore):
         """Restore weights/optimizer/LR/step: Cortex by ``checkpoint_id``, on-prem by ``path``/``step``.
 
         On-prem, ``universal_checkpoint_resize=True`` also loads a ZeRO-1/2 checkpoint saved at another DP size by
-        converting it to a DeepSpeed universal checkpoint inside the checkpoint directory first.
+        converting it to a DeepSpeed universal checkpoint inside the checkpoint directory first. Rank 0 converts the
+        directory once, as shared by every node, unless the DeepSpeed config sets
+        ``checkpoint.use_node_local_storage``: then each node converts its own copy. The setting must match the
+        storage, which is not detected.
         """
         return self._call(
             load_checkpoint_request(

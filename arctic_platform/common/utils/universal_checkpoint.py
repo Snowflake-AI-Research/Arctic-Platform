@@ -41,7 +41,6 @@ import socket
 import subprocess
 import sys
 import time
-import uuid
 from collections.abc import Iterable
 from collections.abc import Iterator
 from collections.abc import Mapping
@@ -381,36 +380,20 @@ def resize_source_tag(load_dir: str, tag: str | None, *, dp_size: int) -> str | 
     return decision
 
 
-def converts_for_filesystem(directory: str) -> bool:
-    """Whether this rank is the one that writes ``directory`` for the ranks sharing its filesystem. Collective.
+def is_universal_converter(engine) -> bool:
+    """Whether this rank writes the universal copy that the ranks sharing its checkpoint directory read.
 
-    Each node's lowest rank drops a probe file into ``directory``; a node then converts only if no lower-ranked
-    node's probe is visible. A shared filesystem is written once, by rank 0, and node-local disks once per node.
+    The caller declares the storage with DeepSpeed's ``checkpoint.use_node_local_storage`` and must set it to match
+    the filesystem, which cannot be inspected reliably: a node-local-looking path such as ``/tmp`` may be shared.
+    With it every node holds its own copy and each node's lowest rank converts; without it one directory is shared by
+    every node and rank 0 converts it once. Collective under node-local storage.
     """
     rank, _ = _world()
+    if not engine.use_node_local_storage():
+        return rank == 0
+    # LOCAL_RANK does not identify a node's ranks when each process sees one GPU, so group by host.
     hosts = _gather(socket.gethostname())
-    leader = hosts.index(hosts[rank]) == rank
-    probe_prefix = f".universal-resize-probe-{_from_rank0(uuid.uuid4().hex)}-"
-    probe = os.path.join(directory, f"{probe_prefix}{rank}")
-    error = None
-    if leader:
-        try:
-            os.makedirs(directory, exist_ok=True)
-            with open(probe, "w", encoding="utf-8"):
-                pass
-        except OSError as exc:
-            error = exc
-    _raise_if_any_failed(error, f"creating a probe file in {directory!r}")
-    converts = False
-    if leader:
-        with os.scandir(directory) as entries:
-            seen = [int(e.name[len(probe_prefix) :]) for e in entries if e.name.startswith(probe_prefix)]
-        converts = min(seen) == rank
-    _barrier()
-    if leader:
-        with contextlib.suppress(OSError):
-            os.remove(probe)
-    return converts
+    return hosts.index(hosts[rank]) == rank
 
 
 def load_checkpoint_with_dp_resize(
@@ -420,7 +403,8 @@ def load_checkpoint_with_dp_resize(
 
     At the saved DP size this is a plain ``engine.load_checkpoint``. Otherwise the tag is converted into
     ``scratch_dir`` (default ``load_dir``) as ``<tag>_universal``, every rank loads that copy universally, and the
-    copy is removed. Each filesystem holding ``scratch_dir`` is written by one rank, which needs every DP rank's
+    copy is removed. The copy is written by rank 0, or by one rank per node under DeepSpeed's
+    ``checkpoint.use_node_local_storage`` (see ``is_universal_converter``), and that rank needs every DP rank's
     optimizer shard under ``load_dir/tag``. Returns what ``engine.load_checkpoint`` returns.
     """
     source = resize_source_tag(load_dir, tag, dp_size=engine.seq_dp_world_size)
@@ -434,7 +418,7 @@ def load_checkpoint_with_dp_resize(
         )
     out_root = scratch_dir or load_dir
     out_tag = source + UNIVERSAL_TAG_SUFFIX
-    converter = converts_for_filesystem(out_root)
+    converter = is_universal_converter(engine)
     error = None
     if converter:
         try:
