@@ -17,19 +17,21 @@
 
 from __future__ import annotations
 
-import json
-import os
-import stat
+from copy import copy
 from pathlib import Path
 
+import torch
 import torch.distributed as dist
 from torch import nn
 
-from arctic_platform.model.implementations.qwen35.mtp_weights import _capture_original_weights
-from arctic_platform.model.implementations.qwen35.mtp_weights import _file_identity
-from arctic_platform.model.implementations.qwen35.mtp_weights import _unique_json_object
+from arctic_platform.model.implementations.moe.preserved_weights import PreservedWeight as _PreservedShardWeight
+from arctic_platform.model.implementations.moe.preserved_weights import capture_original_weights
+from arctic_platform.model.implementations.moe.preserved_weights import file_identity
+from arctic_platform.model.implementations.moe.preserved_weights import open_preserved_weight
+from arctic_platform.model.implementations.moe.preserved_weights import read_preserved_weight
 
 STATE_ATTRIBUTE = "_ap_preserved_glm_auxiliary_weights"
+_FAILURE_ATTRIBUTE = "_ap_preserved_glm_auxiliary_failure"
 
 
 def _layer_prefixes(config) -> tuple[str, ...]:
@@ -43,36 +45,51 @@ def _layer_prefixes(config) -> tuple[str, ...]:
     return tuple(f"model.language_model.layers.{index}." for index in range(layers, layers + count))
 
 
-def _capture(source_path: Path, prefixes: tuple[str, ...]):
-    index_path = source_path / "model.safetensors.index.json"
-    fd = os.open(index_path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
-    try:
-        metadata = os.fstat(fd)
-        if not stat.S_ISREG(metadata.st_mode) or _file_identity(os.stat(index_path)) != _file_identity(metadata):
-            raise ValueError("GLM auxiliary checkpoint index must be a stable regular file")
-        with os.fdopen(os.dup(fd), encoding="utf-8") as stream:
-            index = json.load(stream, object_pairs_hook=_unique_json_object)
-        mapping = index.get("weight_map") if isinstance(index, dict) else None
-        if not isinstance(mapping, dict) or not all(isinstance(name, str) for name in mapping):
-            raise ValueError("GLM auxiliary checkpoint requires an indexed tensor inventory")
-        expected = {name for name in mapping if name.startswith(prefixes)}
-        for prefix in prefixes:
-            required = {prefix + suffix for suffix in ("eh_proj.weight", "enorm.weight", "hnorm.weight")}
-            if not required <= expected:
-                raise ValueError(f"GLM original prediction layer is incomplete: {prefix}")
-        preserved = _capture_original_weights(source_path, expected, prefixes=prefixes)
-        if _file_identity(os.fstat(fd)) != _file_identity(metadata) or _file_identity(
-            os.stat(index_path)
-        ) != _file_identity(metadata):
-            raise ValueError("GLM auxiliary checkpoint index changed during capture")
-        return tuple(sorted(expected)), tuple(sorted(preserved, key=lambda weight: weight.name))
-    finally:
-        os.close(fd)
+def _required_layer_names(config, prefix: str, inventory: set[str]) -> set[str]:
+    from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextDecoderLayer
+
+    text = copy(getattr(config, "text_config", config))
+    index = int(prefix.rstrip(".").split(".")[-1])
+    # Prediction layers extend the final decoder layout when the HF config lists only active layers.
+    for attribute in ("layer_types", "mlp_layer_types", "indexer_types"):
+        values = list(getattr(text, attribute))
+        setattr(text, attribute, values + [values[-1]] * max(0, index + 1 - len(values)))
+    with torch.device("meta"):
+        layer = Glm5NextTextDecoderLayer(text, index)
+    suffixes = set(layer.state_dict())
+    for stem, target in (("attn_hc", "hc_attn"), ("ffn_hc", "hc_ffn")):
+        for field in ("fn", "base", "scale"):
+            name = f"{stem}.{field}"
+            if name in suffixes:
+                suffixes.remove(name)
+                suffixes.add(f"{target}_{field}")
+    # Shipped checkpoints may store fused experts or one projection per expert.
+    packed = "mlp.experts.gate_up_proj"
+    if packed in suffixes and prefix + packed not in inventory:
+        suffixes.difference_update({packed, "mlp.experts.down_proj"})
+        suffixes.update(
+            f"mlp.experts.{expert}.{projection}.weight"
+            for expert in range(text.n_routed_experts)
+            for projection in ("gate_proj", "up_proj", "down_proj")
+        )
+    return {prefix + suffix for suffix in suffixes | {"eh_proj.weight", "enorm.weight", "hnorm.weight"}}
+
+
+def _capture(source_path: Path, prefixes: tuple[str, ...], config):
+    preserved: list[_PreservedShardWeight] = capture_original_weights(source_path, None, prefixes=prefixes)
+    expected = {weight.name for weight in preserved}
+    for prefix in prefixes:
+        required = _required_layer_names(config, prefix, expected)
+        if not required <= expected:
+            raise ValueError(f"GLM original prediction layer is incomplete: missing={sorted(required - expected)}")
+    index_identity = preserved[0].index_identity if preserved else None
+    return tuple(sorted(expected)), tuple(sorted(preserved, key=lambda weight: weight.name)), index_identity
 
 
 def capture_auxiliary_weights(model: nn.Module, source_path: Path) -> None:
-    """Capture the original inactive layers on rank zero before HF conversion."""
+    """Record inactive-layer locations; unavailable originals fail full export, not ordinary loading."""
     model.__dict__.pop(STATE_ATTRIBUTE, None)
+    model.__dict__.pop(_FAILURE_ATTRIBUTE, None)
     prefixes = _layer_prefixes(getattr(model, "config", None))
     if not prefixes:
         return
@@ -80,42 +97,61 @@ def capture_auxiliary_weights(model: nn.Module, source_path: Path) -> None:
     is_master = not distributed or dist.get_rank() == 0
     state = None
     failure: list[str | None] = [None]
-    cause = None
     if is_master:
         try:
-            names, weights = _capture(source_path, prefixes)
-            state = (prefixes, names, weights)
+            names, weights, index_identity = _capture(source_path, prefixes, model.config)
+            state = (prefixes, names, weights, index_identity)
         except Exception as exc:
-            cause = exc
             failure[0] = f"{type(exc).__name__}: {exc}"
     if distributed:
         dist.broadcast_object_list(failure, src=0)
     if failure[0] is not None:
-        raise RuntimeError(f"Cannot preserve original GLM prediction layers: {failure[0]}") from cause
+        setattr(model, _FAILURE_ATTRIBUTE, failure[0])
+        return
     if is_master:
         setattr(model, STATE_ATTRIBUTE, state)
 
 
-def iter_preserved_auxiliary_weights(model: nn.Module):
-    """Export the captured schema unchanged, without registering trainable tensors."""
+def validate_preserved_auxiliary_weights(model: nn.Module) -> None:
+    """Check immutable source generations without reading or retaining tensor payloads."""
+    if model.__dict__.get("_ap_weights_random_initialized", False):
+        return
+    failure = getattr(model, _FAILURE_ATTRIBUTE, None)
+    if failure is not None:
+        raise RuntimeError(f"Cannot preserve original GLM prediction layers: {failure}")
     prefixes = _layer_prefixes(getattr(model, "config", None))
     if not prefixes:
         return
     state = getattr(model, STATE_ATTRIBUTE, None)
-    if state is None or state[0] != prefixes:
+    if state is None or len(state) != 4 or state[0] != prefixes:
         raise RuntimeError("Full GLM HF export requires captured original prediction layers")
-    _, names, weights = state
+    _, names, weights, index_identity = state
     actual = tuple(weight.name for weight in weights)
     if actual != names or len(set(actual)) != len(actual) or not all(name.startswith(prefixes) for name in actual):
         raise RuntimeError("Preserved GLM prediction-layer inventory changed")
+    if index_identity is not None and file_identity(index_identity[0].stat()) != index_identity[1]:
+        raise RuntimeError("Preserved GLM prediction-layer index changed")
     for weight in weights:
-        tensor = weight.tensor
-        if (
-            tuple(tensor.shape) != weight.shape
-            or tensor.dtype != weight.dtype
-            or tensor.device.type != "cpu"
-            or not tensor.is_contiguous()
-            or tensor.requires_grad
-        ):
-            raise RuntimeError(f"Preserved GLM prediction tensor changed layout or dtype: {weight.name}")
-        yield weight.name, tensor
+        with open_preserved_weight(weight):
+            pass
+
+
+def iter_preserved_auxiliary_weights(model: nn.Module):
+    """Map one original tensor at a time; the original checkpoint must remain immutable through export."""
+    validate_preserved_auxiliary_weights(model)
+    state = getattr(model, STATE_ATTRIBUTE, None)
+    if model.__dict__.get("_ap_weights_random_initialized", False) or not _layer_prefixes(
+        getattr(model, "config", None)
+    ):
+        return
+    if state is None:
+        raise RuntimeError("Full GLM HF export requires captured original prediction layers")
+    for weight in state[2]:
+        yield weight.name, read_preserved_weight(weight)
+
+
+def preserved_auxiliary_names(model: nn.Module):
+    state = getattr(model, STATE_ATTRIBUTE, None)
+    if model.__dict__.get("_ap_weights_random_initialized", False) or state is None:
+        return ()
+    return state[1]

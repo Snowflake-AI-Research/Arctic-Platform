@@ -1653,6 +1653,8 @@ def test_capture_mtp_weights_preserves_exact_cpu_payload_without_registering_sta
     monkeypatch.setattr(mtp_weights.dist, "is_initialized", lambda: False)
 
     mtp_weights.capture_mtp_weights(model, source)
+    records = getattr(model, mtp_weights._STATE_ATTRIBUTE)
+    assert all(not isinstance(record, torch.Tensor) and not hasattr(record, "tensor") for record in records)
     preserved = dict(mtp_weights.iter_preserved_mtp_weights(model))
 
     assert tuple(preserved) == tuple(sorted(payload))
@@ -1673,6 +1675,7 @@ def test_capture_mtp_weights_preserves_exact_cpu_payload_without_registering_sta
 
 
 def test_capture_mtp_weights_nonmaster_synchronizes_without_reading_payload(monkeypatch, tmp_path):
+    from arctic_platform.model.implementations.moe import preserved_weights
     from arctic_platform.model.implementations.qwen35 import mtp_weights
 
     model = _mtp_model()
@@ -1685,7 +1688,9 @@ def test_capture_mtp_weights_nonmaster_synchronizes_without_reading_payload(monk
         value[0] = None
 
     monkeypatch.setattr(mtp_weights.dist, "broadcast_object_list", broadcast_object_list)
-    monkeypatch.setattr(mtp_weights, "safe_open", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError()))
+    monkeypatch.setattr(
+        preserved_weights, "safe_open", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError())
+    )
 
     mtp_weights.capture_mtp_weights(model, tmp_path / "unavailable-on-peer")
 
@@ -1694,6 +1699,7 @@ def test_capture_mtp_weights_nonmaster_synchronizes_without_reading_payload(monk
 
 
 def test_capture_mtp_weights_propagates_master_failure_to_nonmaster(monkeypatch, tmp_path):
+    from arctic_platform.model.implementations.moe import preserved_weights
     from arctic_platform.model.implementations.qwen35 import mtp_weights
 
     model = _mtp_model()
@@ -1702,16 +1708,20 @@ def test_capture_mtp_weights_propagates_master_failure_to_nonmaster(monkeypatch,
 
     def broadcast_object_list(value, src):
         assert src == 0
-        value[0] = "ValueError: original Qwen3.5 MTP inventory mismatch"
+        value[0] = "ValueError: original prediction inventory mismatch"
 
     monkeypatch.setattr(mtp_weights.dist, "broadcast_object_list", broadcast_object_list)
-    monkeypatch.setattr(mtp_weights, "safe_open", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError()))
+    monkeypatch.setattr(
+        preserved_weights, "safe_open", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError())
+    )
 
+    mtp_weights.capture_mtp_weights(model, tmp_path / "unavailable-on-peer")
     with pytest.raises(RuntimeError, match="inventory mismatch"):
-        mtp_weights.capture_mtp_weights(model, tmp_path / "unavailable-on-peer")
+        mtp_weights.validate_preserved_mtp_weights(model)
 
 
 def test_capture_mtp_weights_is_noop_for_model_without_mtp(monkeypatch, tmp_path):
+    from arctic_platform.model.implementations.moe import preserved_weights
     from arctic_platform.model.implementations.qwen35 import mtp_weights
 
     model = _mtp_model(layer_count=0)
@@ -1723,7 +1733,9 @@ def test_capture_mtp_weights_is_noop_for_model_without_mtp(monkeypatch, tmp_path
         "broadcast_object_list",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("no collective expected")),
     )
-    monkeypatch.setattr(mtp_weights, "safe_open", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError()))
+    monkeypatch.setattr(
+        preserved_weights, "safe_open", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError())
+    )
 
     mtp_weights.capture_mtp_weights(model, tmp_path / "not-needed")
 
@@ -1758,8 +1770,9 @@ def test_capture_mtp_weights_rejects_incomplete_or_mismatched_inventory(monkeypa
     model = _mtp_model()
     monkeypatch.setattr(mtp_weights.dist, "is_initialized", lambda: False)
 
+    mtp_weights.capture_mtp_weights(model, source)
     with pytest.raises(RuntimeError, match=match):
-        mtp_weights.capture_mtp_weights(model, source)
+        mtp_weights.validate_preserved_mtp_weights(model)
     assert "_ap_preserved_mtp_weights" not in model.__dict__
 
 
@@ -1964,7 +1977,7 @@ def test_capture_mtp_index_provenance_rejects_missing_index_entry(monkeypatch, t
     _write_mtp_checkpoint(source, payload)
     _rewrite_mtp_index(source, lambda weight_map: weight_map.pop("mtp.fc.weight"))
 
-    with pytest.raises(RuntimeError, match="missing="):
+    with pytest.raises(RuntimeError, match="missing=|does not match checkpoint index"):
         _capture_mtp_provenance_locally(monkeypatch, source)
 
 
@@ -1980,7 +1993,7 @@ def test_capture_mtp_index_provenance_rejects_extra_index_entry(monkeypatch, tmp
         ),
     )
 
-    with pytest.raises(RuntimeError, match="unexpected="):
+    with pytest.raises(RuntimeError, match="unexpected=|does not match checkpoint index"):
         _capture_mtp_provenance_locally(monkeypatch, source)
 
 
@@ -2017,7 +2030,7 @@ def test_capture_mtp_index_provenance_rejects_generation_mutation(monkeypatch, t
     from safetensors import safe_open as real_safe_open
     from safetensors.torch import save_file
 
-    from arctic_platform.model.implementations.qwen35 import mtp_weights
+    from arctic_platform.model.implementations.moe import preserved_weights
 
     payload = _mtp_payload()
     source = tmp_path / "original"
@@ -2042,8 +2055,284 @@ def test_capture_mtp_index_provenance_rejects_generation_mutation(monkeypatch, t
                 replacement.replace(shard_path)
         return real_safe_open(path, *args, **kwargs)
 
-    monkeypatch.setattr(mtp_weights, "safe_open", mutate_then_open)
+    monkeypatch.setattr(preserved_weights, "safe_open", mutate_then_open)
 
     with pytest.raises(RuntimeError, match="changed|replaced|identity|generation"):
         _capture_mtp_provenance_locally(monkeypatch, source)
     assert mutated
+
+
+def test_missing_mtp_allows_ordinary_export_but_rejects_full_export(monkeypatch, tmp_path):
+    from arctic_platform.model.implementations.qwen35 import deepspeed_integration as integration
+    from arctic_platform.model.implementations.qwen35 import mtp_weights
+
+    model = _mtp_model()
+    monkeypatch.setattr(mtp_weights.dist, "is_initialized", lambda: False)
+    mtp_weights.capture_mtp_weights(model, tmp_path)
+    calls = []
+
+    def ordinary(**kwargs):
+        calls.append(True)
+        yield "weight", model.weight
+
+    ordinary.weight_names = lambda **kwargs: frozenset({"weight"})
+    monkeypatch.setattr(integration, "_build_iter_full_hf_weights", lambda model: ordinary)
+    exporter = integration._build_iter_full_hf_weights_with_mtp(model)
+    assert list(exporter())[0][0] == "weight"
+    with pytest.raises(RuntimeError, match="Cannot export preserved.*missing="):
+        list(exporter(include_skipped=True))
+    assert calls == [True]
+
+
+def test_mtp_accepts_complete_per_expert_layout(monkeypatch, tmp_path):
+    import torch
+
+    from arctic_platform.model.implementations.qwen35 import mtp_weights
+
+    model = _mtp_model()
+    model.config.text_config.num_experts = 2
+    payload = _mtp_payload()
+    prefix = "mtp.layers.0.mlp.experts."
+    payload.pop(prefix + "gate_up_proj")
+    payload.pop(prefix + "down_proj")
+    payload.update(
+        {
+            f"{prefix}{expert}.{projection}.weight": torch.ones(2, 2)
+            for expert in range(2)
+            for projection in ("gate_proj", "up_proj", "down_proj")
+        }
+    )
+    source = tmp_path / "original"
+    _write_mtp_checkpoint(source, payload)
+    monkeypatch.setattr(mtp_weights.dist, "is_initialized", lambda: False)
+    mtp_weights.capture_mtp_weights(model, source)
+    assert set(dict(mtp_weights.iter_preserved_mtp_weights(model))) == set(payload)
+
+
+@pytest.mark.parametrize("family", ["qwen", "glm"])
+@pytest.mark.parametrize("fault", ["missing", "changed"])
+def test_preserved_export_failure_reaches_every_rank_before_ordinary_collectives(monkeypatch, tmp_path, family, fault):
+    import torch
+
+    from arctic_platform.model.implementations.glm53 import auxiliary_weights
+    from arctic_platform.model.implementations.glm53 import deepspeed_integration as glm
+    from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen
+    from arctic_platform.model.implementations.qwen35 import mtp_weights
+
+    model = _mtp_model()
+    if family == "qwen":
+        builder = qwen._build_iter_full_hf_weights_with_mtp
+    else:
+        from tests.model.test_glm5_next import _auxiliary_model
+
+        model = _auxiliary_model()
+        builder = glm._build_iter_full_hf_weights_with_auxiliary
+    if fault == "changed":
+        from safetensors.torch import save_file
+
+        monkeypatch.setattr(mtp_weights.dist, "is_initialized", lambda: False)
+        if family == "qwen":
+            source = tmp_path / "mtp"
+            _write_mtp_checkpoint(source, _mtp_payload())
+            mtp_weights.capture_mtp_weights(model, source)
+            shard = getattr(model, mtp_weights._STATE_ATTRIBUTE)[0].path
+        else:
+            from tests.model.test_glm5_next import _auxiliary_payload
+
+            tensors = _auxiliary_payload()
+            save_file(tensors, tmp_path / "original.safetensors")
+            auxiliary_weights.capture_auxiliary_weights(model, tmp_path)
+            shard = getattr(model, auxiliary_weights.STATE_ATTRIBUTE)[2][0].path
+        save_file(dict(replaced=torch.ones(1)), shard)
+    ordinary_calls = []
+
+    def ordinary(**kwargs):
+        ordinary_calls.append(kwargs)
+        return iter(())
+
+    monkeypatch.setattr(qwen, "_build_iter_full_hf_weights", lambda model: ordinary)
+    monkeypatch.setattr(mtp_weights.dist, "is_initialized", lambda: True)
+    failure = [None]
+    rank = [0]
+    monkeypatch.setattr(mtp_weights.dist, "get_rank", lambda: rank[0])
+
+    def broadcast(payload, src):
+        assert src == 0
+        if rank[0] == 0:
+            failure[0] = payload[0]
+        else:
+            payload[0] = failure[0]
+
+    monkeypatch.setattr(mtp_weights.dist, "broadcast_object_list", broadcast)
+    errors = []
+    for current_rank in (0, 1):
+        rank[0] = current_rank
+        with pytest.raises(RuntimeError, match="Cannot export preserved") as error:
+            list(builder(model)(include_skipped=True))
+        errors.append(str(error.value))
+    assert errors[0] == errors[1]
+    if fault == "changed":
+        assert "shard changed" in errors[0]
+    assert ordinary_calls == []
+
+
+def test_qwen_mtp_capture_uses_metadata_only(monkeypatch, tmp_path):
+    from arctic_platform.model.implementations.moe import preserved_weights
+    from arctic_platform.model.implementations.qwen35 import mtp_weights
+
+    source = tmp_path / "mtp"
+    _write_mtp_checkpoint(source, _mtp_payload())
+    model = _mtp_model()
+    native_open = preserved_weights.safe_open
+
+    class MetadataReader:
+        def __init__(self, *args, **kwargs):
+            self.reader = native_open(*args, **kwargs)
+
+        def __enter__(self):
+            self.reader.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.reader.__exit__(*args)
+
+        def keys(self):
+            return self.reader.keys()
+
+        def get_slice(self, name):
+            return self.reader.get_slice(name)
+
+        def get_tensor(self, name):
+            pytest.fail("capture materialized an inactive MTP tensor")
+
+    monkeypatch.setattr(mtp_weights.dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(preserved_weights, "safe_open", MetadataReader)
+    mtp_weights.capture_mtp_weights(model, source)
+    assert len(getattr(model, mtp_weights._STATE_ATTRIBUTE)) == len(_mtp_names())
+
+
+@pytest.mark.parametrize("collision_index", [0, 1])
+def test_preserved_collision_is_collective_before_any_sidecar_is_yielded(monkeypatch, tmp_path, collision_index):
+    import torch
+
+    from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen
+    from arctic_platform.model.implementations.qwen35 import mtp_weights
+
+    source = tmp_path / "mtp"
+    payload = _mtp_payload()
+    _write_mtp_checkpoint(source, payload)
+    model = _mtp_model()
+    monkeypatch.setattr(mtp_weights.dist, "is_initialized", lambda: False)
+    mtp_weights.capture_mtp_weights(model, source)
+    collision = sorted(payload)[-1]
+    rank = [0]
+    ordinary_calls = []
+    live = [("trained.weight", torch.ones(1))]
+    live.insert(collision_index, (collision, torch.ones(1)))
+
+    def ordinary(**kwargs):
+        ordinary_calls.append(True)
+        yield from live if rank[0] == 0 else []
+
+    ordinary.weight_names = lambda **kwargs: frozenset(name for name, _ in live)
+    monkeypatch.setattr(qwen, "_build_iter_full_hf_weights", lambda model: ordinary)
+    messages = []
+    monkeypatch.setattr(mtp_weights.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(mtp_weights.dist, "get_rank", lambda: rank[0])
+
+    def broadcast(message, src):
+        if rank[0] == 0:
+            messages.append(message[0])
+        else:
+            message[0] = messages.pop(0)
+
+    monkeypatch.setattr(mtp_weights.dist, "broadcast_object_list", broadcast)
+    for current_rank in (0, 1):
+        rank[0] = current_rank
+        yielded = []
+        with pytest.raises(RuntimeError, match="collides with live HF export"):
+            for name, tensor in qwen._build_iter_full_hf_weights_with_mtp(model)(include_skipped=True):
+                yielded.append(name)
+        assert yielded == []
+    assert ordinary_calls == []
+
+
+def test_preserved_sidecar_close_broadcasts_failure_to_peers(monkeypatch):
+    import torch
+
+    from arctic_platform.model.implementations.qwen35 import mtp_weights
+
+    monkeypatch.setattr(mtp_weights.dist, "is_initialized", lambda: True)
+    rank, messages = [0], []
+    monkeypatch.setattr(mtp_weights.dist, "get_rank", lambda: rank[0])
+
+    def broadcast(message, src):
+        if rank[0] == 0:
+            messages.append(message[0])
+        else:
+            message[0] = messages.pop(0)
+
+    monkeypatch.setattr(mtp_weights.dist, "broadcast_object_list", broadcast)
+    preserved = mtp_weights._PreservedExport(iter([("mtp.weight", torch.ones(1))]), frozenset({"mtp.weight"}))
+    generator = mtp_weights.finish_preserved_weight_export(preserved, set(), description="Qwen MTP")
+    assert next(generator)[0] == "mtp.weight"
+    generator.close()
+    assert len(messages) == 2
+    assert "GeneratorExit" in messages[-1]
+    rank[0] = 1
+    with pytest.raises(RuntimeError, match="GeneratorExit"):
+        list(mtp_weights.finish_preserved_weight_export(preserved, set(), description="Qwen MTP"))
+    assert messages == []
+
+
+@pytest.mark.parametrize("family", ["qwen", "glm"])
+@pytest.mark.parametrize("ep_size", [1, 2])
+def test_live_export_metadata_inventory_matches_real_layer_mapping(monkeypatch, family, ep_size):
+    import deepspeed.utils.groups as groups
+    import torch
+    import torch.distributed as dist
+
+    from arctic_platform.model.implementations.glm53.converting_glm5_next import convert_prime_layer_to_hf
+    from arctic_platform.model.implementations.moe.deepspeed_integration import build_iter_full_hf_weights
+    from arctic_platform.model.implementations.qwen35.models.qwen3_5_moe.converting_qwen3_5_moe import (
+        convert_tt_layer_to_hf,
+    )
+
+    converter = convert_tt_layer_to_hf if family == "qwen" else convert_prime_layer_to_hf
+    prefix = "model.layers.0" if family == "qwen" else "model.language_model.layers.0"
+    seen_meta = []
+
+    class Model(torch.nn.Module):
+        def named_parameters(self, *args, **kwargs):
+            for name in ("w1", "w2", "w3"):
+                parameter = torch.nn.Parameter(torch.ones(2, 3, 4))
+                parameter.allreduce = False
+                parameter.group_name = "ep"
+                yield f"{prefix}.mlp.experts.{name}", parameter
+            yield f"{prefix}.mlp.router.gate.weight", torch.nn.Parameter(torch.ones(2, 4))
+
+        def convert_layer_to_hf(self, state, index):
+            seen_meta.append(all(tensor.is_meta for tensor in state.values()))
+            converter(state, index)
+
+    monkeypatch.setattr(groups, "_get_expert_parallel_world_size", lambda name: ep_size)
+    group = object()
+    monkeypatch.setattr(groups, "_get_expert_parallel_group", lambda name: group)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(dist, "get_process_group_ranks", lambda group: list(range(ep_size)))
+    monkeypatch.setattr(dist, "get_world_size", lambda **kwargs: ep_size)
+
+    def all_gather(outputs, tensor, **kwargs):
+        assert len(outputs) == ep_size
+        for output in outputs:
+            output.copy_(tensor)
+
+    monkeypatch.setattr(dist, "all_gather", all_gather)
+    exporter = build_iter_full_hf_weights(Model())
+    names = exporter.weight_names(include_skipped=True)
+    assert seen_meta == [True]
+    assert names == set(dict(exporter(include_skipped=True)))
+    assert seen_meta == [True, False]
+    if family == "glm":
+        assert f"{prefix}.mlp.experts.{2 * ep_size - 1}.gate_proj.weight" in names

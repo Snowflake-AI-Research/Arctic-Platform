@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 from __future__ import annotations
 
 import json
@@ -901,3 +902,127 @@ def test_qwen38_conversion_rejects_mixed_expert_layouts(packed_projection):
         convert_hf_to_prime(state)
     assert set(state) == set(original)
     assert all(state[name] is value for name, value in original.items())
+
+
+@pytest.mark.parametrize("include_skipped", [False, True])
+def test_qwen38_full_hf_export_restores_ple_shards(monkeypatch, include_skipped):
+    from types import SimpleNamespace
+
+    from arctic_platform.model.implementations.qwen38 import deepspeed_integration as integration
+
+    model = torch.nn.Module()
+    model.config = SimpleNamespace(text_config=SimpleNamespace(split_ngram_parts=2))
+    name = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.weight"
+    tensor = torch.arange(20).reshape(5, 4)
+
+    def ordinary_builder(built_model):
+        assert built_model is model
+
+        def iterator(*, include_skipped=False):
+            yield name, tensor
+            if include_skipped:
+                yield "mtp.fc_embedding.weight", torch.ones(2, 2)
+
+        return iterator
+
+    monkeypatch.setattr(integration.qwen_ds, "_build_iter_full_hf_weights_with_mtp", ordinary_builder)
+    exported = dict(integration._build_iter_full_hf_weights(model)(include_skipped=include_skipped))
+    if not include_skipped:
+        assert set(exported) == {name}
+        assert exported[name] is tensor
+        return
+    assert set(exported) == {
+        name.replace(".weight", ".shard_0.weight"),
+        name.replace(".weight", ".shard_1.weight"),
+        "mtp.fc_embedding.weight",
+    }
+    torch.testing.assert_close(exported[name.replace(".weight", ".shard_0.weight")], tensor[:3], rtol=0, atol=0)
+    torch.testing.assert_close(exported[name.replace(".weight", ".shard_1.weight")], tensor[3:], rtol=0, atol=0)
+
+
+def test_qwen38_full_hf_export_uses_family_export_builder():
+    from arctic_platform.model.implementations.qwen38 import deepspeed_integration as integration
+
+    assert integration._adapter().hf_weight_export is integration._build_iter_full_hf_weights
+
+
+@pytest.mark.parametrize("parts", [0, -1, True, 1.5, "128"])
+def test_qwen38_full_hf_export_rejects_invalid_ple_part_count(monkeypatch, parts):
+    from types import SimpleNamespace
+
+    from arctic_platform.model.implementations.qwen38 import deepspeed_integration as integration
+
+    model = torch.nn.Module()
+    model.config = SimpleNamespace(text_config=SimpleNamespace(split_ngram_parts=parts))
+    monkeypatch.setattr(integration.qwen_ds, "_build_iter_full_hf_weights_with_mtp", lambda model: None)
+    with pytest.raises(ValueError, match="split_ngram_parts must be a positive integer"):
+        integration._build_iter_full_hf_weights(model)
+
+
+def test_qwen38_checkpoint_export_preserves_mtp_while_splitting_ple(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    from safetensors.torch import load_file
+    from safetensors.torch import save_file
+
+    from arctic_platform.model.implementations.moe import weights
+    from arctic_platform.model.implementations.qwen35 import mtp_weights
+    from arctic_platform.model.implementations.qwen38 import deepspeed_integration as integration
+
+    model = torch.nn.Module()
+    model.config = SimpleNamespace(
+        text_config=SimpleNamespace(model_type="qwen4_exp_text", mtp_num_hidden_layers=1, split_ngram_parts=2)
+    )
+    mtp_name = "mtp.fc_embedding.weight"
+    original_mtp = torch.arange(6, dtype=torch.bfloat16).reshape(2, 3)
+    payload = {name: original_mtp.clone() for name in mtp_weights._configured_names(model)}
+    assert len(payload) == 31
+    save_file(payload, str(tmp_path / "model.safetensors"))
+    monkeypatch.setattr(mtp_weights.dist, "is_initialized", lambda: False)
+    mtp_weights.capture_mtp_weights(model, tmp_path)
+    ple_name = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.weight"
+    monkeypatch.setattr(
+        torch.distributed, "get_rank", lambda: pytest.fail("non-distributed export must not query rank")
+    )
+    ple = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+
+    def ordinary(**kwargs):
+        yield ple_name, ple
+
+    ordinary.weight_names = lambda **kwargs: frozenset({ple_name})
+    monkeypatch.setattr(integration.qwen_ds, "_build_iter_full_hf_weights", lambda built_model: ordinary)
+    exporter = integration._adapter().hf_weight_export(model)
+    checkpoint = dict(exporter(include_skipped=True))
+    assert set(checkpoint) == set(payload) | {
+        ple_name.replace(".weight", ".shard_0.weight"),
+        ple_name.replace(".weight", ".shard_1.weight"),
+    }
+    shards = [checkpoint[ple_name.replace(".weight", f".shard_{index}.weight")] for index in range(2)]
+    assert len({tensor.untyped_storage().data_ptr() for tensor in shards}) == 2
+    split = weights.split_torch_state_dict_into_shards
+    monkeypatch.setattr(
+        weights,
+        "split_torch_state_dict_into_shards",
+        lambda state, **kwargs: split(state, max_shard_size=48, **kwargs),
+    )
+    sharded_output = tmp_path / "sharded"
+    weights.save_state_dict(dict(checkpoint), sharded_output)
+    sharded = weights.load_state_dict(sharded_output)
+    assert set(sharded) == set(checkpoint)
+    for name, tensor in checkpoint.items():
+        torch.testing.assert_close(sharded[name], tensor, rtol=0, atol=0)
+    index = json.loads((sharded_output / "model.safetensors.index.json").read_text())
+    assert index["metadata"]["total_size"] == sum(t.numel() * t.element_size() for t in checkpoint.values())
+    for filename in set(index["weight_map"].values()):
+        tensors = load_file(str(sharded_output / filename))
+        assert sum(t.numel() * t.element_size() for t in tensors.values()) <= 48
+    # Direct serialization also preserves exact tensor values and MTP coverage.
+    output = tmp_path / "export.safetensors"
+    save_file(checkpoint, str(output))
+    restored = load_file(str(output))
+    for name, tensor in payload.items():
+        torch.testing.assert_close(restored[name], tensor, rtol=0, atol=0)
+        assert restored[name].dtype == tensor.dtype
+    torch.testing.assert_close(restored[ple_name.replace(".weight", ".shard_0.weight")], ple[:3], rtol=0, atol=0)
+    torch.testing.assert_close(restored[ple_name.replace(".weight", ".shard_1.weight")], ple[3:], rtol=0, atol=0)
+    assert mtp_name not in dict(exporter(include_skipped=False))

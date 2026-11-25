@@ -30,10 +30,13 @@ from arctic_platform.model.implementations.moe.layers.moe import BCFeedForward
 from arctic_platform.model.implementations.moe.parallel_dims import ParallelDims
 from arctic_platform.model.implementations.qwen35 import deepspeed_integration as qwen_ds
 from arctic_platform.model.implementations.qwen35.config import ModelConfig
-from arctic_platform.model.implementations.qwen35.mtp_weights import iter_preserved_weights_collectively
+from arctic_platform.model.implementations.qwen35.mtp_weights import finish_preserved_weight_export
+from arctic_platform.model.implementations.qwen35.mtp_weights import prepare_preserved_weights_for_export
 from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
 
 from .auxiliary_weights import iter_preserved_auxiliary_weights
+from .auxiliary_weights import preserved_auxiliary_names
+from .auxiliary_weights import validate_preserved_auxiliary_weights
 from .context_parallel import SPARSE_MLA_BACKENDS
 from .context_parallel import apply_context_parallelism
 
@@ -80,15 +83,34 @@ def _build_iter_full_hf_weights_with_auxiliary(model: nn.Module):
     ordinary = qwen_ds._build_iter_full_hf_weights(model)
 
     def iterator(*, include_skipped: bool = False):
+        preserved = (
+            prepare_preserved_weights_for_export(
+                model,
+                iter_preserved_auxiliary_weights,
+                description="GLM prediction layers",
+                validate=validate_preserved_auxiliary_weights,
+                names=preserved_auxiliary_names,
+                live_names=lambda: ordinary.weight_names(include_skipped=True),
+            )
+            if include_skipped
+            else None
+        )
         emitted = set()
+        collision = False
         for name, tensor in ordinary(include_skipped=include_skipped):
             emitted.add(name)
-            yield name, tensor
-        if include_skipped:
-            yield from iter_preserved_weights_collectively(
-                model, iter_preserved_auxiliary_weights, emitted, description="GLM prediction"
-            )
+            collision = collision or (preserved is not None and name in preserved.names)
+            if not collision:
+                yield name, tensor
+            del tensor
+        if preserved is not None:
+            yield from finish_preserved_weight_export(preserved, emitted, description="GLM prediction")
 
+    def weight_names(*, include_skipped: bool = False):
+        names = ordinary.weight_names(include_skipped=include_skipped)
+        return names | frozenset(preserved_auxiliary_names(model)) if include_skipped else names
+
+    setattr(iterator, "weight_names", weight_names)
     return iterator
 
 

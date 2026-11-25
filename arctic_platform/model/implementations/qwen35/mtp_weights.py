@@ -17,19 +17,23 @@
 
 from __future__ import annotations
 
-import json
-import os
-import stat
-from contextlib import ExitStack
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
-from safetensors import safe_open
 from torch import nn
 
+from arctic_platform.model.implementations.moe.preserved_weights import PreservedWeight as _PreservedWeight
+from arctic_platform.model.implementations.moe.preserved_weights import (
+    capture_original_weights as _capture_original_weights,
+)
+from arctic_platform.model.implementations.moe.preserved_weights import open_preserved_weight
+from arctic_platform.model.implementations.moe.preserved_weights import read_preserved_weight
+
 _STATE_ATTRIBUTE = "_ap_preserved_mtp_weights"
+_FAILURE_ATTRIBUTE = "_ap_preserved_mtp_failure"
 _BASE_NAMES = (
     "fc.weight",
     "norm.weight",
@@ -79,14 +83,12 @@ _QWEN4_LAYER_NAMES = (
 
 
 @dataclass(frozen=True)
-class _PreservedWeight:
-    name: str
-    tensor: torch.Tensor
-    shape: tuple[int, ...]
-    dtype: torch.dtype
+class _PreservedExport:
+    weights: Iterable[tuple[str, torch.Tensor]]
+    names: frozenset[str]
 
 
-def _configured_names(model: nn.Module) -> set[str]:
+def _configured_names(model: nn.Module, inventory: set[str] | None = None) -> set[str]:
     config = getattr(model, "config", None)
     text_config = getattr(config, "text_config", config)
     model_type = getattr(text_config, "model_type", None)
@@ -101,111 +103,29 @@ def _configured_names(model: nn.Module) -> set[str]:
         raise ValueError("Qwen mtp_num_hidden_layers must be a nonnegative integer")
     if count == 0:
         return set()
-    return {f"mtp.{name}" for name in base_names} | {
+    expected = {f"mtp.{name}" for name in base_names} | {
         f"mtp.layers.{index}.{name}" for index in range(count) for name in layer_names
     }
-
-
-def _file_identity(metadata: os.stat_result) -> tuple[int, ...]:
-    return (
-        metadata.st_dev,
-        metadata.st_ino,
-        metadata.st_mode,
-        metadata.st_size,
-        metadata.st_mtime_ns,
-        metadata.st_ctime_ns,
-    )
-
-
-def _unique_json_object(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"duplicate checkpoint index key: {key}")
-        result[key] = value
-    return result
-
-
-def _capture_original_weights(
-    source_path: Path, expected: set[str], *, prefixes: tuple[str, ...] = ("mtp.",)
-) -> list[_PreservedWeight]:
-    """The resolved original checkpoint must stay immutable through ordinary DCP loading."""
-    preserved: list[_PreservedWeight] = []
-    held: list[tuple[Path, int, os.stat_result]] = []
-    with ExitStack() as stack:
-
-        def hold(path: Path) -> int:
-            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
-            stack.callback(os.close, fd)
-            metadata = os.fstat(fd)
-            if not stat.S_ISREG(metadata.st_mode):
-                raise ValueError(f"original checkpoint source is not a regular file: {path}")
-            if _file_identity(os.stat(path)) != _file_identity(metadata):
-                raise ValueError(f"original checkpoint source changed while opening: {path}")
-            held.append((path, fd, metadata))
-            return fd
-
-        index_path = source_path / "model.safetensors.index.json"
-        indexed: dict[Path, set[str]] | None = None
-        if os.path.lexists(index_path):
-            index_fd = hold(index_path)
-            with os.fdopen(os.dup(index_fd), encoding="utf-8") as handle:
-                index = json.load(handle, object_pairs_hook=_unique_json_object)
-            weight_map = index.get("weight_map") if isinstance(index, dict) else None
-            if not isinstance(weight_map, dict) or not all(isinstance(name, str) for name in weight_map):
-                raise ValueError("original checkpoint index requires a weight_map object")
-            mtp_names = {name for name in weight_map if name.startswith(prefixes)}
-            if mtp_names != expected:
-                raise ValueError(
-                    "original Qwen3.5 MTP index mismatch: "
-                    f"missing={sorted(expected - mtp_names)}, unexpected={sorted(mtp_names - expected)}"
+    if inventory is not None:
+        for index in range(count):
+            prefix = f"mtp.layers.{index}.mlp.experts."
+            if prefix + "gate_up_proj" in inventory:
+                continue
+            experts = getattr(text_config, "num_experts", None)
+            if type(experts) is int and experts > 0:
+                expected.difference_update({prefix + "gate_up_proj", prefix + "down_proj"})
+                expected.update(
+                    f"{prefix}{expert}.{projection}.weight"
+                    for expert in range(experts)
+                    for projection in ("gate_proj", "up_proj", "down_proj")
                 )
-            indexed = {}
-            for name in sorted(mtp_names):
-                shard_name = weight_map[name]
-                if (
-                    not isinstance(shard_name, str)
-                    or not shard_name
-                    or "\\" in shard_name
-                    or Path(shard_name).is_absolute()
-                    or ".." in Path(shard_name).parts
-                    or Path(shard_name).suffix != ".safetensors"
-                ):
-                    raise ValueError(f"unsafe original MTP shard path for {name}: {shard_name!r}")
-                indexed.setdefault(source_path / shard_name, set()).add(name)
-
-        shards = sorted(indexed if indexed is not None else source_path.glob("*.safetensors"))
-        names: set[str] = set()
-        for shard in shards:
-            shard_fd = hold(shard)
-            # Read the held file generation, not a separately reopened mutable pathname.
-            with safe_open(f"/proc/self/fd/{shard_fd}", framework="pt", device="cpu") as reader:
-                shard_names = {name for name in reader.keys() if name.startswith(prefixes)}
-                if indexed is not None and shard_names != indexed[shard]:
-                    raise ValueError(f"original MTP shard does not match checkpoint index: {shard}")
-                for name in sorted(shard_names):
-                    if name in names:
-                        raise ValueError(f"duplicate original MTP tensor: {name}")
-                    names.add(name)
-                    source = reader.get_tensor(name)
-                    tensor = source.detach().clone().contiguous()
-                    preserved.append(_PreservedWeight(name, tensor, tuple(source.shape), source.dtype))
-        if names != expected:
-            raise ValueError(
-                "original Qwen3.5 MTP inventory mismatch: "
-                f"missing={sorted(expected - names)}, unexpected={sorted(names - expected)}"
-            )
-        for path, fd, metadata in held:
-            if _file_identity(os.fstat(fd)) != _file_identity(metadata) or _file_identity(
-                os.stat(path)
-            ) != _file_identity(metadata):
-                raise ValueError(f"original checkpoint source changed during MTP capture: {path}")
-    return preserved
+    return expected
 
 
 def capture_mtp_weights(model: nn.Module, source_path: Path) -> None:
-    """Capture only rank 0's original CPU tensors, before selecting a converted cache."""
+    """Record immutable source locations; unavailable sidecars fail full export, not ordinary loading."""
     model.__dict__.pop(_STATE_ATTRIBUTE, None)
+    model.__dict__.pop(_FAILURE_ATTRIBUTE, None)
     expected = _configured_names(model)
     if not expected:
         return
@@ -214,59 +134,43 @@ def capture_mtp_weights(model: nn.Module, source_path: Path) -> None:
     is_master = not distributed or dist.get_rank() == 0
     preserved: list[_PreservedWeight] = []
     failure: list[str | None] = [None]
-    cause = None
     if is_master:
         try:
-            preserved = _capture_original_weights(source_path, expected)
+            preserved = _capture_original_weights(source_path, None, prefixes=("mtp.",))
+            inventory = {weight.name for weight in preserved}
+            expected = _configured_names(model, inventory)
+            if inventory != expected:
+                raise ValueError(
+                    f"original prediction inventory mismatch: missing={sorted(expected - inventory)}, "
+                    f"unexpected={sorted(inventory - expected)}"
+                )
         except Exception as exc:
-            cause = exc
             failure[0] = f"{type(exc).__name__}: {exc}"
 
     # A source failure on the serializer rank must not strand peers in the following DCP barrier.
     if distributed:
         dist.broadcast_object_list(failure, src=0)
     if failure[0] is not None:
-        raise RuntimeError(f"Cannot preserve original Qwen3.5 MTP weights: {failure[0]}") from cause
+        setattr(model, _FAILURE_ATTRIBUTE, failure[0])
+        return
     if is_master:
         setattr(model, _STATE_ATTRIBUTE, tuple(sorted(preserved, key=lambda weight: weight.name)))
 
 
-def iter_preserved_mtp_weights(model: nn.Module):
-    """Yield unchanged original weights without registering parameters or buffers."""
-    expected = _configured_names(model)
-    if not expected:
-        return
-    preserved = getattr(model, _STATE_ATTRIBUTE, ())
-    names = [weight.name for weight in preserved]
-    if len(names) != len(set(names)) or set(names) != expected:
-        raise RuntimeError("Full Qwen3.5 HF export requires captured original MTP weights")
-    for weight in preserved:
-        tensor = weight.tensor
-        if (
-            tuple(tensor.shape) != weight.shape
-            or tensor.dtype != weight.dtype
-            or tensor.device.type != "cpu"
-            or not tensor.is_contiguous()
-            or tensor.requires_grad
-        ):
-            raise RuntimeError(f"Preserved original MTP tensor changed layout or dtype: {weight.name}")
-        yield weight.name, tensor
-
-
-def iter_preserved_weights_collectively(model: nn.Module, iterator, emitted: set[str], *, description: str):
-    """Validate retained CPU tensors on the serializer rank and report failures to every drained peer."""
+def prepare_preserved_weights_for_export(model: nn.Module, iterator, *, description: str, validate, names, live_names):
+    """Validate rank zero's sidecar before any ordinary export collective."""
     distributed = dist.is_initialized()
-    is_master = dist.get_rank() == 0
-    preserved = ()
+    is_master = not distributed or dist.get_rank() == 0
+    weights = _PreservedExport((), frozenset())
     failure: list[str | None] = [None]
     cause = None
     if is_master:
         try:
-            # Materialize references, not new tensor copies, before publishing any sidecar.
-            preserved = tuple(iterator(model))
-            for name, _ in preserved:
-                if name in emitted:
-                    raise RuntimeError(f"{description} tensor collides with live HF export: {name}")
+            validate(model)
+            weights = _PreservedExport(iterator(model), frozenset(names(model)))
+            collisions = weights.names & live_names() if weights.names else frozenset()
+            if collisions:
+                raise RuntimeError(f"{description} tensor collides with live HF export: {sorted(collisions)}")
         except Exception as exc:
             cause = exc
             failure[0] = f"{type(exc).__name__}: {exc}"
@@ -274,4 +178,82 @@ def iter_preserved_weights_collectively(model: nn.Module, iterator, emitted: set
         dist.broadcast_object_list(failure, src=0)
     if failure[0] is not None:
         raise RuntimeError(f"Cannot export preserved {description}: {failure[0]}") from cause
-    yield from preserved
+    return weights
+
+
+def finish_preserved_weight_export(preserved, emitted: set[str], *, description: str):
+    """Finish sidecar status collectively, including a started rank-zero iterator's early close.
+
+    Every rank must fully drain the entire export iterator, or all ranks must abort before the sidecar stage.
+    Closing an unstarted generator does not run its finally block; rank-local cancellation during the live
+    collective stream cannot be recovered here and requires whole-process-group abort by the caller.
+    """
+    distributed = dist.is_initialized()
+    is_master = not distributed or dist.get_rank() == 0
+    failure: list[str | None] = [None]
+    cause = None
+    if is_master:
+        try:
+            collisions = preserved.names & emitted
+            if collisions:
+                raise RuntimeError(f"{description} tensor collides with live HF export: {sorted(collisions)}")
+        except Exception as exc:
+            cause = exc
+            failure[0] = f"{type(exc).__name__}: {exc}"
+    if distributed:
+        dist.broadcast_object_list(failure, src=0)
+    if failure[0] is not None:
+        raise RuntimeError(f"Cannot finish preserved {description} export: {failure[0]}") from cause
+    try:
+        if is_master:
+            for name, tensor in preserved.weights:
+                yield name, tensor
+                del tensor
+    except BaseException as exc:
+        cause = exc
+        failure[0] = f"{type(exc).__name__}: sidecar export interrupted: {exc}"
+        if not isinstance(exc, Exception):
+            raise
+    finally:
+        if distributed:
+            try:
+                dist.broadcast_object_list(failure, src=0)
+            except Exception:
+                if cause is None:
+                    raise
+    if failure[0] is not None:
+        raise RuntimeError(f"Cannot finish preserved {description} export: {failure[0]}") from cause
+
+
+def preserved_mtp_names(model: nn.Module):
+    if model.__dict__.get("_ap_weights_random_initialized", False):
+        return ()
+    return (weight.name for weight in getattr(model, _STATE_ATTRIBUTE, ()))
+
+
+def validate_preserved_mtp_weights(model: nn.Module) -> None:
+    """Validate metadata and original source generations before ordinary export collectives."""
+    if model.__dict__.get("_ap_weights_random_initialized", False):
+        return
+    failure = getattr(model, _FAILURE_ATTRIBUTE, None)
+    if failure is not None:
+        raise RuntimeError(f"Cannot preserve original Qwen MTP weights: {failure}")
+    preserved = getattr(model, _STATE_ATTRIBUTE, ())
+    expected = _configured_names(model, {weight.name for weight in preserved})
+    if not expected:
+        return
+    names = [weight.name for weight in preserved]
+    if len(names) != len(set(names)) or set(names) != expected:
+        raise RuntimeError("Full Qwen HF export requires captured original MTP weights")
+    for weight in preserved:
+        with open_preserved_weight(weight):
+            pass
+
+
+def iter_preserved_mtp_weights(model: nn.Module):
+    """Map only the current exported tensor; the original checkpoint must remain immutable."""
+    validate_preserved_mtp_weights(model)
+    if model.__dict__.get("_ap_weights_random_initialized", False) or not _configured_names(model):
+        return
+    for weight in getattr(model, _STATE_ATTRIBUTE, ()):
+        yield weight.name, read_preserved_weight(weight)

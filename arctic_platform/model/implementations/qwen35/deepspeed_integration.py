@@ -26,7 +26,6 @@ from .model_builder import resolve_weight_source
 from .config import DebugModelConfig, ModelConfig
 from .sequence_parallel import apply_sequence_parallelism
 from .mtp_weights import iter_preserved_mtp_weights
-from .mtp_weights import iter_preserved_weights_collectively
 from .model_builder import (
     DTYPE_MAP,
     _reset_runtime_moe_buffers,
@@ -224,16 +223,38 @@ def _build_iter_full_hf_weights_with_mtp(model: nn.Module):
     ordinary = _build_iter_full_hf_weights(model)
 
     def iterator(*, include_skipped: bool = False):
+        from .mtp_weights import finish_preserved_weight_export
+        from .mtp_weights import prepare_preserved_weights_for_export
+        from .mtp_weights import preserved_mtp_names
+        from .mtp_weights import validate_preserved_mtp_weights
+
+        preserved = (
+            prepare_preserved_weights_for_export(
+                model, iter_preserved_mtp_weights, description="Qwen MTP weights",
+                validate=validate_preserved_mtp_weights, names=preserved_mtp_names,
+                live_names=lambda: ordinary.weight_names(include_skipped=True),
+            )
+            if include_skipped else None
+        )
         names: set[str] = set()
+        collision = False
         for name, tensor in ordinary(include_skipped=include_skipped):
             names.add(name)
-            yield name, tensor
-        # Finish all ordinary collectives before the serializer-only sidecar.
-        if include_skipped:
-            yield from iter_preserved_weights_collectively(
-                model, iter_preserved_mtp_weights, names, description="Original MTP"
-            )
+            collision = collision or (preserved is not None and name in preserved.names)
+            # Drain ordinary collectives on every rank, but never publish a colliding live tensor.
+            if not collision:
+                yield name, tensor
+            del tensor
+        if preserved is not None:
+            yield from finish_preserved_weight_export(preserved, names, description="Original MTP")
 
+    def weight_names(*, include_skipped: bool = False):
+        from .mtp_weights import preserved_mtp_names
+
+        names = ordinary.weight_names(include_skipped=include_skipped)
+        return names | frozenset(preserved_mtp_names(model)) if include_skipped else names
+
+    iterator.weight_names = weight_names
     return iterator
 
 
