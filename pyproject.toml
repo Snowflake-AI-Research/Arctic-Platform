@@ -145,10 +145,12 @@ correctness = [
     "tqdm",
 ]
 
-# qwen3.5 and other models that use GDN attention layers need this for much better perf
+# qwen3.5 and other models that use GDN attention layers need this for much better perf.
+# Prefix sharing's conv carry and initial_state handoff are verified on GPU on these releases;
+# flash-linear-attention 0.6.0 pins fla-core==0.6.0.
 gdn = [
-    "flash-linear-attention",
-    "causal-conv1d",
+    "flash-linear-attention==0.6.0",
+    "causal-conv1d==1.7.0",
 ]
 
 # BF16 routed experts on Hopper and Blackwell. moe_use_sonicmoe defaults off; turning it on needs this extra.

@@ -4,13 +4,12 @@ from dataclasses import dataclass
 from typing import Literal
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
+from arctic_platform.common.packing.layout import dense_causal_attention
 from arctic_platform.common.packing.layout import get_stashed_layout
 from arctic_platform.common.packing.layout import prefix_varlen_args
 from arctic_platform.common.packing.layout import register_native_prefix_attention
-from arctic_platform.common.packing.layout import require_dense_attention_layout
 
 from .norms import RMSNorm, RMSNormConfig
 from .rotary_emb import apply_rotary_pos_emb
@@ -302,8 +301,9 @@ class SDPAAttention(nn.Module):
     ) -> torch.Tensor:
         key_states = key_states.repeat_interleave(self.num_key_value_groups, dim=1)
         value_states = value_states.repeat_interleave(self.num_key_value_groups, dim=1)
-        require_dense_attention_layout(type(self).__name__, get_stashed_layout(self))
-        out = F.scaled_dot_product_attention(query_states, key_states, value_states, is_causal=True)
+        out = dense_causal_attention(
+            type(self).__name__, query_states, key_states, value_states, get_stashed_layout(self)
+        )
         out = out.transpose(1, 2).contiguous()
         return out.view(out.shape[0], out.shape[1], -1)
 

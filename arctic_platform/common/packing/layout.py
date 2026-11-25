@@ -23,7 +23,8 @@ token-mean only.
 Lifetime: :func:`using_layout` is the only way to activate a layout. It must wrap forward,
 loss, and backward of one model call. Entering with a sharing layout validates every
 sequence mixer (:func:`require_prefix_continuation`) and the router-replay decision for
-MoE models, and raises before anything runs. Calling it per model call is the caller's
+MoE models, and raises before anything runs. A ``transformers`` model with Arctic-Platform attention must
+also be registered with :func:`register_prefix_sharing_model` once it is verified end to end. Calling it per model call is the caller's
 job. Training does not use this API yet: that is deliberate until the executor PR
 (``plan_calls`` / ``execute_calls``). PR1 users are the CPU tests and the on-prem GPU gate.
 
@@ -41,15 +42,19 @@ one; another thread entering while any context is active raises. The active-layo
 and the Hugging Face registry override are process globals. Reads are not thread-checked:
 autograd runs backward, and checkpoint recompute, on its own device threads.
 
-Every model that runs while a context is active needs its own :func:`using_layout` (an
-unshared layout is fine). Arctic-Platform attention (flash or SDPA) with no stash raises while
-any context is active, because ``cu_seqlens_from_position_ids`` would hand it another call's
-segments, and SDPA also raises on a layout with several segments. Hugging Face attention that
-dispatches through ``transformers``' registry (every implementation but eager) raises with no
-stash while a sharing context is active. With nested
-contexts the loss and position-id guards fire if any layout in the stack shares, and
-``cu_seqlens_from_position_ids`` raises when the stack holds more than one layout, since it
-cannot tell which call it is serving.
+An unshared layout refuses nothing that runs packed today (padded calls, SP shards, SDPA, caches),
+and it only supplies the segments it knows where the call is exactly the layout's tokens:
+``cu_seqlens_from_position_ids`` returns them for the layout's own positions, and
+Arctic-Platform SDPA (:func:`dense_causal_attention`) attends within each segment instead of
+across the whole packed call. Other calls behave as they do with no layout.
+
+Every model that runs while a sharing context is active needs its own :func:`using_layout` (an
+unshared layout is fine). Arctic-Platform attention (flash or SDPA), the GatedDeltaNet adapters,
+and Hugging Face attention that dispatches through ``transformers``' registry (every
+implementation but eager) raise with no stash then, because ``cu_seqlens_from_position_ids``
+would hand them the sharing call's segments. With nested contexts the loss and position-id guards
+fire if any layout in the stack shares, and ``cu_seqlens_from_position_ids`` raises when a sharing
+stack holds more than one layout, since it cannot tell which call it is serving.
 
 Attention reads the layout stashed on its own module. Arctic-Platform ``FlashAttention``
 gathers K/V itself. Hugging Face flash attention gets the gather from a wrapper that
@@ -63,14 +68,24 @@ varlen backward) have been checked on GPU against an unshared run. A sharing lay
 other ``FlashAttention`` versions and Hugging Face implementations other than
 ``flash_attention_2`` / ``_3`` / ``_4``, and needs the kernel each mixer calls installed.
 
-Mixers are found by class name and by a direct ``Conv1d`` child; any that is not one of the
-flash attentions above (Mamba / SSM, GatedDeltaNet, short convolutions) refuses a sharing
-layout, because it would restart its state at each continuation instead of carrying the root's.
+Mixers are found by class name and by a direct ``Conv1d`` child. A GatedDeltaNet continues a
+shared prefix when its module carries a :data:`PREFIX_CONTINUATION_ATTR` check (the adapter in
+``gpu/sp/gated_delta_net.py``, or the custom Qwen3.5-MoE layer): each continuation's conv window
+starts with its root's last inputs and its recurrent state starts from the root's final state,
+which needs FLA's chunk rule, causal-conv1d's ``seq_idx``, and roots of whole 64-token chunks. Any
+other mixer that is not one of the flash attentions above (Mamba / SSM, unadapted GatedDeltaNet,
+short convolutions) refuses a sharing layout, because it would restart its state at each
+continuation instead of carrying the root's.
 
-Not supported inside :func:`using_layout` until the GatedDeltaNet and executor PRs define
-them: sequence parallelism (SP >= 2, a shard's ``position_ids`` do not cover the layout)
-and padded calls (``pad_packed_microbatch``). Both fail the packed-token-count checks in
-``cu_seqlens_from_position_ids`` and :func:`prefix_varlen_args`.
+Under sequence parallelism the layout describes the whole packed call, identical on every rank,
+and mixers apply it after their all-to-all, when they hold every token: DeepSpeed's
+``UlyssesSPAttentionHF`` gets the prefix gather by having its inner attention swapped for the
+context (its subclasses are refused), and the GatedDeltaNet adapters read it after the head
+exchange. Not supported under a sharing layout until the executor PR: padded calls
+(``pad_packed_microbatch``), which fail the packed-token-count checks in
+``cu_seqlens_from_position_ids`` and :func:`prefix_varlen_args`. Under SP, a backbone that rebuilds
+global boundaries passes its own stash to ``cu_seqlens_from_position_ids``, so another model's
+context is never read for them.
 
 MoE policy (documentation only; nothing here adjusts token counts): a shared root token goes
 through the router and experts once per call, so ``tokens_per_expert``, expert-bias updates,
@@ -114,6 +129,9 @@ LAYOUT_ATTR = "_arctic_packed_layout"
 # ``sft_mask`` / ``echo_observation_mask`` sit outside ``loss_mask`` but still weight a loss term.
 LOSS_WEIGHT_KEYS = frozenset({"loss_mask", "response_mask", "sft_mask", "echo_observation_mask"})
 _HF_PREFIX_MARK = "_arctic_prefix_attention"
+# Instance attribute: ``check(layout) -> reason | None``. A mixer that continues prefixes itself (the GatedDeltaNet
+# adapter) sets it on each module it installs on; a class attribute does not count.
+PREFIX_CONTINUATION_ATTR = "_arctic_prefix_continuation"
 _MISSING = object()
 _ModuleType = TypeVar("_ModuleType", bound=type)
 
@@ -408,6 +426,11 @@ class PackedLayout:
         return int(self.cu_seqlens[-1])
 
     @cached_property
+    def segment_bounds(self) -> list[tuple[int, int]]:
+        cu = self.cu_seqlens.tolist()
+        return list(zip(cu[:-1], cu[1:]))
+
+    @cached_property
     def root_tokens(self) -> int:
         return int(self.cu_seqlens[self.num_roots])
 
@@ -613,6 +636,12 @@ def get_stashed_layout(module: torch.nn.Module) -> PackedLayout | None:
     return getattr(module, LAYOUT_ATTR, None)
 
 
+def get_sharing_layout(module: torch.nn.Module) -> PackedLayout | None:
+    """``module``'s stash if it shares a prefix, else ``None``: an unshared layout leaves code on its no-layout path."""
+    layout = get_stashed_layout(module)
+    return layout if layout is not None and layout.has_sharing else None
+
+
 def get_active_packed_layout() -> PackedLayout | None:
     """Layout of the innermost :func:`using_layout`, for code that has no module to read."""
     return _ACTIVE_LAYOUTS[-1] if _ACTIVE_LAYOUTS else None
@@ -623,16 +652,34 @@ def prefix_sharing_active() -> bool:
     return any(layout is not None and layout.has_sharing for layout in _ACTIVE_LAYOUTS)
 
 
-def layout_for_position_ids() -> PackedLayout | None:
-    """The layout whose segments replace boundaries read from ``position_ids``, or ``None`` to read them.
+def layout_for_own_positions(layout: PackedLayout | None, flat_position_ids: Tensor) -> PackedLayout | None:
+    """``layout`` if its segments replace boundaries read from ``flat_position_ids``, else ``None``.
+
+    A sharing layout always does: its continuations do not restart at position 0. An unshared one does only for its
+    own positions, so a padded call or an SP shard reads its positions as before.
+    """
+    if layout is None or layout.has_sharing:
+        return layout
+    if flat_position_ids.numel() != layout.num_tokens:
+        return None
+    own = layout.position_ids.to(device=flat_position_ids.device, dtype=flat_position_ids.dtype)
+    return layout if torch.equal(own, flat_position_ids) else None
+
+
+def layout_for_position_ids(flat_position_ids: Tensor) -> PackedLayout | None:
+    """The layout whose segments replace boundaries read from ``flat_position_ids``, or ``None`` to read them.
 
     The caller has no module, so it cannot tell which context's model it serves. One layout
-    (possibly entered more than once) is unambiguous. With several, any choice can hand one
-    model's segments to another model's mixers, and the packed-token-count check only catches
-    that when the widths differ, so this raises instead.
+    (possibly entered more than once) is unambiguous. Under sharing, several raise: any choice can
+    hand one model's segments to another model's mixers, and the packed-token-count check only
+    catches that when the widths differ. An unshared layout replaces them only when it is the only
+    one active and the positions are its own, so a padded call, an SP shard, or another model's
+    batch reads its positions as before.
     """
-    if not _ACTIVE_LAYOUTS:
-        return None
+    if not prefix_sharing_active():
+        if not _ACTIVE_LAYOUTS or any(layout is not _ACTIVE_LAYOUTS[0] for layout in _ACTIVE_LAYOUTS):
+            return None
+        return layout_for_own_positions(_ACTIVE_LAYOUTS[0], flat_position_ids)
     if any(layout is not _ACTIVE_LAYOUTS[0] for layout in _ACTIVE_LAYOUTS):
         raise ValueError(
             "nested using_layout contexts with different layouts are active, so segments cannot be "
@@ -702,7 +749,7 @@ def using_layout(model: torch.nn.Module, layout: PackedLayout | None) -> Iterato
     default); :meth:`PackedLayout.unpack` raises on the latter only if the loss flows through it.
     """
     if layout is not None and layout.has_sharing:
-        require_prefix_continuation(model)
+        require_prefix_continuation(model, layout)
         require_router_replay_decision(model, layout)
         require_bottom_right_causal_flash(model)
     with ExitStack() as stack:
@@ -746,27 +793,77 @@ def using_layout(model: torch.nn.Module, layout: PackedLayout | None) -> Iterato
 
 def _unstashed_error(name: str) -> ValueError:
     return ValueError(
-        f"{name} ran with no PackedLayout stashed while a using_layout context is active in this process; "
+        f"{name} ran with no PackedLayout stashed while a prefix-sharing using_layout context is active in this "
+        "process; "
         "the active layout's segments may have reached it through cu_seqlens_from_position_ids. Wrap this "
         "model in its own using_layout (an unshared layout is fine)"
     )
 
 
-def require_dense_attention_layout(name: str, layout: PackedLayout | None) -> None:
-    """Raise unless dense (non-varlen) attention ``name`` can run on a call with stash ``layout``.
+def require_stash_inside_context(name: str, layout: PackedLayout | None) -> None:
+    """Raise if mixer ``name`` has no stash while a sharing context is active: its boundaries may be another call's."""
+    if layout is None and prefix_sharing_active():
+        raise _unstashed_error(name)
 
-    It masks one causal rectangle per batch row, so a layout with several segments would let them
-    attend to each other, and with no stash inside a context it cannot tell whether it got a packed batch.
+
+def require_dense_attention_layout(name: str, layout: PackedLayout | None) -> None:
+    """Raise if dense (non-varlen) attention ``name`` would run a prefix-sharing call.
+
+    It masks one causal rectangle per batch row and has no K/V gather, so it cannot continue a shared root. With no
+    stash inside a sharing context it may be running another call's batch. An unshared stash changes nothing.
     """
     if layout is None:
-        if any(active is not None for active in _ACTIVE_LAYOUTS):
+        if prefix_sharing_active():
             raise _unstashed_error(name)
         return
-    if layout.num_segments > 1:
+    if layout.has_sharing:
         raise ValueError(
-            f"{name} has no varlen path, so its causal mask would span the layout's {layout.num_segments} "
-            "segments; packed layouts need FlashAttention"
+            f"{name} has no varlen path, so it cannot continue a shared prefix; prefix sharing needs FlashAttention"
         )
+
+
+def dense_causal_attention(
+    name: str,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    layout: PackedLayout | None,
+    scale: float | None = None,
+    dropout_p: float = 0.0,
+) -> Tensor:
+    """Causal SDPA over ``[B, H, T, D]`` that keeps a packed call's segments apart.
+
+    One causal rectangle over a packed call lets each segment attend to the ones before it. With an
+    unshared stash that describes the call (``[1, H, T, D]`` with the layout's ``T`` tokens), each
+    segment attends only to itself. Any other call (no stash, a padded call, an SP shard, ``B > 1``)
+    runs one causal rectangle as before. Refuses what :func:`require_dense_attention_layout` refuses.
+    """
+    require_dense_attention_layout(name, layout)
+    tokens = query.shape[2]
+    describes_call = (
+        layout is not None
+        and layout.num_segments > 1
+        and query.shape[0] == 1
+        and tokens == layout.num_tokens
+        and key.shape[2] == value.shape[2] == tokens
+    )
+    if not describes_call:
+        return F.scaled_dot_product_attention(query, key, value, dropout_p=dropout_p, is_causal=True, scale=scale)
+    assert layout is not None
+    return torch.cat(
+        [
+            F.scaled_dot_product_attention(
+                query[:, :, start:end],
+                key[:, :, start:end],
+                value[:, :, start:end],
+                dropout_p=dropout_p,
+                is_causal=True,
+                scale=scale,
+            )
+            for start, end in layout.segment_bounds
+        ],
+        dim=2,
+    )
 
 
 def prefix_varlen_args(
@@ -778,26 +875,24 @@ def prefix_varlen_args(
 ) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None, int | None, int | None]:
     """Return ``k, v, cu_q, cu_k, max_q, max_k`` for one varlen call over ``[T, H, D]`` K/V.
 
-    ``layout`` is the caller's own stash. Without one this is the caller's own ``cu_seqlens``,
-    unless some context is active: then those segments may be another call's, so this raises.
-    With one, segments come from the layout, and under sharing each continuation's K/V is its
+    ``layout`` is the caller's own stash. Without one, or with an unshared one, this is the caller's own
+    ``cu_seqlens``, unless a sharing context is active and there is no stash: then those segments may be another
+    call's, so this raises. With a sharing stash, segments come from the layout and each continuation's K/V is its
     parent root followed by itself.
     """
-    if layout is None:
-        if any(active is not None for active in _ACTIVE_LAYOUTS):
-            raise _unstashed_error("attention")
+    if layout is None and prefix_sharing_active():
+        raise _unstashed_error("attention")
+    if layout is None or not layout.has_sharing:
         return k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen
     if k.ndim != 3:
         raise ValueError(f"prefix K/V gather expects [T, H, D], got {tuple(k.shape)}")
     if k.shape[0] != layout.num_tokens or v.shape[0] != layout.num_tokens:
         raise ValueError(
             f"layout expects {layout.num_tokens} packed K/V tokens, got {k.shape[0]} / {v.shape[0]} "
-            "(already gathered, or a sequence-parallel shard or padded call, which using_layout does not "
-            "support until the GatedDeltaNet / executor PRs)"
+            "(already gathered; a sequence-parallel shard, which must be all-to-all'd to the whole call first; "
+            "or a padded call, which using_layout does not support until the executor PR)"
         )
     cu_q = layout.cu_seqlens.to(device=k.device, dtype=torch.int32)
-    if not layout.has_sharing:
-        return k, v, cu_q, cu_q, layout.max_len_q, layout.max_len_q
     idx = layout.kv_index.to(device=k.device)
     cu_k = layout.cu_seqlens_k.to(device=k.device, dtype=torch.int32)
     return k.index_select(0, idx), v.index_select(0, idx), cu_q, cu_k, layout.max_len_q, layout.max_len_k
@@ -832,7 +927,8 @@ def _flash_kernel(module: torch.nn.Module) -> int:
 
 def require_bottom_right_causal_flash(model: torch.nn.Module) -> None:
     """Every flash kernel ``model``'s mixers call must be installed and align the causal mask bottom-right."""
-    for kernel in sorted({_flash_kernel(module) for module in sequence_mixers(model)}):
+    attention = [module for module in sequence_mixers(model) if _prefix_continuation_check(module) is None]
+    for kernel in sorted({_flash_kernel(module) for module in attention}):
         distribution, oldest = _FLASH_KERNELS[kernel]
         installed = _installed_version(distribution)
         if installed is None:
@@ -907,12 +1003,62 @@ def _hf_prefix_attention_fn(orig: Callable, impl: str = "flash_attention_2") -> 
     return prefix_attention
 
 
+def _hf_stash_check_fn(orig: Callable) -> Callable:
+    """Pass ``orig`` through, raising for a module with no stash while a sharing context is active."""
+
+    def stash_check(module, *args, **kwargs):
+        if get_stashed_layout(module) is None and prefix_sharing_active():
+            raise _unstashed_error(type(module).__name__)
+        return orig(module, *args, **kwargs)
+
+    setattr(stash_check, _HF_PREFIX_MARK, True)
+    return stash_check
+
+
+def _ulysses_attention(fn: Callable) -> Any:
+    """The DeepSpeed ``UlyssesSPAttentionHF`` behind registry entry ``fn``, or ``None`` if ``fn`` is not one.
+
+    ``register_with_transformers`` replaces the core entry with a ``uattn_wrapper`` closure over the instance,
+    whose ``attn`` (the captured core) runs after the all-to-all on the whole packed sequence for local heads.
+    That is where the prefix gather has to run; DeepSpeed exposes no other hook.
+    """
+    try:
+        from deepspeed.runtime.sequence_parallel.ulysses_sp import UlyssesSPAttentionHF
+    except ImportError:
+        return None
+    found = []
+    for cell in getattr(fn, "__closure__", None) or ():
+        try:
+            value = cell.cell_contents
+        except ValueError:
+            continue
+        if isinstance(value, UlyssesSPAttentionHF):
+            found.append(value)
+    if not found:
+        return None
+    if getattr(fn, "__name__", None) != "uattn_wrapper" or len(found) != 1:
+        raise ValueError(
+            f"attention registry entry {fn!r} closes over a DeepSpeed UlyssesSPAttentionHF but is not the "
+            "uattn_wrapper prefix sharing is verified with"
+        )
+    if type(found[0]) is not UlyssesSPAttentionHF:
+        # DSS's HeterogeneousUlyssesSPAttentionHF re-dispatches large head dims to flex attention, which
+        # ignores the prefix segments.
+        raise ValueError(
+            f"prefix sharing supports DeepSpeed's UlyssesSPAttentionHF, not the subclass {type(found[0]).__name__}"
+        )
+    return found[0]
+
+
 @contextmanager
 def _hf_prefix_attention(model: torch.nn.Module) -> Iterator[None]:
     """Point every entry of ``transformers``' attention registry at the prefix wrapper, then restore them.
 
     Every entry, not just the ones ``model`` uses, so another model's Hugging Face attention with no
     stash raises instead of reading the packed batch as one sequence. Eager attention skips the registry.
+
+    Under DeepSpeed Ulysses the registry entry sees this rank's token window, so it only checks the stash and
+    the prefix wrapper goes on the Ulysses instance's ``attn``, which sees the whole packed call.
     """
     hf_modules = [module for module in model.modules() if type(module).__name__ in _HF_PREFIX_ATTENTION]
     try:
@@ -928,6 +1074,7 @@ def _hf_prefix_attention(model: torch.nn.Module) -> Iterator[None]:
         if getattr(sys.modules.get(type(module).__module__), "ALL_ATTENTION_FUNCTIONS", None) is not registry:
             raise ValueError(f"{type(module).__name__} does not dispatch through transformers.ALL_ATTENTION_FUNCTIONS")
     saved: list[tuple[str, Any]] = []
+    swapped: list[tuple[Any, Callable, Callable]] = []
     try:
         for impl in sorted({module.config._attn_implementation for module in hf_modules}):
             if impl not in registry:
@@ -936,19 +1083,39 @@ def _hf_prefix_attention(model: torch.nn.Module) -> Iterator[None]:
             current = registry[impl]
             if getattr(current, _HF_PREFIX_MARK, False):
                 continue
+            ulysses = _ulysses_attention(current)
             saved.append((impl, local.get(impl, _MISSING)))
-            registry[impl] = _hf_prefix_attention_fn(current, impl)
+            if ulysses is None:
+                registry[impl] = _hf_prefix_attention_fn(current, impl)
+                continue
+            core = ulysses.attn
+            ulysses.attn = _hf_prefix_attention_fn(core, impl)
+            swapped.append((ulysses, core, ulysses.attn))
+            registry[impl] = _hf_stash_check_fn(current)
         yield
     finally:
+        replaced = False
+        for ulysses, core, wrapper in reversed(swapped):
+            replaced = replaced or ulysses.attn is not wrapper
+            ulysses.attn = core
         for impl, previous in reversed(saved):
             if previous is _MISSING:
                 del registry[impl]
             else:
                 registry[impl] = previous
+        if replaced:
+            raise RuntimeError("DeepSpeed Ulysses attention was replaced inside a prefix-sharing context")
 
 
-_HF_PREFIX_ATTENTION = {"Qwen3Attention", "Qwen3MoeAttention"}
+_HF_PREFIX_ATTENTION = {
+    "Qwen3Attention",
+    "Qwen3MoeAttention",
+    "Qwen3_5Attention",
+    "Qwen3_5MoeAttention",
+    "Qwen3NextAttention",
+}
 _NATIVE_PREFIX_ATTENTION: set[type] = set()
+_PREFIX_SHARING_MODELS: set[type] = set()
 _SEQUENCE_MIXER_NEEDLES = (
     "Attention",
     "DeltaNet",
@@ -974,6 +1141,27 @@ def register_native_prefix_attention(cls: _ModuleType) -> _ModuleType:
     return cls
 
 
+def register_prefix_sharing_model(cls: _ModuleType) -> _ModuleType:
+    """Accept registered native attention inside ``cls``, a model verified end to end with prefix sharing.
+
+    A ``transformers`` model whose mixers include a registered native attention class shares prefixes only if it
+    contains a module of a registered model type: the attention layer being verified does not cover the model's own
+    forward (positions, masks, boundaries). Matched by exact type.
+    """
+    _PREFIX_SHARING_MODELS.add(cls)
+    return cls
+
+
+def _unverified_native_model(model: torch.nn.Module, mixers: list[torch.nn.Module]) -> str | None:
+    from transformers import PreTrainedModel
+
+    if not isinstance(model, PreTrainedModel) or not any(type(m) in _NATIVE_PREFIX_ATTENTION for m in mixers):
+        return None
+    if any(type(module) in _PREFIX_SHARING_MODELS for module in model.modules()):
+        return None
+    return f"{type(model).__name__} (model not yet verified end to end with prefix sharing)"
+
+
 def _is_sequence_mixer(module: torch.nn.Module) -> bool:
     name = type(module).__name__
     if any(needle in name for needle in _SEQUENCE_MIXER_NEEDLES):
@@ -987,9 +1175,18 @@ def sequence_mixers(model: torch.nn.Module) -> list[torch.nn.Module]:
     return [module for module in model.modules() if _is_sequence_mixer(module)]
 
 
-def _prefix_continuation_blocker(module: torch.nn.Module) -> str | None:
-    """Why ``module`` cannot run prefix continuation, or ``None`` if it can."""
+def _prefix_continuation_check(module: torch.nn.Module) -> Callable[[PackedLayout | None], str | None] | None:
+    check = module.__dict__.get(PREFIX_CONTINUATION_ATTR)
+    return check if callable(check) else None
+
+
+def _prefix_continuation_blocker(module: torch.nn.Module, layout: PackedLayout | None = None) -> str | None:
+    """Why ``module`` cannot run prefix continuation (on ``layout``, if given), or ``None`` if it can."""
     name = type(module).__name__
+    check = _prefix_continuation_check(module)
+    if check is not None:
+        reason = check(layout)
+        return None if reason is None else f"{name} ({reason})"
     if type(module) in _NATIVE_PREFIX_ATTENTION:
         version = getattr(module, "_flash_attn_version", 2)
         if version not in _FLASH_KERNELS:
@@ -1011,15 +1208,18 @@ def supports_prefix_continuation(module: torch.nn.Module) -> bool:
     return _prefix_continuation_blocker(module) is None
 
 
-def require_prefix_continuation(model: torch.nn.Module) -> None:
+def require_prefix_continuation(model: torch.nn.Module, layout: PackedLayout | None = None) -> None:
+    """Raise unless every sequence mixer of ``model`` can continue a shared prefix (on ``layout``, if given)."""
     mixers = sequence_mixers(model)
     if not mixers:
         raise ValueError("zorro/prefix sharing found no sequence mixers to validate")
-    unsupported = sorted({reason for module in mixers if (reason := _prefix_continuation_blocker(module))})
+    unsupported = {reason for module in mixers if (reason := _prefix_continuation_blocker(module, layout))}
+    if (reason := _unverified_native_model(model, mixers)) is not None:
+        unsupported.add(reason)
     if unsupported:
         raise ValueError(
             "zorro/prefix sharing needs prefix continuation in every sequence mixer; "
-            f"unsupported in this PR: {unsupported}"
+            f"unsupported in this PR: {sorted(unsupported)}"
         )
 
 

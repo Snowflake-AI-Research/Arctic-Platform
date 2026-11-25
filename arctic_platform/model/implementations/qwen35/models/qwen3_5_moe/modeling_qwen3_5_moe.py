@@ -16,13 +16,23 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 from transformers.utils import logging
 
-from arctic_platform.common.packing.layout import require_no_prefix_sharing
+from arctic_platform.common.packing.layout import PREFIX_CONTINUATION_ATTR
+from arctic_platform.common.packing.layout import PackedLayout
+from arctic_platform.common.packing.layout import dense_causal_attention
+from arctic_platform.common.packing.layout import get_sharing_layout
+from arctic_platform.common.packing.layout import get_stashed_layout
+from arctic_platform.common.packing.layout import layout_for_own_positions
+from arctic_platform.common.packing.layout import prefix_varlen_args
+from arctic_platform.common.packing.layout import register_native_prefix_attention
+from arctic_platform.common.packing.layout import register_prefix_sharing_model
+from arctic_platform.common.packing.layout import require_stash_inside_context
 from arctic_platform.model.implementations.debug.determinism import resolve_flash_attention_determinism
 from arctic_platform.model.implementations.fp8 import fp8_weight_block_size
 from arctic_platform.model.implementations.fp8 import make_linear
 from arctic_platform.model.implementations.gpu.action_masks import slice_action_masks_for_logits_to_keep
 from arctic_platform.model.implementations.gpu.lm_head import inherit_lm_head_target_validation
 from arctic_platform.model.implementations.gpu.lm_head import slice_temperature_for_logits_to_keep
+from arctic_platform.model.implementations.gpu.sp.gated_delta_net import gated_delta_net_prefix_continuation_blocker
 from arctic_platform.model.implementations.gpu.sp.gated_delta_net import head_parallel_gated_delta_net
 from arctic_platform.model.implementations.gpu.sp.gated_delta_net import repeat_query_key_for_value_heads
 from arctic_platform.model.implementations.gpu.vllm_rounding import FusedAddRMSNorm as _FusedAddRMSNorm
@@ -59,7 +69,8 @@ except ImportError:
 # signature than v3 (qv is the 4th positional arg) -> called by keyword below.
 try:
     from flash_attn.cute import flash_attn_varlen_func as flash_attn_4_varlen_func
-except ImportError:
+# Some flash_attn builds raise AttributeError, not ImportError, while importing ``flash_attn.cute``.
+except (ImportError, AttributeError):
     flash_attn_4_varlen_func = None  # type: ignore
 
 # Flash linear attention imports (for GatedDeltaNet fast path)
@@ -272,6 +283,12 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         # Select best available kernel
         self._causal_conv1d_fn = causal_conv1d_fn
         self._chunk_gated_delta_rule = chunk_gated_delta_rule or torch_chunk_gated_delta_rule
+        setattr(self, PREFIX_CONTINUATION_ATTR, self._prefix_continuation_blocker)
+
+    def _prefix_continuation_blocker(self, layout: PackedLayout | None) -> str | None:
+        return gated_delta_net_prefix_continuation_blocker(
+            layout, self.conv_kernel_size, self._causal_conv1d_fn, self._chunk_gated_delta_rule
+        )
 
     def forward(
         self,
@@ -293,9 +310,16 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         key = key.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
         value = value.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
 
-        if getattr(self, "cp_group", None) is not None:
-            global_cu_seqlens = getattr(self, "_dss_sp_global_cu_seqlens", None)
-            if not torch.is_tensor(global_cu_seqlens):
+        # A sharing layout is the packed call's boundaries (global under SP), and its continuations resume their
+        # root's conv inputs and recurrent state. An unshared layout keeps the usual path, with the cu_seqlens
+        # the text forward passes.
+        layout = get_sharing_layout(self)
+        if layout is None:
+            require_stash_inside_context(type(self).__name__, get_stashed_layout(self))
+        cp_group = getattr(self, "cp_group", None)
+        if cp_group is not None or layout is not None:
+            global_cu_seqlens = None if layout is not None else getattr(self, "_dss_sp_global_cu_seqlens", None)
+            if layout is None and not torch.is_tensor(global_cu_seqlens):
                 raise RuntimeError("head-parallel GatedDeltaNet requires global packed cu_seqlens")
             core_attn_out, _ = head_parallel_gated_delta_net(
                 self._causal_conv1d_fn,
@@ -310,11 +334,12 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                 convolution_activation=self.activation,
                 A_log=self.A_log,
                 dt_bias=self.dt_bias,
-                process_group=self.cp_group,
+                process_group=cp_group,
                 global_cu_seqlens=global_cu_seqlens,
                 num_key_heads=self.num_k_heads,
                 num_value_heads=self.num_v_heads,
                 fp32_beta=self.fp32_parity,
+                layout=layout,
                 initial_state=None,
                 output_final_state=False,
                 use_qk_l2norm_in_kernel=True,
@@ -483,11 +508,12 @@ class Qwen3_5MoeGatedSDPAAttention(Qwen3_5MoeGatedAttentionBase):
     ) -> torch.Tensor:
         key_states = _repeat_kv(key_states, self.num_key_value_groups)
         value_states = _repeat_kv(value_states, self.num_key_value_groups)
-        return F.scaled_dot_product_attention(
+        return dense_causal_attention(
+            type(self).__name__,
             query_states,
             key_states,
             value_states,
-            is_causal=True,
+            get_stashed_layout(self),
             scale=self.scaling,
         )
 
@@ -503,8 +529,13 @@ class Qwen3_5MoeGatedSDPAAttention(Qwen3_5MoeGatedAttentionBase):
         return self.output_proj(attn_output, gate), None
 
 
+@register_native_prefix_attention
 class Qwen3_5MoeGatedFlashAttention(Qwen3_5MoeGatedAttentionBase):
-    """Gated softmax attention using Flash Attention varlen functions (v3 Hopper / v4 Blackwell)."""
+    """Gated softmax attention using Flash Attention varlen functions (v3 Hopper / v4 Blackwell).
+
+    Inside ``using_layout`` the segments come from the stashed layout; under sharing each continuation attends to
+    its root's K/V too (``prefix_varlen_args``), on the whole packed call (after the Ulysses all-to-all under SP).
+    """
 
     _funcs = {
         3: flash_attn_3_varlen_func,
@@ -530,7 +561,7 @@ class Qwen3_5MoeGatedFlashAttention(Qwen3_5MoeGatedAttentionBase):
             self.func, config.head_dim, f"flash_attention_{flash_attn_version}"
         )
 
-    def _compute_attention(self, q, k, v, cu_seqlens, max_seqlen):
+    def _compute_attention(self, q, k, v, cu_seqlens, max_seqlen, cu_seqlens_k=None, max_seqlen_k=None):
         # Keyword args work for all FA versions; positional differs (FA4 inserts `qv` at arg 4).
         # `deterministic` is passed only when it was asked for, so a job that did not ask calls the entry point
         # with the arguments it always did, and a build whose signature lacks the keyword is reached only by a
@@ -541,9 +572,9 @@ class Qwen3_5MoeGatedFlashAttention(Qwen3_5MoeGatedAttentionBase):
             k,
             v,
             cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens,
+            cu_seqlens_k=cu_seqlens if cu_seqlens_k is None else cu_seqlens_k,
             max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen,
+            max_seqlen_k=max_seqlen if max_seqlen_k is None else max_seqlen_k,
             causal=True,
             **deterministic,
         )
@@ -559,7 +590,10 @@ class Qwen3_5MoeGatedFlashAttention(Qwen3_5MoeGatedAttentionBase):
         cu_seqlens: torch.LongTensor | None = None,
         max_seqlen: int | None = None,
     ) -> torch.Tensor:
-        return self._compute_attention(query_states[0], key_states[0], value_states[0], cu_seqlens, max_seqlen)
+        key, value, cu_q, cu_k, max_q, max_k = prefix_varlen_args(
+            key_states[0], value_states[0], cu_seqlens, max_seqlen, get_stashed_layout(self)
+        )
+        return self._compute_attention(query_states[0], key, value, cu_q, max_q, cu_k, max_k)
 
     def attn_projections(
         self,
@@ -846,6 +880,7 @@ class Qwen3_5MoePreTrainedModel(PreTrainedModelPrimeRL):
         return state_dict
 
 
+@register_prefix_sharing_model
 class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
     def __init__(self, config: Qwen3_5MoeConfig):
         super().__init__(config)
@@ -875,8 +910,19 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        if self.config._attn_implementation in ("flash_attention_2", "flash_attention_3", "flash_attention_4"):
-            require_no_prefix_sharing("Qwen3.5-MoE segment boundaries")
+        layout = get_sharing_layout(self)
+        stashed = get_stashed_layout(self)
+        if layout is None and position_ids is not None and inputs_embeds.shape[0] == 1:
+            # An unshared stash whose positions are this call's: its segments hold for every attention implementation,
+            # including SDPA, whose GatedDeltaNet layers would otherwise get no boundaries.
+            layout = layout_for_own_positions(stashed, position_ids.reshape(-1))
+        if layout is not None:
+            # Not position_ids == 0, which would glue a continuation onto the root before it. Under sharing the
+            # mixers read the stash themselves; these only fill the decoder's arguments.
+            cu_seqlens = layout.cu_seqlens.to(device=inputs_embeds.device, dtype=torch.int32)
+            max_seqlen = layout.max_len_q
+        elif self.config._attn_implementation in ("flash_attention_2", "flash_attention_3", "flash_attention_4"):
+            require_stash_inside_context("Qwen3.5-MoE segment boundaries", stashed)
             flat_position_ids = position_ids.view(-1)
             # Segment lengths from boundary indices (where position_ids resets to 0), not position values, so
             # an SP shard carrying global-offset positions still yields local cu_seqlens. Same as the

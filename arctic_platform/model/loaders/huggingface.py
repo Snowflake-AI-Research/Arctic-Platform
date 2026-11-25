@@ -154,4 +154,10 @@ def load_huggingface(ctx: LoaderContext) -> LoadedModel:
         )
 
         configure_transformers_sequence_parallel_model(model, groups["sp_group"], fp32_beta=options.fp32_parity)
+    else:
+        from arctic_platform.model.implementations.gpu.sp.gated_delta_net import (
+            apply_gated_delta_net_prefix_continuation,
+        )
+
+        apply_gated_delta_net_prefix_continuation(model)
     return LoadedModel(model=model)

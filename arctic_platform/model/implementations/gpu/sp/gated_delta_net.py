@@ -20,6 +20,8 @@ import importlib
 import inspect
 import logging
 import types
+import weakref
+from dataclasses import dataclass
 from typing import Any
 from typing import Callable
 
@@ -28,12 +30,23 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
+from arctic_platform.common.packing.layout import PREFIX_CONTINUATION_ATTR
+from arctic_platform.common.packing.layout import PackedLayout
+from arctic_platform.common.packing.layout import get_sharing_layout
+from arctic_platform.common.packing.layout import get_stashed_layout
+from arctic_platform.common.packing.layout import require_stash_inside_context
+
 from ..packing import cu_seqlens_from_position_ids
 from .collectives import sequence_head_all_to_all
 
 logger = logging.getLogger(__name__)
 
 _CP_CONTEXT_ATTRIBUTE = "_dss_gated_delta_net_cp_context"
+
+
+def _group_size(process_group) -> int:
+    """SP size of ``process_group``; ``None`` is SP=1, which needs no initialized process group."""
+    return 1 if process_group is None else dist.get_world_size(process_group)
 
 
 def kernel_groups_value_heads(rule: Callable[..., Any] | None) -> bool:
@@ -221,7 +234,9 @@ def _shard_head_parameter(
         raise RuntimeError(
             f"head-parallel GatedDeltaNet expected {name} with shape [{num_value_heads}], got {tuple(value.shape)}"
         )
-    world_size = dist.get_world_size(process_group)
+    world_size = _group_size(process_group)
+    if world_size == 1:
+        return value
     rank = dist.get_rank(process_group)
     local_heads = num_value_heads // world_size
     return value.narrow(0, rank * local_heads, local_heads)
@@ -249,7 +264,9 @@ def _shard_convolution_parameter(
             f"{expected_channels}, got {tuple(value.shape)}"
         )
 
-    world_size = dist.get_world_size(process_group)
+    world_size = _group_size(process_group)
+    if world_size == 1:
+        return value
     rank = dist.get_rank(process_group)
     local_key_channels = key_channels // world_size
     local_value_channels = value_channels // world_size
@@ -320,6 +337,215 @@ def _fallback_depthwise_causal_convolution(
     raise RuntimeError(f"unsupported GatedDeltaNet causal-convolution activation {activation!r}")
 
 
+@dataclass(frozen=True)
+class GatedDeltaContinuation:
+    """Index plan that runs one sharing :class:`PackedLayout` call through GatedDeltaNet.
+
+    Attributes:
+        carry_index: Long ``[T + (k-1) * C]``. Packed tokens fed to the convolution: every root, then each
+            continuation preceded by its parent root's last ``k-1`` tokens, which seed its left context.
+        carry_cu_seqlens: Int32 ``[S + 1]`` segment boundaries of ``carry_index``.
+        keep_index: Long ``[T]``. Convolution outputs that belong to packed tokens, in packed order; the seed
+            outputs are dropped.
+        root_cu_seqlens: Int32 ``[R + 1]`` boundaries of the roots, tokens ``[0, root_tokens)``.
+        continuation_cu_seqlens: Int32 ``[C + 1]`` boundaries of the continuations, counted from ``root_tokens``.
+        parent: Long ``[C]``. Root whose final recurrent state each continuation starts from.
+        root_tokens: Packed tokens in roots.
+    """
+
+    carry_index: torch.Tensor
+    carry_cu_seqlens: torch.Tensor
+    keep_index: torch.Tensor
+    root_cu_seqlens: torch.Tensor
+    continuation_cu_seqlens: torch.Tensor
+    parent: torch.Tensor
+    root_tokens: int
+
+
+_CONTINUATION_PLANS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _build_continuation(layout: PackedLayout, kernel_size: int) -> GatedDeltaContinuation:
+    cu = layout.cu_seqlens.tolist()
+    parents = layout.parent.tolist()
+    num_roots = layout.num_roots
+    if any(parent != -1 for parent in parents[:num_roots]) or any(
+        not 0 <= parent < num_roots for parent in parents[num_roots:]
+    ):
+        raise ValueError("PackedLayout segments must be roots first, then continuations whose parent is a root")
+    seed = kernel_size - 1
+    carry = [torch.arange(0, cu[num_roots])]
+    keep = [torch.arange(0, cu[num_roots])]
+    carry_lengths = [cu[s + 1] - cu[s] for s in range(num_roots)]
+    offset = cu[num_roots]
+    for segment in range(num_roots, layout.num_segments):
+        parent = parents[segment]
+        root_length = cu[parent + 1] - cu[parent]
+        if root_length < seed:
+            raise ValueError(
+                f"GatedDeltaNet conv carry needs every shared root to hold at least kernel_size - 1 = {seed} "
+                f"tokens, but root {parent} has {root_length}"
+            )
+        length = cu[segment + 1] - cu[segment]
+        carry.append(torch.arange(cu[parent + 1] - seed, cu[parent + 1]))
+        carry.append(torch.arange(cu[segment], cu[segment + 1]))
+        keep.append(torch.arange(offset + seed, offset + seed + length))
+        carry_lengths.append(seed + length)
+        offset += seed + length
+    root_tokens = cu[num_roots]
+    return GatedDeltaContinuation(
+        carry_index=torch.cat(carry),
+        carry_cu_seqlens=F.pad(torch.tensor(carry_lengths, dtype=torch.int32).cumsum(0, dtype=torch.int32), (1, 0)),
+        keep_index=torch.cat(keep),
+        root_cu_seqlens=layout.cu_seqlens[: num_roots + 1].to(torch.int32),
+        continuation_cu_seqlens=(layout.cu_seqlens[num_roots:] - root_tokens).to(torch.int32),
+        parent=layout.parent[num_roots:].to(torch.long),
+        root_tokens=root_tokens,
+    )
+
+
+def gated_delta_continuation(
+    layout: PackedLayout, kernel_size: int, device: torch.device | str
+) -> GatedDeltaContinuation:
+    """The cached :class:`GatedDeltaContinuation` of a sharing ``layout`` for a ``kernel_size`` convolution."""
+    if not layout.has_sharing:
+        raise ValueError("gated_delta_continuation needs a sharing PackedLayout")
+    plans = _CONTINUATION_PLANS.setdefault(layout, {})
+    key = (int(kernel_size), str(torch.device(device)))
+    plan = plans.get(key)
+    if plan is None:
+        cpu = plans.get((int(kernel_size), "cpu")) or _build_continuation(layout, int(kernel_size))
+        plans[(int(kernel_size), "cpu")] = cpu
+        plan = GatedDeltaContinuation(
+            carry_index=cpu.carry_index.to(device),
+            carry_cu_seqlens=cpu.carry_cu_seqlens.to(device),
+            keep_index=cpu.keep_index.to(device),
+            root_cu_seqlens=cpu.root_cu_seqlens.to(device),
+            continuation_cu_seqlens=cpu.continuation_cu_seqlens.to(device),
+            parent=cpu.parent.to(device),
+            root_tokens=cpu.root_tokens,
+        )
+        plans[key] = plan
+    return plan
+
+
+def packed_causal_convolution(
+    causal_convolution: Callable[..., torch.Tensor] | None,
+    x: torch.Tensor,
+    *,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    activation: str | None,
+    cu_seqlens: torch.Tensor,
+    continuation: GatedDeltaContinuation | None,
+) -> torch.Tensor:
+    """Depthwise causal convolution of a packed ``[1, C, T]`` call, restarting at every ``cu_seqlens`` boundary.
+
+    With ``continuation`` each continuation segment instead starts from its parent root's last ``k-1`` inputs,
+    as the unshared row would. The gather's backward scatter-adds the continuation's gradient into those root
+    inputs.
+    """
+    if continuation is not None:
+        # causal-conv1d takes seq_idx only with a channel-last x; gathering along tokens of [1, T, C] keeps it so.
+        x = x.transpose(1, 2).index_select(1, continuation.carry_index).transpose(1, 2)
+        cu_seqlens = continuation.carry_cu_seqlens
+    if causal_convolution is not None:
+        output = causal_convolution(
+            x=x,
+            weight=weight,
+            bias=bias,
+            activation=activation,
+            seq_idx=_packed_sequence_indices(cu_seqlens),
+        )
+    else:
+        output = _fallback_depthwise_causal_convolution(
+            x,
+            weight=weight,
+            bias=bias,
+            activation=activation,
+            global_cu_seqlens=cu_seqlens,
+        )
+    if continuation is not None:
+        output = output.transpose(1, 2).index_select(1, continuation.keep_index).transpose(1, 2)
+    return output
+
+
+def packed_gated_delta_rule(
+    gated_delta_rule: Callable[..., Any],
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    *,
+    cu_seqlens: torch.Tensor,
+    continuation: GatedDeltaContinuation | None,
+    **rule_kwargs,
+) -> torch.Tensor:
+    """Gated delta rule over a packed ``[1, T, H, D]`` call; returns the ``[1, T, HV, Dv]`` output.
+
+    With ``continuation`` the roots run first and return their final recurrent states; the continuations then
+    run from their parent's state. A root with several continuations receives the sum of their state
+    gradients. The state is passed on in the dtype the rule returns it in (fp32 for FLA), never cast.
+    """
+    for name in ("initial_state", "output_final_state", "cu_seqlens_cpu", "cp_context"):
+        value = rule_kwargs.pop(name, None)
+        if value is not None and value is not False:
+            raise RuntimeError(f"packed GatedDeltaNet sets {name} itself; callers may not pass it")
+    if continuation is None:
+        output, final_state = gated_delta_rule(
+            q, k, v, g, beta, initial_state=None, output_final_state=False, cu_seqlens=cu_seqlens, **rule_kwargs
+        )
+        if final_state is not None:
+            raise RuntimeError("packed GatedDeltaNet unexpectedly returned recurrent state")
+        return output
+
+    split = continuation.root_tokens
+
+    def roots(tensor):
+        return tensor[:, :split]
+
+    def continuations(tensor):
+        return tensor[:, split:]
+
+    root_output, state = gated_delta_rule(
+        roots(q),
+        roots(k),
+        roots(v),
+        roots(g),
+        roots(beta),
+        initial_state=None,
+        output_final_state=True,
+        cu_seqlens=continuation.root_cu_seqlens,
+        **rule_kwargs,
+    )
+    num_roots = int(continuation.root_cu_seqlens.numel() - 1)
+    expected = (num_roots, int(v.shape[2]), int(k.shape[3]), int(v.shape[3]))
+    if not torch.is_tensor(state) or tuple(state.shape) != expected or state.device != v.device:
+        raise RuntimeError(
+            f"packed GatedDeltaNet expected root final states shaped {expected} on {v.device}, got "
+            f"{None if state is None else (tuple(state.shape), state.device)}"
+        )
+    if state.dtype != torch.promote_types(v.dtype, torch.float32):
+        raise RuntimeError(
+            f"packed GatedDeltaNet expected {torch.promote_types(v.dtype, torch.float32)} state, got {state.dtype}"
+        )
+    continuation_output, final_state = gated_delta_rule(
+        continuations(q),
+        continuations(k),
+        continuations(v),
+        continuations(g),
+        continuations(beta),
+        initial_state=state.index_select(0, continuation.parent),
+        output_final_state=False,
+        cu_seqlens=continuation.continuation_cu_seqlens,
+        **rule_kwargs,
+    )
+    if final_state is not None:
+        raise RuntimeError("packed GatedDeltaNet unexpectedly returned recurrent state")
+    return torch.cat([root_output, continuation_output], dim=1)
+
+
 def head_parallel_gated_delta_net(
     causal_convolution: Callable[..., torch.Tensor] | None,
     gated_delta_rule: Callable[..., Any],
@@ -335,10 +561,12 @@ def head_parallel_gated_delta_net(
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
     process_group,
-    global_cu_seqlens: torch.Tensor,
+    global_cu_seqlens: torch.Tensor | None,
     num_key_heads: int,
     num_value_heads: int,
     fp32_beta: bool,
+    layout: PackedLayout | None = None,
+    repeat_query_key: bool = False,
     **rule_kwargs,
 ):
     """Run convolution and recurrence on a full-sequence GDN head shard.
@@ -350,9 +578,14 @@ def head_parallel_gated_delta_net(
     from local-sequence/all-heads to full-sequence/local-heads. The depthwise
     convolution and recurrent rule then share that representation. A final
     all-to-all restores local-sequence/all-value-heads for the norm and output
-    projection.
+    projection. With ``process_group=None`` (or a one-rank group) there is no exchange.
+
+    With ``layout`` (the caller's stashed :class:`PackedLayout`, global across the SP group) the boundaries come
+    from the layout rather than ``global_cu_seqlens``, and under sharing each continuation resumes its parent
+    root's convolution inputs and recurrent state. ``repeat_query_key`` expands Q/K to the value-head count even
+    for a rule that groups value heads itself, as the stock transformers forward does.
     """
-    world_size = dist.get_world_size(process_group)
+    world_size = _group_size(process_group)
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
         raise RuntimeError("head-parallel GatedDeltaNet requires q/k/v shaped [B, T, H, D]")
     if q.shape[0] != 1:
@@ -384,14 +617,28 @@ def head_parallel_gated_delta_net(
 
     local_sequence_length = int(v.shape[1])
     global_sequence_length = local_sequence_length * world_size
+    continuation = None
+    if layout is not None:
+        if global_sequence_length != layout.num_tokens:
+            raise RuntimeError(
+                f"GatedDeltaNet's PackedLayout has {layout.num_tokens} packed tokens, but this call covers "
+                f"{global_sequence_length} ({local_sequence_length} per rank x SP {world_size}); padded calls "
+                "are not supported inside using_layout"
+            )
+        global_cu_seqlens = layout.cu_seqlens.to(device=v.device, dtype=torch.int32)
+        if layout.has_sharing:
+            continuation = gated_delta_continuation(layout, int(convolution_weight.shape[-1]), v.device)
     _validate_global_cu_seqlens(
         global_cu_seqlens,
         global_sequence_length=global_sequence_length,
     )
-    exchanged = _pack_and_exchange_head_tensors(
-        {"q": q, "k": k, "v": v, "b": b, "a": a},
-        process_group=process_group,
-    )
+    if world_size == 1:
+        exchanged = {"q": q, "k": k, "v": v, "b": b, "a": a}
+    else:
+        exchanged = _pack_and_exchange_head_tensors(
+            {"q": q, "k": k, "v": v, "b": b, "a": a},
+            process_group=process_group,
+        )
 
     key_head_dim = int(q.shape[3])
     value_head_dim = int(v.shape[3])
@@ -423,22 +670,15 @@ def head_parallel_gated_delta_net(
         ],
         dim=-1,
     ).transpose(1, 2)
-    if causal_convolution is not None:
-        mixed_qkv = causal_convolution(
-            x=mixed_qkv,
-            weight=local_convolution_weight,
-            bias=local_convolution_bias,
-            activation=convolution_activation,
-            seq_idx=_packed_sequence_indices(global_cu_seqlens),
-        )
-    else:
-        mixed_qkv = _fallback_depthwise_causal_convolution(
-            mixed_qkv,
-            weight=local_convolution_weight,
-            bias=local_convolution_bias,
-            activation=convolution_activation,
-            global_cu_seqlens=global_cu_seqlens,
-        )
+    mixed_qkv = packed_causal_convolution(
+        causal_convolution,
+        mixed_qkv,
+        weight=local_convolution_weight,
+        bias=local_convolution_bias,
+        activation=convolution_activation,
+        cu_seqlens=global_cu_seqlens,
+        continuation=continuation,
+    )
 
     mixed_qkv = mixed_qkv.transpose(1, 2)
     local_key_dim = local_key_heads * key_head_dim
@@ -476,27 +716,30 @@ def head_parallel_gated_delta_net(
     beta = exchanged["b"].float().sigmoid() if fp32_beta else exchanged["b"].sigmoid()
     g = -local_A_log.float().exp() * F.softplus(exchanged["a"].float() + local_dt_bias)
 
-    query, key = repeat_query_key_for_value_heads(query, key, local_key_heads, local_value_heads, gated_delta_rule)
+    if repeat_query_key and local_value_heads > local_key_heads:
+        replication = local_value_heads // local_key_heads
+        query = query.repeat_interleave(replication, dim=2)
+        key = key.repeat_interleave(replication, dim=2)
+    else:
+        query, key = repeat_query_key_for_value_heads(query, key, local_key_heads, local_value_heads, gated_delta_rule)
 
     if rule_kwargs.get("initial_state") is not None:
         raise RuntimeError("head-parallel GatedDeltaNet training does not support an initial recurrent state")
     if rule_kwargs.get("output_final_state", False):
         raise RuntimeError("head-parallel GatedDeltaNet training does not support returning recurrent state")
-    rule_kwargs["initial_state"] = None
-    rule_kwargs["output_final_state"] = False
-    rule_kwargs["cu_seqlens"] = global_cu_seqlens
-    rule_kwargs["cu_seqlens_cpu"] = None
-    rule_kwargs["cp_context"] = None
-    output, final_state = gated_delta_rule(
+    output = packed_gated_delta_rule(
+        gated_delta_rule,
         query,
         key,
         value,
         g,
         beta,
+        cu_seqlens=global_cu_seqlens,
+        continuation=continuation,
         **rule_kwargs,
     )
-    if final_state is not None:
-        raise RuntimeError("head-parallel GatedDeltaNet unexpectedly returned recurrent state")
+    if world_size == 1:
+        return output, None
     return (
         sequence_head_all_to_all(
             process_group,
@@ -710,17 +953,123 @@ def _module_head_counts(module: nn.Module) -> tuple[int, int]:
     return num_key_heads, num_value_heads
 
 
-def _adapt_gated_delta_net_module(module: nn.Module, process_group, *, fp32_beta: bool) -> None:
+GATED_DELTA_CHUNK_SIZE = 64
+_SPLIT_PROJECTIONS = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
+_FUSED_PROJECTIONS = ("in_proj_qkvz", "in_proj_ba", "fix_query_key_value_ordering")
+
+
+def _installed_version(distribution: str) -> str | None:
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version
+
+    try:
+        return version(distribution)
+    except PackageNotFoundError:
+        return None
+
+
+def _kernel_parameters(kernel) -> set[str]:
+    try:
+        return set(inspect.signature(kernel).parameters) if callable(kernel) else set()
+    except (TypeError, ValueError):
+        return set()
+
+
+def prefix_continuation_kernel_blocker(causal_convolution, gated_delta_rule) -> str | None:
+    """Why these resolved kernels cannot continue a shared prefix, or ``None`` if they can."""
+    if not kernel_groups_value_heads(gated_delta_rule):
+        return "prefix sharing needs flash-linear-attention's chunk_gated_delta_rule, not a fallback rule"
+    missing = {"cu_seqlens", "initial_state", "output_final_state"} - _kernel_parameters(gated_delta_rule)
+    if missing:
+        return f"the gated delta rule takes no {sorted(missing)}"
+    if "seq_idx" not in _kernel_parameters(causal_convolution):
+        return (
+            "prefix sharing needs causal-conv1d's causal_conv1d_fn with seq_idx; the torch fallback ignores boundaries"
+        )
+    if _installed_version("fla-core") is None and _installed_version("flash-linear-attention") is None:
+        return "prefix sharing needs flash-linear-attention installed"
+    return None
+
+
+def gated_delta_net_prefix_continuation_blocker(
+    layout: PackedLayout | None, kernel_size: int, causal_convolution, gated_delta_rule
+) -> str | None:
+    """Why a GatedDeltaNet with these kernels cannot run ``layout`` (any layout if ``None``), or ``None``."""
+    reason = prefix_continuation_kernel_blocker(causal_convolution, gated_delta_rule)
+    if reason is not None or layout is None or not layout.has_sharing:
+        return reason
+    cu = layout.cu_seqlens.tolist()
+    for root in sorted(set(layout.parent[layout.num_roots :].tolist())):
+        length = cu[root + 1] - cu[root]
+        if length % GATED_DELTA_CHUNK_SIZE:
+            return (
+                f"shared root {root} has {length} tokens; GatedDeltaNet roots must be a multiple of its "
+                f"{GATED_DELTA_CHUNK_SIZE}-token chunk (shared_prefix_length(first_weighted, "
+                f"{GATED_DELTA_CHUNK_SIZE}))"
+            )
+        if length < kernel_size - 1:
+            return f"shared root {root} has {length} tokens, fewer than the conv carry's {kernel_size - 1}"
+    return None
+
+
+def gated_delta_net_prefix_continuation_check(module: nn.Module, causal_convolution, gated_delta_rule):
+    """``check(layout)`` for :data:`~arctic_platform.common.packing.layout.PREFIX_CONTINUATION_ATTR`."""
+    kernel_size = int(module.conv_kernel_size)
+
+    def check(layout: PackedLayout | None) -> str | None:
+        return gated_delta_net_prefix_continuation_blocker(layout, kernel_size, causal_convolution, gated_delta_rule)
+
+    return check
+
+
+def _project_gated_delta_net_inputs(module: nn.Module, hidden_states: torch.Tensor, num_key_heads, num_value_heads):
+    """Native-head ``q, k [B, T, H, K]``, ``v, z [B, T, HV, V]``, ``b, a [B, T, HV]`` of split or fused projections.
+
+    Qwen3-Next's fused ``in_proj_qkvz`` / ``in_proj_ba`` interleave heads by key-head group;
+    ``fix_query_key_value_ordering`` returns them in the split layout, value head ``hv`` under key head
+    ``hv // (HV // H)``, so every rank's contiguous head slice lines up across q, k, v, z, b and a.
+    """
+    batch_size, sequence_length, _ = hidden_states.shape
+    key_head_dim = int(module.head_k_dim)
+    value_head_dim = int(module.head_v_dim)
+    if hasattr(module, "in_proj_qkvz"):
+        query, key, value, z, b, a = module.fix_query_key_value_ordering(
+            module.in_proj_qkvz(hidden_states), module.in_proj_ba(hidden_states)
+        )
+    else:
+        key_dim = num_key_heads * key_head_dim
+        value_dim = num_value_heads * value_head_dim
+        query, key, value = torch.split(module.in_proj_qkv(hidden_states), [key_dim, key_dim, value_dim], dim=-1)
+        z = module.in_proj_z(hidden_states)
+        b = module.in_proj_b(hidden_states)
+        a = module.in_proj_a(hidden_states)
+    shape = (batch_size, sequence_length)
+    return (
+        query.reshape(*shape, num_key_heads, key_head_dim),
+        key.reshape(*shape, num_key_heads, key_head_dim),
+        value.reshape(*shape, num_value_heads, value_head_dim),
+        z.reshape(*shape, num_value_heads, value_head_dim),
+        b.reshape(*shape, num_value_heads),
+        a.reshape(*shape, num_value_heads),
+    )
+
+
+def _adapt_gated_delta_net_module(
+    module: nn.Module, process_group, *, fp32_beta: bool, stock_numerics: bool = False
+) -> None:
     """Replace ``module.forward`` with the head-parallel forward.
 
     ``fp32_beta`` is passed to :func:`head_parallel_gated_delta_net`: ``True`` evaluates the beta gate as a sigmoid of
     fp32 ``b``, ``False`` as ``b.sigmoid()`` in ``b``'s own dtype, which is what the stock transformers forward does.
+
+    ``process_group=None`` is SP=1. There a call with a sharing :class:`PackedLayout` stashed, or an unshared one
+    that is exactly this call (``[1, num_tokens]``, no cache), runs the packed path on the layout's segments with
+    ``stock_numerics``, which repeats Q/K to the value heads as the stock forward does. Any other call runs the stock
+    forward unchanged.
     """
+    fused = all(hasattr(module, attribute) for attribute in _FUSED_PROJECTIONS)
     required_attributes = (
-        "in_proj_qkv",
-        "in_proj_z",
-        "in_proj_b",
-        "in_proj_a",
+        *(_FUSED_PROJECTIONS if fused else _SPLIT_PROJECTIONS),
         "conv1d",
         "A_log",
         "dt_bias",
@@ -740,7 +1089,7 @@ def _adapt_gated_delta_net_module(module: nn.Module, process_group, *, fp32_beta
     original_causal_convolution = _resolve_gated_delta_net_kernel(module, "causal_conv1d_fn")
     original_gated_delta_rule = _resolve_gated_delta_net_kernel(module, "chunk_gated_delta_rule")
     num_key_heads, num_value_heads = _module_head_counts(module)
-    world_size = dist.get_world_size(process_group)
+    world_size = _group_size(process_group)
     if num_key_heads % world_size or num_value_heads % world_size:
         raise RuntimeError(
             f"SP size {world_size} must divide GatedDeltaNet key/value heads ({num_key_heads}/{num_value_heads})"
@@ -749,19 +1098,36 @@ def _adapt_gated_delta_net_module(module: nn.Module, process_group, *, fp32_beta
         raise RuntimeError(
             f"GatedDeltaNet value heads ({num_value_heads}) must be divisible by key heads ({num_key_heads})"
         )
+    stock_forward = module.forward
 
     def forward(self, *args, **kwargs):
         hidden_states = _hidden_states_from_call(args, kwargs)
         cache_params = kwargs.get("cache_params")
         if cache_params is None and len(args) > 1:
             cache_params = args[1]
+        layout = get_sharing_layout(self)
+        if layout is None:
+            stash = get_stashed_layout(self)
+            require_stash_inside_context(type(self).__name__, stash)
+            if process_group is None:
+                # The stock forward resets state only at cu_seq_lens_q the caller passes; an unshared stash that is
+                # exactly this call gives its own segments instead.
+                if (
+                    stash is None
+                    or cache_params is not None
+                    or tuple(hidden_states.shape[:2]) != (1, stash.num_tokens)
+                ):
+                    return stock_forward(*args, **kwargs)
+                layout = stash
         if cache_params is not None:
             raise RuntimeError(
-                "head-parallel GatedDeltaNet is a training path and does not support "
-                "cached recurrent or convolution state"
+                "the packed GatedDeltaNet path (sequence parallelism or prefix sharing) is a training path and "
+                "does not support cached recurrent or convolution state"
             )
-        global_cu_seqlens = getattr(self, _GLOBAL_CU_SEQLENS_ATTRIBUTE, None)
-        if not torch.is_tensor(global_cu_seqlens):
+        # Under a sharing layout the boundaries are the layout's; seq_idx / cu_seq_lens_* the caller passed describe
+        # the unshared rows and are not read.
+        global_cu_seqlens = None if layout is not None else getattr(self, _GLOBAL_CU_SEQLENS_ATTRIBUTE, None)
+        if layout is None and not torch.is_tensor(global_cu_seqlens):
             raise RuntimeError(
                 "GatedDeltaNet sequence parallelism needs the packed group's global cu_seqlens on the module "
                 f"as {_GLOBAL_CU_SEQLENS_ATTRIBUTE!r}, and this call has none. The model's forward is supposed "
@@ -770,39 +1136,8 @@ def _adapt_gated_delta_net_module(module: nn.Module, process_group, *, fp32_beta
             )
 
         batch_size, local_sequence_length, _ = hidden_states.shape
-        mixed_qkv = self.in_proj_qkv(hidden_states)
-        z = self.in_proj_z(hidden_states).reshape(
-            batch_size,
-            local_sequence_length,
-            num_value_heads,
-            int(self.head_v_dim),
-        )
-        b = self.in_proj_b(hidden_states)
-        a = self.in_proj_a(hidden_states)
-        key_dim = num_key_heads * int(self.head_k_dim)
-        value_dim = num_value_heads * int(self.head_v_dim)
-        query, key, value = torch.split(
-            mixed_qkv,
-            [key_dim, key_dim, value_dim],
-            dim=-1,
-        )
-        query = query.reshape(
-            batch_size,
-            local_sequence_length,
-            num_key_heads,
-            int(self.head_k_dim),
-        )
-        key = key.reshape(
-            batch_size,
-            local_sequence_length,
-            num_key_heads,
-            int(self.head_k_dim),
-        )
-        value = value.reshape(
-            batch_size,
-            local_sequence_length,
-            num_value_heads,
-            int(self.head_v_dim),
+        query, key, value, z, b, a = _project_gated_delta_net_inputs(
+            self, hidden_states, num_key_heads, num_value_heads
         )
         core_attn_out, _ = head_parallel_gated_delta_net(
             original_causal_convolution,
@@ -822,6 +1157,8 @@ def _adapt_gated_delta_net_module(module: nn.Module, process_group, *, fp32_beta
             num_key_heads=num_key_heads,
             num_value_heads=num_value_heads,
             fp32_beta=fp32_beta,
+            layout=layout,
+            repeat_query_key=stock_numerics,
             initial_state=None,
             output_final_state=False,
             use_qk_l2norm_in_kernel=True,
@@ -840,6 +1177,11 @@ def _adapt_gated_delta_net_module(module: nn.Module, process_group, *, fp32_beta
     module._dss_gated_delta_net_sequence_parallel = True
     module._dss_gated_delta_net_head_parallel = True
     module._dss_gated_delta_net_full_temporal_core = True
+    setattr(
+        module,
+        PREFIX_CONTINUATION_ATTR,
+        gated_delta_net_prefix_continuation_check(module, original_causal_convolution, original_gated_delta_rule),
+    )
 
 
 def _install_global_boundary_wrapper(model: nn.Module, modules: list, process_group) -> None:
@@ -856,6 +1198,10 @@ def _install_global_boundary_wrapper(model: nn.Module, modules: list, process_gr
     original_forward = model.forward
 
     def forward(*args, **kwargs):
+        stash = get_stashed_layout(model)
+        if stash is not None and stash.has_sharing:
+            # The layers read the stashed global layout; this rank's positions cover only its window.
+            return original_forward(*args, **kwargs)
         position_ids = kwargs.get("position_ids")
         if not torch.is_tensor(position_ids):
             raise ValueError(
@@ -867,7 +1213,7 @@ def _install_global_boundary_wrapper(model: nn.Module, modules: list, process_gr
         gathered = [torch.empty_like(position_ids) for _ in range(world_size)]
         dist.all_gather(gathered, position_ids.contiguous(), group=process_group)
         # SP shards are contiguous in rank order, so concatenation rebuilds the packed call's positions.
-        global_cu_seqlens = cu_seqlens_from_position_ids(torch.cat(gathered, dim=1))
+        global_cu_seqlens = cu_seqlens_from_position_ids(torch.cat(gathered, dim=1), stash)
         for module in modules:
             setattr(module, _GLOBAL_CU_SEQLENS_ATTRIBUTE, global_cu_seqlens)
         return original_forward(*args, **kwargs)
@@ -911,3 +1257,25 @@ def apply_gated_delta_net_sequence_parallelism(model: nn.Module, process_group, 
             adapted_modules,
         )
     return adapted_modules
+
+
+def apply_gated_delta_net_prefix_continuation(model: nn.Module) -> int:
+    """Install the GatedDeltaNet adapter at SP=1 and return the count of adapted modules.
+
+    Calls without a sharing :class:`PackedLayout` stashed still run each module's stock forward. Calls under a
+    sharing layout run the packed path in stock numerics (Q/K repeated to the value heads, beta as
+    ``b.sigmoid()`` in ``b``'s dtype, so an fp32 ``in_proj_b`` output hook still applies), with boundaries from
+    the layout and each continuation resuming its root.
+    """
+    adapted = 0
+    for name, module in model.named_modules():
+        if not _is_gated_delta_net_module(module) or getattr(module, "_dss_gated_delta_net_sequence_parallel", False):
+            continue
+        try:
+            _adapt_gated_delta_net_module(module, None, fp32_beta=False, stock_numerics=True)
+        except RuntimeError as exc:
+            # The stock forward still runs; prefix sharing refuses an unadapted GatedDeltaNet.
+            logger.info("GatedDeltaNet %s keeps its stock forward without prefix continuation: %s", name, exc)
+            continue
+        adapted += 1
+    return adapted
