@@ -23,10 +23,9 @@ instead of assuming them, and a family with another layout registers its own ent
 The token count per item is not in the spec: ``media_token_spans``, ``mrope_position_ids`` and ``window_media``
 count ``t * h * w / merge**2``, so a family that counts otherwise brings its count with those.
 
-The Qwen-VL entry reproduces the constants the existing code uses. ``run_pipeline`` takes its media kinds, its
-spatial merge factor and its position layout from the spec of the engine's ``model_type``. A model type with no spec
-keeps what ``run_pipeline`` did before specs: ``pixel_values`` and ``image_grid_thw`` reach the engine as sent (no
-M-RoPE positions, no row ids; the model builds its own positions), and any other media key is refused for it.
+The Qwen-VL entry reproduces the constants the existing code uses. A caller that places media for a model takes
+its media kinds, spatial merge factor and position layout from the spec of the model's ``model_type``;
+``media_spec_for`` gives None for a model type with no spec.
 
 Only ``qwen4_exp`` is registered: its Arctic modeling takes ``[4, 1, T]`` M-RoPE ``position_ids`` and both
 ``pixel_values`` and ``pixel_values_videos``. Other Qwen vision-language model types are left out until their Arctic
