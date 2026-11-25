@@ -66,17 +66,27 @@ def glm_metadata(decode):
 def test_glm_pool_order(monkeypatch, decode, dcp):
     apply_required_vllm_patches()
     interpret(monkeypatch, sparse_indexer.kpool_ops, "_expand_pools_and_append_tail_kernel")
-    emitted = []
 
+    # GPU selectors: at dcp > 1 the local top-k returns rank-local pools, and only the merge returns the selection.
     def emit(dst):
-        dst.copy_(emitted[-1])
+        if dcp == 1:
+            dst.copy_(selected)
+        else:
+            # Rank 0 holds 65 complete pools in the long row and one in the short row.
+            dst.fill_(-1)
+            dst[0, :65] = torch.arange(65)
+            dst[1, 0] = 0
 
-    # GPU kernels: zero scores; the local top-k emits the pool list, and at dcp > 1 the cross-rank merge re-emits it.
+    def merge(logits, dst, k, rank, world_size, interleave, **kwargs):
+        assert world_size == dcp
+        if world_size > 1:
+            dst.copy_(selected)
+
     monkeypatch.setattr(sparse_indexer, "fp8_fp4_mqa_logits", lambda *args: torch.zeros(2, 514))
     monkeypatch.setattr(sparse_indexer, "fp8_fp4_paged_mqa_logits", lambda *args, **kwargs: torch.zeros(2, 514))
     monkeypatch.setattr(torch.ops._C, "top_k_per_row_prefill", lambda _, lo, hi, dst, *a: emit(dst), raising=False)
     monkeypatch.setattr(sparse_indexer, "get_indexer_topk", lambda backend: lambda logits, lens, n, dst, *a: emit(dst))
-    monkeypatch.setattr(sparse_indexer, "_merge_dcp_topk_global", lambda logits, dst, *a, **kw: dcp > 1 and emit(dst))
+    monkeypatch.setattr(sparse_indexer, "_merge_dcp_topk_global", merge)
     workspace = SimpleNamespace(get_simultaneous=lambda *specs: [torch.empty(s, dtype=d) for s, d in specs])
     monkeypatch.setattr(sparse_indexer, "current_workspace_manager", lambda: workspace)
     monkeypatch.setattr(sparse_indexer, "DeepseekV32IndexerMetadata", SimpleNamespace)
@@ -86,7 +96,6 @@ def test_glm_pool_order(monkeypatch, decode, dcp):
     short[:4] = torch.arange(4)
     short[2048] = 4
     for selected in selections():
-        emitted.append(selected.int())
         buffer = torch.zeros(2, 2051, dtype=torch.int32)
         sparse_indexer.sparse_attn_indexer_kpool(
             hidden_states=torch.empty(2, 1),
