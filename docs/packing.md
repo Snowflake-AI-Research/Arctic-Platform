@@ -58,14 +58,16 @@ A model call runs inside `using_layout(model, layout)`, which stashes the layout
 Sharing is fail-closed:
 
 - `build` and `pack_with_layout` refuse a group whose rows disagree on the prefix's `input_ids` or `position_ids`, loss weight on a shared cell, and a batch that is not the one the layout was built from. Router-replay ids that disagree on a group's prefix turn that group's sharing off.
-- `using_layout` refuses a sharing layout unless every sequence mixer supports continuation (flash-attn 2 >= 2.1, FA3, or FA4 with a varlen backward) and an MoE model has an explicit router-replay decision. The loss must be token-mean.
+- `using_layout` refuses a sharing layout unless every sequence mixer supports continuation (flash-attn 2 >= 2.1, FA3, or FA4 with a varlen backward, or GatedDeltaNet below) and an MoE model has an explicit router-replay decision. Arctic-Platform attention shares only inside models registered as verified end to end (`register_prefix_sharing_model`; today the custom Qwen3.5-MoE). The loss must be token-mean.
+- GatedDeltaNet continues a root in two parts. The causal conv gets the root's last `kernel_size - 1` prefix inputs prepended to each continuation, and the gated delta rule runs the roots with `output_final_state=True`, then each continuation from its root's fp32 state. It needs causal-conv1d's `causal_conv1d_fn` with `seq_idx` and FLA's chunked rule with `initial_state` (the `[gdn]` extra pins the verified releases), and every shared prefix to hold at least `kernel_size - 1` tokens. Hugging Face models get the adapter at load (`apply_gated_delta_net_prefix_continuation`); without a stash it runs the stock forward.
 - Code with no stash that reads boundaries while a sharing context is active (another model's attention, `position_ids == 0` helpers) raises instead of reading another call's segments.
 
 Context rules:
 
 - Keep the context open through backward. The prefix gather runs again in activation-checkpoint recompute, and `unpack`'s backward hook raises if the context has exited.
 - One thread holds contexts at a time. They nest on that thread over disjoint modules, or with the same layout (or its `.to()` copy). A different layout on a module another active context holds raises, since the outer call's backward or recompute would read the inner layout. Contexts exit innermost first.
-- Sequence-parallel shards and padded calls cannot run inside a context yet.
+- Under sequence parallelism the layout describes the whole call, not a rank's window. The prefix gather runs where a mixer sees the whole packed sequence for its local heads: after the all-to-all in DeepSpeed's Hugging Face Ulysses attention (registered through `register_hf_ulysses`), in the custom Qwen3.5-MoE's Ulysses attention, and in the head-parallel GatedDeltaNet. Each rank's token count is checked against the layout after the exchange.
+- Padded calls cannot run inside a sharing context yet.
 
 ## What a worker receives
 
