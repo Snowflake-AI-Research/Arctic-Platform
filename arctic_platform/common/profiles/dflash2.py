@@ -36,6 +36,7 @@ def register(registry: Registry) -> None:
             "numerics.optimization_dtype",
         ],
         unsupported={
+            "tiled_remat.token_budget": "packed mixer tiling is only on the huggingface SFT path",
             "checkpointing.mode": (
                 "the loader has no activation checkpointing; it rejects `patches.gradient_checkpointing`"
             ),

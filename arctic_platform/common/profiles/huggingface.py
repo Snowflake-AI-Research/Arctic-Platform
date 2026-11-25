@@ -48,6 +48,7 @@ def register(registry: Registry) -> None:
             "checkpointing.freq",
             "checkpointing.offload",
             "tiled_mlp.token_chunk_size",
+            "tiled_remat.token_budget",
             "lm_head.fp32",
             "lm_head.token_chunk_size",
             "lm_head.vocab_chunk_size",

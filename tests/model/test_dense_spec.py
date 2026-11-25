@@ -20,6 +20,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.dense_spec import dense_model_spec
 from arctic_platform.model.dense_spec import ds_worker_dense_model_spec
 
@@ -104,6 +105,30 @@ def test_omitted_loader_options_are_not_passed(monkeypatch):
     _spec()
 
     assert "loader_options" not in seen[0]
+
+
+@pytest.mark.parametrize("token_budget", [None, 4096])
+def test_tiled_remat_uses_shared_dense_training_mapping(token_budget):
+    options = {"tiled_remat_token_budget": token_budget}
+    dense = _spec(training_options=options)
+    onprem = ds_worker_dense_model_spec(
+        "Qwen/Qwen3-8B",
+        {"attn_implementation": "sdpa", "enable_gradient_checkpointing": False, **options},
+        dtype="bfloat16",
+        sequence_parallel=1,
+    )
+    assert onprem.model_dump() == dense.model_dump()
+    if token_budget is None:
+        assert dense.patches.tiled_remat is None
+    else:
+        assert dense.patches.tiled_remat.token_budget == token_budget
+    assert ModelSpec.model_validate_json(dense.model_dump_json()).model_dump() == dense.model_dump()
+
+
+@pytest.mark.parametrize("token_budget", [0, -1])
+def test_tiled_remat_rejects_nonpositive_budget(token_budget):
+    with pytest.raises(ValueError, match="token_budget"):
+        _spec(training_options={"tiled_remat_token_budget": token_budget})
 
 
 def test_loader_fields_in_training_options_are_rejected():

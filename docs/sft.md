@@ -162,6 +162,24 @@ derives varlen `cu_seqlens` from the position-id resets
 (`_is_packed_sequence`) — attention does not run as a single dense rectangle
 across packed documents.
 
+### Packed batches with linear attention (GDN)
+
+Qwen3.5 linear-attention layers (`linear_attn`, GatedDeltaNet) reset their recurrent state at `cu_seq_lens_q` and stop their short convolution at `seq_idx`. The model does not derive either from `position_ids`. When a packed batch reaches a module that has `linear_attn` layers, `run_sft_pipeline` installs `install_packed_gdn_boundaries` (`arctic_platform/common/utils/packed_gdn.py`) once as a forward pre-hook. The hook derives `cu_seq_lens_q/k`, `max_length_q/k` and `seq_idx` from `position_ids`. It leaves a call unchanged when that call already carries `cu_seq_lens_q`, and it does nothing for models without `linear_attn` layers. Dense packed batches are unaffected.
+
+### Tiled rematerialization of packed mixers
+
+The option `tiled_remat.token_budget` (default 4096, huggingface profile only) recomputes each packed attention or linear-attention mixer in whole-sample tiles of at most that many tokens during the backward pass, using DeepSpeed's `tiled_rematerialization`. The following are validation errors:
+
+- A flash attention implementation other than `flash_attention_2`, `flash_attention_3` or `flash_attention_4`.
+- A mixer call with neither `cu_seq_lens_q/k` nor `position_ids`. Packed batches are required.
+- A `hidden_states` batch dimension other than 1. Micro batch must be 1.
+- A `seq_idx` that disagrees with `cu_seq_lens_q`.
+- Under ZeRO-3, mixer parameters that are not ZeRO leaf modules.
+
+Model profiles other than huggingface reject the option.
+
+Wall probes and arm configs for the packed integration plan live in `arctic_platform.sft.eval` (`python -m arctic_platform.sft.eval`). The matched settings are ZeRO-2 with optimizer offload to CPU, bf16, FlashAttention 3, liger on, tiled MLP chunk 4096, and UltraChat packed to the exact target length.
+
 ## Loss functions: `sft` vs `sft_ce`
 
 Both compute the same causal-LM cross-entropy over unmasked tokens

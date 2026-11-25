@@ -37,6 +37,7 @@ from arctic_platform.model import loader as loader_mod
 from arctic_platform.model import patch as patch_mod
 from arctic_platform.model import register_loader
 from arctic_platform.model import register_patch
+from arctic_platform.model.dense_spec import ds_worker_dense_model_spec
 
 
 @pytest.fixture(autouse=True)
@@ -360,6 +361,54 @@ class TestDenseModelSpec:
         assert z.logits_optimization_peak_mem_size_in_gib == 8
         assert z.logits_compute_from_fp32_inputs is True
         assert z.logits_compute_in_fp32 is True
+
+    def test_tiled_mlp_token_chunk_size_maps(self):
+        spec = ds_worker_dense_model_spec(
+            "x",
+            {"attn_implementation": "flash_attention_3", "tiled_mlp_token_chunk_size": 4096},
+            dtype="bfloat16",
+            sequence_parallel=1,
+        )
+        assert spec.patches.tiled_mlp is not None
+        assert spec.patches.tiled_mlp.token_chunk_size == 4096
+
+    def test_tiled_remat_token_budget_maps(self):
+        spec = ds_worker_dense_model_spec(
+            "x",
+            {"attn_implementation": "flash_attention_3", "tiled_remat_token_budget": 4096},
+            dtype="bfloat16",
+            sequence_parallel=1,
+        )
+        assert spec.patches.tiled_remat is not None
+        assert spec.patches.tiled_remat.token_budget == 4096
+
+    def test_activation_offload_flag_maps_defaults(self):
+        from arctic_platform.model.config import ActivationOffloadPatch
+
+        spec = ds_worker_dense_model_spec(
+            "x",
+            {
+                "attn_implementation": "flash_attention_3",
+                "ac_config": {"offload_config": {"enabled": True}},
+                "enable_gradient_checkpointing": True,
+            },
+            dtype="bfloat16",
+            sequence_parallel=1,
+        )
+        defaults = ActivationOffloadPatch()
+        assert spec.patches.activation_offload is not None
+        assert spec.patches.activation_offload.enabled is True
+        assert spec.patches.activation_offload.keep_last_n == defaults.keep_last_n
+        assert spec.patches.activation_offload.pin_memory_max_size_gib == defaults.pin_memory_max_size_gib
+
+    def test_activation_offload_absent_when_flag_false(self):
+        spec = ds_worker_dense_model_spec(
+            "x",
+            {"attn_implementation": "flash_attention_3", "ac_config": {"offload_config": {"enabled": False}}},
+            dtype="bfloat16",
+            sequence_parallel=1,
+        )
+        assert spec.patches.activation_offload is None
 
     def test_zorro_uses_pydantic_defaults_for_omitted_fields(self):
         z = ZorroTrainPatch.model_validate({"rollout_n": 4})

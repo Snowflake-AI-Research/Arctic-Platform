@@ -185,6 +185,14 @@ class TiledMlpPatch(BaseModel):
     token_chunk_size: PositiveInt = Field(..., description="Maximum tokens per recomputed dense-MLP tile.")
 
 
+class TiledRematPatch(BaseModel):
+    """Recompute packed attention and linear-attention mixers in token tiles of whole samples."""
+
+    model_config = ConfigDict(extra="forbid", validate_default=True)
+
+    token_budget: PositiveInt = Field(4096, description="Maximum tokens per packed mixer tile.")
+
+
 class Patches(BaseModel):
     """Optional features applied to the model after it is loaded."""
 
@@ -200,6 +208,9 @@ class Patches(BaseModel):
     )
     compile: CompilePatch | None = Field(None, description="Per-transformer-layer torch.compile settings.")
     tiled_mlp: TiledMlpPatch | None = Field(None, description="Recompute dense MLPs in token tiles.")
+    tiled_remat: TiledRematPatch | None = Field(
+        None, description="Recompute packed mixers in whole-sample tiles. None disables."
+    )
     lm_head: LmHeadPatch | None = Field(None, description="LM-head precision and chunking.")
     zorro_train: ZorroTrainPatch | None = Field(None, description="ZoRRo Train patch (None disables).")
     peft: dict | None = Field(None, description="PEFT config; wrap after other patches, before the optimizer.")
