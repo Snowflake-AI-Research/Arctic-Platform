@@ -18,10 +18,22 @@ option leaves each switch's environment variable in charge. CPU only."""
 from __future__ import annotations
 
 import importlib
+import json
+import os
+import sys
+import types
 
 import pytest
+import torch
 from pydantic import ValidationError
+from torch import nn
 
+from arctic_platform.model import ModelSpec
+from arctic_platform.model import ParallelismConfig
+from arctic_platform.model import build_model
+from arctic_platform.model import loader as loader_mod
+from arctic_platform.model.implementations.moe import expert_replicas
+from arctic_platform.model.implementations.moe import ultraep_replicas
 from arctic_platform.model.implementations.moe.runtime_options import MoeRuntimeOptions
 from arctic_platform.model.implementations.moe.runtime_options import apply_moe_runtime_options
 from arctic_platform.model.loaders.generic_moe import GenericMoeOptions
@@ -32,7 +44,11 @@ from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
 SWITCHES = {
     "w4a8_experts": ("kernels.w4a8", "w4a8_experts_requested", "ARL_W4A8_EXPERTS", True, False),
     "w8a8_experts": ("kernels.fp8_grouped_w8a8", "w8a8_experts_requested", "ARL_W8A8_EXPERTS", True, False),
+    "ultraep_spares": ("moe.ultraep_replicas", "ultraep_spares", "ARL_ULTRAEP_SPARES", 2, 0),
+    # expert_replicas is set apart (test_online_replicas_*): it cannot be on together with ultraep_spares.
+    "expert_replicas_ema": ("moe.expert_replicas", "replica_ema", "ARL_EXPERT_REPLICAS_EMA", 0.25, 0.5),
 }
+REPLICAS_ENV = "ARL_EXPERT_REPLICAS"
 
 
 def _module(name):
@@ -47,6 +63,8 @@ def _env_value(value) -> str:
 def _clean(monkeypatch):
     for _, _, env, _, _ in SWITCHES.values():
         monkeypatch.delenv(env, raising=False)
+    monkeypatch.delenv(REPLICAS_ENV, raising=False)
+    monkeypatch.delenv("ULTRA_EP_IPC_SYMM", raising=False)
     yield
     apply_moe_runtime_options(MoeRuntimeOptions())  # leave every switch to its environment variable again
 
@@ -58,9 +76,12 @@ def _switches(switches=SWITCHES):
 @pytest.mark.parametrize("options_cls", [GlmMoeDsaOptions, GenericMoeOptions, Qwen3_5MoeOptions])
 def test_loader_options_carry_the_runtime_fields(options_cls):
     switches = SWITCHES
-    options = options_cls.model_validate({field: spec[3] for field, spec in switches.items()})
+    options = options_cls.model_validate(
+        {field: spec[3] for field, spec in switches.items()} | {"ultraep_ipc_symm": True}
+    )
     apply_moe_runtime_options(options)
     assert _switches(switches) == {field: spec[3] for field, spec in switches.items()}
+    assert os.environ["ULTRA_EP_IPC_SYMM"] == "1"
 
 
 def test_options_override_the_environment(monkeypatch):
@@ -78,9 +99,212 @@ def test_unset_options_leave_the_environment_in_charge(monkeypatch):
     assert _switches() == {field: spec[3] for field, spec in SWITCHES.items()}
 
 
+def test_ipc_symm_is_written_for_ultraep():
+    apply_moe_runtime_options(MoeRuntimeOptions(ultraep_ipc_symm=True))
+    assert os.environ["ULTRA_EP_IPC_SYMM"] == "1"
+    apply_moe_runtime_options(MoeRuntimeOptions(ultraep_ipc_symm=False))
+    assert os.environ["ULTRA_EP_IPC_SYMM"] == "0"
+    apply_moe_runtime_options(MoeRuntimeOptions())  # unset: UltraEP's own variable stays as it is
+    assert os.environ["ULTRA_EP_IPC_SYMM"] == "0"
+
+
 def test_unknown_runtime_fields_are_refused():
     with pytest.raises(ValidationError):
         GlmMoeDsaOptions.model_validate({"frozen_expert_ofload": True})
+    with pytest.raises(ValidationError):
+        MoeRuntimeOptions(ultraep_spares=-1)
+    for fields in ({"expert_replicas": -1}, {"expert_replicas_ema": 0.0}, {"expert_replicas_ema": 1.5}):
+        with pytest.raises(ValidationError):
+            GlmMoeDsaOptions.model_validate(fields)
+
+
+def test_the_spare_planners_are_exclusive():
+    """UltraEP's spares and the online replicas both fill the spare expert slots."""
+    with pytest.raises(ValidationError, match="at most one"):
+        GlmMoeDsaOptions(ultraep_spares=2, expert_replicas=2)
+    assert GlmMoeDsaOptions(ultraep_spares=2, expert_replicas=0).ultraep_spares == 2
+    assert GlmMoeDsaOptions(ultraep_spares=0, expert_replicas=2).expert_replicas == 2
+
+
+def test_online_replicas_take_the_option_then_the_environment(monkeypatch):
+    replicas = _module("moe.expert_replicas")
+    apply_moe_runtime_options(GlmMoeDsaOptions())
+    assert (replicas.replica_spares(), replicas.replica_ema()) == (0, 0.5)
+    monkeypatch.setenv(REPLICAS_ENV, "1")
+    assert replicas.replica_spares() == 1
+    apply_moe_runtime_options(GlmMoeDsaOptions(expert_replicas=4, expert_replicas_ema=0.75))
+    assert (replicas.replica_spares(), replicas.replica_ema()) == (4, 0.75)
+    apply_moe_runtime_options(GlmMoeDsaOptions())  # a later load that sets nothing goes back to the environment
+    assert replicas.replica_spares() == 1
+
+
+def test_both_ultraep_paths_read_one_spare_count(monkeypatch):
+    """The trainable experts' UltraEP (moe/ultraep_replicas.py) and the frozen quantized one (moe/ultraep_frozen.py:
+    block FP8, packed 4-bit) take the same loader option."""
+    frozen = _module("moe.ultraep_frozen")
+    trainable = _module("moe.ultraep_replicas")
+    apply_moe_runtime_options(GlmMoeDsaOptions(ultraep_spares=3))
+    assert frozen.ultraep_spares() == trainable.ultraep_spares() == 3
+    monkeypatch.setenv("ARL_ULTRAEP_SPARES", "1")
+    apply_moe_runtime_options(GlmMoeDsaOptions())
+    assert frozen.ultraep_spares() == trainable.ultraep_spares() == 1
+
+
+@pytest.mark.parametrize("configured, inherited, seen", [(True, None, "1"), (False, "1", "0"), (None, "1", "1")])
+def test_ipc_symm_is_in_the_environment_when_ultraep_allocates(monkeypatch, configured, inherited, seen):
+    """UltraEP reads ULTRA_EP_IPC_SYMM inside ``Manager``; the configured mode must be there by then, and an unset
+    one must leave the inherited value alone."""
+    trainable = _module("moe.ultraep_replicas")
+    if inherited is not None:
+        monkeypatch.setenv("ULTRA_EP_IPC_SYMM", inherited)
+    observed = []
+
+    class Manager:
+        def __init__(self, **kwargs):
+            observed.append(os.environ.get("ULTRA_EP_IPC_SYMM"))
+
+    monkeypatch.setitem(sys.modules, "ultra_ep", types.SimpleNamespace(Manager=Manager))
+    monkeypatch.setattr(trainable.dist, "get_world_size", lambda group=None: 2)
+    apply_moe_runtime_options(GlmMoeDsaOptions(ultraep_spares=2, ultraep_ipc_symm=configured))
+    state = trainable.UltraEPState(object(), 3, trainable.ultraep_spares(), torch.zeros(3, 4, 8), torch.zeros(3, 8, 4))
+    assert state.spares == 2
+    assert observed == [seen, seen]
+
+
+# The loaders that reject expert parallelism, and so have no MoE runtime.
+_NO_EXPERT_PARALLEL = {"huggingface", "dflash2"}
+LOADER_OPTIONS = sorted(
+    {entry.options for name, entry in loader_mod._LOADERS.items() if name not in _NO_EXPERT_PARALLEL},
+    key=lambda options: options.__name__,
+)
+
+
+@pytest.mark.parametrize("options_cls", LOADER_OPTIONS)
+def test_every_moe_loader_takes_the_fields_unset_by_default(options_cls):
+    assert issubclass(options_cls, MoeRuntimeOptions)
+    options = options_cls()
+    assert (options.ultraep_spares, options.ultraep_ipc_symm) == (None, None)
+    options = options_cls(ultraep_spares=2, ultraep_ipc_symm=True)
+    assert (options.ultraep_spares, options.ultraep_ipc_symm) == (2, True)
+    assert options_cls(expert_replicas=2, expert_replicas_ema=1.0).expert_replicas == 2
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"ultraep_spares": -1},
+        {"expert_replicas": -2},
+        {"expert_replicas_ema": 0.0},
+        {"expert_replicas_ema": 1.5},
+        {"ultraep_spares": 2, "expert_replicas": 2},
+    ],
+)
+def test_bad_values_are_refused(fields):
+    with pytest.raises(ValidationError):
+        GenericMoeOptions(**fields)
+
+
+def test_one_planner_may_be_off_while_the_other_is_on():
+    assert GenericMoeOptions(ultraep_spares=2, expert_replicas=0).ultraep_spares == 2
+
+
+def test_configured_values_win_and_unset_ones_fall_back_to_the_environment(monkeypatch):
+    monkeypatch.setenv("ARL_ULTRAEP_SPARES", "3")
+    monkeypatch.setenv("ARL_EXPERT_REPLICAS", "1")
+    monkeypatch.setenv("ARL_EXPERT_REPLICAS_EMA", "0.25")
+    apply_moe_runtime_options(GenericMoeOptions())
+    assert (ultraep_replicas.ultraep_spares(), expert_replicas.replica_spares(), expert_replicas.replica_ema()) == (
+        3,
+        1,
+        0.25,
+    )
+    apply_moe_runtime_options(GenericMoeOptions(ultraep_spares=0, expert_replicas=4, expert_replicas_ema=0.75))
+    assert (ultraep_replicas.ultraep_spares(), expert_replicas.replica_spares(), expert_replicas.replica_ema()) == (
+        0,
+        4,
+        0.75,
+    )
+    # A later load that sets nothing goes back to the environment.
+    apply_moe_runtime_options(GenericMoeOptions())
+    assert ultraep_replicas.ultraep_spares() == 3
+
+
+def test_defaults_without_config_or_environment():
+    apply_moe_runtime_options(GenericMoeOptions())
+    assert (ultraep_replicas.ultraep_spares(), expert_replicas.replica_spares(), expert_replicas.replica_ema()) == (
+        0,
+        0,
+        0.5,
+    )
+
+
+def test_an_options_model_without_the_fields_counts_as_unset(monkeypatch):
+    monkeypatch.setenv("ARL_ULTRAEP_SPARES", "2")
+    apply_moe_runtime_options(types.SimpleNamespace(ep_comm_backend="uccl"))
+    assert ultraep_replicas.ultraep_spares() == 2
+
+
+def _checkpoint(tmp_path, model_type: str) -> str:
+    path = tmp_path / model_type
+    path.mkdir()
+    (path / "config.json").write_text(json.dumps({"model_type": model_type}))
+    return str(path)
+
+
+def test_the_spec_hands_the_fields_to_the_loader(monkeypatch, tmp_path):
+    from arctic_platform.model.implementations.qwen35 import deepspeed_integration as integration
+
+    seen = {}
+
+    def load(**kwargs):
+        seen.update(kwargs)
+        return nn.Identity()
+
+    monkeypatch.setattr(integration, "load_generic_moe_model", load)
+    spec = ModelSpec(
+        model_path_or_name=_checkpoint(tmp_path, "qwen3_moe"),
+        parallelism=ParallelismConfig(expert_parallel=2),
+        loader_options={"ultraep_spares": 2, "ultraep_ipc_symm": True, "expert_replicas_ema": 0.5},
+    )
+    assert spec.loader_options["ultraep_spares"] == 2
+    build_model(spec, parallel_groups={"ep_group": object()})
+    options = seen["options"]
+    assert (options.ultraep_spares, options.ultraep_ipc_symm, options.expert_replicas) == (2, True, None)
+
+
+def test_load_moe_model_applies_the_options_before_it_builds_the_model(monkeypatch):
+    from arctic_platform.model.implementations.moe import deepspeed_integration as common
+
+    order = []
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+
+    class Mesh:
+        @staticmethod
+        def from_group(**kwargs):
+            return object()
+
+    def build_model_config(*args):
+        order.append(("config", ultraep_replicas.ultraep_spares()))
+        return types.SimpleNamespace()
+
+    def family_loader(*args, **kwargs):
+        order.append(("load", ultraep_replicas.ultraep_spares()))
+        return nn.Identity()
+
+    adapter = types.SimpleNamespace(build_model_config=build_model_config)
+    common.load_moe_model(
+        adapter,
+        family_loader,
+        model_name="m",
+        optimization_dtype="bfloat16",
+        attn_implementation="eager",
+        ep_size=2,
+        ep_group=object(),
+        options=GenericMoeOptions(ep_comm_backend="uccl", ultraep_spares=2),
+        patch_moe_detection=lambda: None,
+        device_mesh_type=Mesh,
+    )
+    assert order == [("config", 2), ("load", 2)]
 
 
 def test_w8a8_experts_reach_the_experts_built_after_the_load():

@@ -112,9 +112,14 @@ def sonic_routed_experts(
     token_ids = torch.arange(tokens, device=hidden_states.device).unsqueeze(1).expand(tokens, topk)[mask].int()
     local_ids = expert_indices[mask].int()
     w1, w2, w3 = experts.w1, experts.w2, experts.w3  # LoRA-merged inside the PEFT wrappers
+    replica_call = getattr(experts, "_arl_replica_call", None)
+    if replica_call is not None:
+        # Spare expert slots (moe/expert_replicas.py, moe/ultraep_replicas.py) appended after the native experts,
+        # read from their owners' current (LoRA-merged or trained) weights.
+        w1, w2, w3 = replica_call.extend(w1, w2, w3)
     num_experts, inter, hidden = w1.shape
     note_feature_dims(num_experts, num_experts + 1, inter, 2 * inter, hidden)
-    if w1.requires_grad or w3.requires_grad:
+    if replica_call is not None or w1.requires_grad or w3.requires_grad:
         # Trained weights or LoRA deltas take their gradients through the stack, so it is built per call.
         gate_up = torch.cat([w1, w3], dim=1)
     else:

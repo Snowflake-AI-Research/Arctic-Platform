@@ -25,21 +25,31 @@ their modules once per model load, before the model is built.
 from __future__ import annotations
 
 import importlib
+import os
 from typing import Any
 
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
+from pydantic import model_validator
+from typing_extensions import Self
 
 # field -> (module that reads it, relative to arctic_platform.model.implementations; the setter it takes it through)
 _SETTERS = {
     "w4a8_experts": ("kernels.w4a8", "configure_from_options"),
     "w8a8_experts": ("kernels.fp8_grouped_w8a8", "configure_from_options"),
+    # One spare count for UltraEP's three paths (moe/ultraep_replicas.py picks one from the experts).
+    "ultraep_spares": ("moe.ultraep_replicas", "configure_from_options"),
+    "expert_replicas": ("moe.expert_replicas", "configure_spares"),
+    "expert_replicas_ema": ("moe.expert_replicas", "configure_ema"),
 }
+_ULTRA_EP_IPC_SYMM_ENV = "ULTRA_EP_IPC_SYMM"
 
 
 class MoeRuntimeOptions(BaseModel):
-    """Settings of the MoE runtime, one field per module setting. None: the environment variable decides."""
+    """Expert-balance and expert-GEMM settings of the MoE runtime. None: the environment variable
+    decides. UltraEP's spares and the online replicas both fill the spare expert slots, so at most one of them is
+    on."""
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
@@ -48,6 +58,17 @@ class MoeRuntimeOptions(BaseModel):
         description=(
             "Run INT4 routed experts with FP8 activations (W4A8, the checkpoint's static activation scales) instead of "
             "decoding them to BF16 (kernels/w4a8). Unset: ARL_W4A8_EXPERTS."
+        ),
+    )
+    ultraep_spares: int | None = Field(
+        None,
+        ge=0,
+        description=(
+            "Spare expert slots per GPU that UltraEP fills, in every MoE call, with copies of that call's hottest "
+            "experts inside the owner's NVLink domain. The experts pick the path: BF16 experts as stored, trained in "
+            "full or frozen without an adapter (moe/ultraep_replicas.py); frozen block-FP8 or packed 4-bit (INT4, "
+            "NVFP4, MXFP4) experts with their LoRA (moe/ultraep_frozen.py). 0 turns UltraEP off. Unset: "
+            "ARL_ULTRAEP_SPARES."
         ),
     )
     w8a8_experts: bool | None = Field(
@@ -59,6 +80,39 @@ class MoeRuntimeOptions(BaseModel):
             "block FP8. Unset: ARL_W8A8_EXPERTS."
         ),
     )
+    ultraep_ipc_symm: bool | None = Field(
+        None,
+        description=(
+            "Map UltraEP's peer buffers through CUDA IPC handles instead of torch symmetric memory, whose rendezvous "
+            "refuses ranks that each see only their own GPU (as DSS runs them). Written to ULTRA_EP_IPC_SYMM, which "
+            "UltraEP reads, before its buffers are allocated. Unset: ULTRA_EP_IPC_SYMM."
+        ),
+    )
+    expert_replicas: int | None = Field(
+        None,
+        ge=0,
+        description=(
+            "Spare expert slots per GPU for Arctic's own online replicas of BF16 experts, planned once per "
+            "micro-batch from an EMA of the routed counts and kept on their owner's node (moe/expert_replicas.py). 0 "
+            "turns them off. Unset: ARL_EXPERT_REPLICAS."
+        ),
+    )
+    expert_replicas_ema: float | None = Field(
+        None,
+        gt=0,
+        le=1,
+        description=(
+            "Weight of the newest micro-batch's counts in the online replicas' load estimate (1 plans from that "
+            "micro-batch alone). Unset: ARL_EXPERT_REPLICAS_EMA, else 0.5."
+        ),
+    )
+    @model_validator(mode="after")
+    def _one_spare_planner(self) -> Self:
+        if (self.ultraep_spares or 0) > 0 and (self.expert_replicas or 0) > 0:
+            raise ValueError(
+                "ultraep_spares and expert_replicas both plan the spare expert slots; set at most one of them"
+            )
+        return self
 
 
 def apply_moe_runtime_options(options: Any) -> None:
@@ -68,3 +122,6 @@ def apply_moe_runtime_options(options: Any) -> None:
     for field, (module_name, setter) in _SETTERS.items():
         module = importlib.import_module(f"arctic_platform.model.implementations.{module_name}")
         getattr(module, setter)(getattr(options, field, None))
+    ipc_symm = getattr(options, "ultraep_ipc_symm", None)
+    if ipc_symm is not None:
+        os.environ[_ULTRA_EP_IPC_SYMM_ENV] = "1" if ipc_symm else "0"
