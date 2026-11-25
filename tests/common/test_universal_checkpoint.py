@@ -88,6 +88,38 @@ class _FakeEngine:
         return os.path.join(load_dir, str(tag)), {}
 
 
+_DEFAULT_TIMEOUT_S = 2
+_CONVERSION_S = 3 * _DEFAULT_TIMEOUT_S
+
+
+def _slow_conversion_worker(rank: int, world_size: int, init_method: str, root: str) -> None:
+    """One rank of a gloo job whose rank 0 converts for longer than the default process-group timeout."""
+    import time
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    def slow_convert(src, out):
+        time.sleep(_CONVERSION_S)
+        Path(out).mkdir(parents=True)
+
+    os.environ["GLOO_SOCKET_IFNAME"] = "lo"
+    dist.init_process_group(
+        "gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=_DEFAULT_TIMEOUT_S),
+    )
+    uc.convert_to_universal = slow_convert
+    try:
+        engine = _FakeEngine(dp=world_size)
+        uc.load_checkpoint_with_dp_resize(engine, root, conversion_timeout_s=60)
+        assert [universal for _dir, _tag, universal, _kwargs in engine.loads] == [True]
+    finally:
+        dist.destroy_process_group()
+
+
 @require_deepspeed
 class TestCheckpointInspection(TestCasePlus):
     def test_shard_ranks_match_bf16_and_fp32_names_and_paths(self):
@@ -291,21 +323,63 @@ class TestLoadWithDpResize(TestCasePlus):
         _write_checkpoint(self.root / TAG, dp=4)
         engine = _FakeEngine(dp=2)
         load_path, _ = uc.load_checkpoint_with_dp_resize(engine, str(self.root))
-        out_tag = TAG + uc.UNIVERSAL_TAG_SUFFIX
-        self.assertEqual(self.converted, [(str(self.root / TAG), str(self.root / out_tag))])
+        ((src, out),) = self.converted
+        out_tag = Path(out).name
+        self.assertRegex(out_tag, rf"^{TAG}{uc.UNIVERSAL_TAG_SUFFIX}_[0-9a-f]{{8}}$")
+        self.assertEqual((src, out), (str(self.root / TAG), str(self.root / out_tag)))
         self.assertEqual(engine.loads, [(str(self.root), out_tag, True, {})])
         self.assertEqual(load_path, str(self.root / out_tag))
         self.assertFalse(engine._config.load_universal_checkpoint)
         left = sorted(p.name for p in self.root.iterdir())
         self.assertEqual(left, [TAG, "latest"])
 
+    def test_each_load_converts_into_its_own_copy(self):
+        # Jobs resizing the same shared checkpoint at once must not write into, or remove, each other's copy.
+        _write_checkpoint(self.root / TAG, dp=4)
+        uc.load_checkpoint_with_dp_resize(_FakeEngine(dp=2), str(self.root))
+        uc.load_checkpoint_with_dp_resize(_FakeEngine(dp=2), str(self.root))
+        first, second = (out for _src, out in self.converted)
+        self.assertNotEqual(first, second)
+
     def test_scratch_dir_receives_the_copy(self):
         _write_checkpoint(self.root / TAG, dp=4)
         scratch = self.root / "scratch"
         engine = _FakeEngine(dp=1)
         uc.load_checkpoint_with_dp_resize(engine, str(self.root), TAG, scratch_dir=str(scratch))
-        self.assertEqual(self.converted[0][1], str(scratch / (TAG + uc.UNIVERSAL_TAG_SUFFIX)))
+        self.assertEqual(Path(self.converted[0][1]).parent, scratch)
         self.assertEqual(list(scratch.iterdir()), [])
+
+    def test_a_failed_load_still_removes_the_copy(self):
+        _write_checkpoint(self.root / TAG, dp=4)
+        engine = _FakeEngine(dp=2)
+
+        def failing_load(load_dir, tag=None, **kwargs):
+            raise OSError("unreadable universal file")
+
+        engine.load_checkpoint = failing_load
+        with self.assertRaisesRegex(OSError, "unreadable universal file"):
+            uc.load_checkpoint_with_dp_resize(engine, str(self.root))
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), [TAG, "latest"])
+
+    def test_a_failed_conversion_removes_its_partial_copy(self):
+        _write_checkpoint(self.root / TAG, dp=4)
+
+        def failing_convert(src, out):
+            Path(out).mkdir(parents=True)
+            raise RuntimeError("ds_to_universal failed")
+
+        uc.convert_to_universal = failing_convert
+        engine = _FakeEngine(dp=2)
+        with self.assertRaisesRegex(RuntimeError, "ds_to_universal failed"):
+            uc.load_checkpoint_with_dp_resize(engine, str(self.root))
+        self.assertEqual(engine.loads, [])
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), [TAG, "latest"])
+
+    def test_ranks_wait_for_a_conversion_longer_than_the_default_timeout(self):
+        import torch.multiprocessing as mp
+
+        _write_checkpoint(self.root / TAG, dp=4)
+        mp.spawn(_slow_conversion_worker, args=(2, (self.root / "rendezvous").as_uri(), str(self.root)), nprocs=2)
 
     def test_expert_parallel_engine_is_refused_before_converting(self):
         _write_checkpoint(self.root / TAG, dp=4)

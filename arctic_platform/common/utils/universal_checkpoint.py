@@ -41,10 +41,12 @@ import socket
 import subprocess
 import sys
 import time
+import uuid
 from collections.abc import Iterable
 from collections.abc import Iterator
 from collections.abc import Mapping
 from collections.abc import Sequence
+from datetime import timedelta
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -52,6 +54,9 @@ logger = logging.getLogger(__name__)
 UNIVERSAL_TAG_SUFFIX = "_universal"
 # First DeepSpeed release that records and loads Ulysses sequence-parallel checkpoints as TP=1.
 SEQUENCE_PARALLEL_MIN_DEEPSPEED = "0.20.2"
+# How long the other ranks wait for one rank's ds_to_universal. It reads and rewrites the whole checkpoint, which on
+# shared storage outlasts DeepSpeed's default process-group timeout.
+DEFAULT_CONVERSION_TIMEOUT_S = 4 * 3600
 
 _MODEL_STATES = "mp_rank_00_model_states.pt"
 _OPTIM_SHARD_RE = re.compile(r"(?:^|/)(?:bf16_)?zero_pp_rank_(\d+)_mp_rank_\d+_optim_states\.pt$")
@@ -332,26 +337,36 @@ def _from_rank0(value):
     return shared[0]
 
 
-def _gather(value) -> list:
+def _gather(value, group=None) -> list:
     import torch.distributed as dist
 
     if not dist.is_initialized():
         return [value]
-    gathered = [None] * dist.get_world_size()
-    dist.all_gather_object(gathered, value)
+    gathered = [None] * dist.get_world_size(group)
+    dist.all_gather_object(gathered, value, group=group)
     return gathered
 
 
-def _barrier() -> None:
+@contextlib.contextmanager
+def _wait_group(timeout_s: float) -> Iterator[Any]:
+    """A gloo group over every rank whose collectives time out after ``timeout_s``. Collective."""
     import torch.distributed as dist
 
-    if dist.is_initialized():
-        dist.barrier()
+    if not dist.is_initialized():
+        yield None
+        return
+    group = dist.new_group(backend="gloo", timeout=timedelta(seconds=timeout_s))
+    try:
+        yield group
+    finally:
+        dist.destroy_process_group(group)
 
 
-def _raise_if_any_failed(error: BaseException | None, what: str) -> None:
+def _raise_if_any_failed(error: BaseException | None, what: str, group=None) -> None:
     """Collective: re-raise this rank's ``error``, or tell ranks that succeeded which ranks failed."""
-    failed = [rank for rank, err in enumerate(_gather(None if error is None else repr(error))) if err is not None]
+    failed = [
+        rank for rank, err in enumerate(_gather(None if error is None else repr(error), group)) if err is not None
+    ]
     if error is not None:
         raise error
     if failed:
@@ -397,15 +412,23 @@ def is_universal_converter(engine) -> bool:
 
 
 def load_checkpoint_with_dp_resize(
-    engine, load_dir: str, tag: str | None = None, *, scratch_dir: str | None = None, **load_kwargs
+    engine,
+    load_dir: str,
+    tag: str | None = None,
+    *,
+    scratch_dir: str | None = None,
+    conversion_timeout_s: float = DEFAULT_CONVERSION_TIMEOUT_S,
+    **load_kwargs,
 ):
     """``engine.load_checkpoint`` that also loads a ZeRO-1/2 checkpoint saved at another DP size. Collective.
 
     At the saved DP size this is a plain ``engine.load_checkpoint``. Otherwise the tag is converted into
-    ``scratch_dir`` (default ``load_dir``) as ``<tag>_universal``, every rank loads that copy universally, and the
-    copy is removed. The copy is written by rank 0, or by one rank per node under DeepSpeed's
+    ``scratch_dir`` (default ``load_dir``) as ``<tag>_universal_<id>``, a name unique to this load so that jobs
+    resizing the same checkpoint do not share a copy; every rank loads it universally, and it is removed, also when
+    the conversion or any rank's load fails. The copy is written by rank 0, or by one rank per node under DeepSpeed's
     ``checkpoint.use_node_local_storage`` (see ``is_universal_converter``), and that rank needs every DP rank's
-    optimizer shard under ``load_dir/tag``. Returns what ``engine.load_checkpoint`` returns.
+    optimizer shard under ``load_dir/tag``. The other ranks wait up to ``conversion_timeout_s`` for it. Returns what
+    ``engine.load_checkpoint`` returns.
     """
     source = resize_source_tag(load_dir, tag, dp_size=engine.seq_dp_world_size)
     if source is None:
@@ -417,28 +440,38 @@ def load_checkpoint_with_dp_resize(
             "locate; pass each EP rank's expert file to convert_to_universal(expert_shards=...) instead"
         )
     out_root = scratch_dir or load_dir
-    out_tag = source + UNIVERSAL_TAG_SUFFIX
+    out_tag = f"{source}{UNIVERSAL_TAG_SUFFIX}_{_from_rank0(uuid.uuid4().hex[:8])}"
     converter = is_universal_converter(engine)
-    error = None
-    if converter:
+    try:
+        # Created before converting: joining a new group is bounded by the default timeout, not ``conversion_timeout_s``.
+        with _wait_group(conversion_timeout_s) as group:
+            error = None
+            if converter:
+                try:
+                    src = os.path.join(load_dir, source)
+                    saved = require_complete_checkpoint(src)
+                    logger.info(
+                        "resizing %s from DP %d to DP %d via %s", src, saved, engine.seq_dp_world_size, out_tag
+                    )
+                    convert_to_universal(src, os.path.join(out_root, out_tag))
+                except Exception as exc:
+                    error = exc
+            _raise_if_any_failed(error, "universal checkpoint conversion", group)
+        result = error = None
         try:
-            src = os.path.join(load_dir, source)
-            saved = require_complete_checkpoint(src)
-            logger.info("resizing %s from DP %d to DP %d via %s", src, saved, engine.seq_dp_world_size, out_tag)
-            convert_to_universal(src, os.path.join(out_root, out_tag))
+            with universal_load(engine):
+                result = engine.load_checkpoint(out_root, out_tag, **load_kwargs)
         except Exception as exc:
             error = exc
-    _raise_if_any_failed(error, "universal checkpoint conversion")
-    with universal_load(engine):
-        result = engine.load_checkpoint(out_root, out_tag, **load_kwargs)
-    _barrier()
-    if converter:
-        shutil.rmtree(os.path.join(out_root, out_tag), ignore_errors=True)
-        # ds_to_universal also points ``latest_universal`` at the copy it wrote.
-        marker = os.path.join(out_root, "latest_universal")
-        with contextlib.suppress(OSError):
-            with open(marker, encoding="utf-8") as f:
-                stale = f.read().strip() == out_tag
-            if stale:
-                os.remove(marker)
-    return result
+        _raise_if_any_failed(error, "universal checkpoint load")
+        return result
+    finally:
+        if converter:
+            shutil.rmtree(os.path.join(out_root, out_tag), ignore_errors=True)
+            # ds_to_universal also points ``latest_universal`` at the copy it wrote.
+            marker = os.path.join(out_root, "latest_universal")
+            with contextlib.suppress(OSError):
+                with open(marker, encoding="utf-8") as f:
+                    stale = f.read().strip() == out_tag
+                if stale:
+                    os.remove(marker)
