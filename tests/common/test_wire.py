@@ -58,3 +58,39 @@ def test_force_chunk_empty_frame_emits_one_chunk():
 
     assert len(chunks) == 1
     assert wire.decode_byte_chunks(chunks, kind="request") == b""
+
+
+def test_read_frame_index_reads_the_header_alone():
+    frame = wire.dumps({"ids": torch.arange(6, dtype=torch.int32).view(2, 3), "note": "x", "rows": [torch.ones(4)]})
+    index, tree = wire.read_frame_index(frame)
+    assert index["ids"]["dtype"] == "I32" and index["ids"]["shape"] == [2, 3]
+    assert index["rows.0"]["shape"] == [4]
+    assert tree[0] == "d" and dict(tree[1])["note"] == ["j", "x"]
+    header_end = 8 + int.from_bytes(frame[:8], "little")
+    start, end = index["ids"]["data_offsets"]
+    assert torch.frombuffer(bytearray(frame[header_end + start : header_end + end]), dtype=torch.int32).tolist() == [
+        0, 1, 2, 3, 4, 5,
+    ]
+    # Only the header has to be there, and a memoryview is read without copying the frame.
+    assert wire.read_frame_index(memoryview(frame)[:header_end]) == (index, tree)
+
+
+def test_read_frame_index_has_no_placeholder_for_a_tensorless_frame():
+    index, tree = wire.read_frame_index(wire.dumps({"a": 1}))
+    assert index == {} and tree == ["j", {"a": 1}]
+
+
+@pytest.mark.parametrize(
+    "data",
+    [b"", b"short", b"\x08\x00\x00\x00\x00\x00\x00\x00{not json", b"\xff" * 8 + b"{}", 3],
+    ids=["empty", "short", "bad-json", "huge-length", "not-bytes"],
+)
+def test_read_frame_index_is_none_for_what_is_not_a_whole_header(data):
+    assert wire.read_frame_index(data) is None
+    frame = wire.dumps({"x": torch.ones(2)})
+    assert wire.read_frame_index(frame[: 8 + int.from_bytes(frame[:8], "little") - 1]) is None
+
+
+def test_public_size_constants_match_the_private_ones():
+    assert wire.MAX_HEADER_BYTES == wire._MAX_HEADER_BYTES
+    assert wire.DEFAULT_CHUNK_OVERHEAD_BYTES == wire._DEFAULT_CHUNK_OVERHEAD_BYTES

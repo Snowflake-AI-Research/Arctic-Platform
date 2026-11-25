@@ -61,6 +61,10 @@ _ROOT_KEY = "__root__"
 _MAX_HEADER_BYTES = 64 * 1024 * 1024
 _CHUNK_PAYLOAD_KEY = "payload"
 _DEFAULT_CHUNK_OVERHEAD_BYTES = 8192
+# Public: the largest frame header this module reads, and what ``encode_byte_chunks`` budgets per chunk frame
+# around its payload slice. A service that bounds requests before decoding them sizes its limits from these.
+MAX_HEADER_BYTES = _MAX_HEADER_BYTES
+DEFAULT_CHUNK_OVERHEAD_BYTES = _DEFAULT_CHUNK_OVERHEAD_BYTES
 
 _PICKLE_SIGNATURES = (b"\x80\x02", b"\x80\x03", b"\x80\x04", b"\x80\x05")
 _ZIP_SIGNATURE = b"PK\x03\x04"
@@ -229,6 +233,31 @@ def read_metadata(data: Any) -> dict:
     except (WireError, ValueError):
         return {}
     return json.loads(raw) if raw else {}
+
+
+def read_frame_index(data: Any) -> tuple[dict, Any] | None:
+    """A frame's tensor index and structure tree, read from its header alone; None if *data* holds none whole.
+
+    The index maps each tensor key to its safetensors entry (``dtype``, ``shape``, ``data_offsets``, relative to
+    the end of the header, which is ``8 + header length`` bytes in); the tree is the frame's structure, its tensor
+    leaves ``["t", key, ...]`` (see :func:`dumps`). No tensor is loaded and only the header bytes are copied, so a
+    caller can screen a large frame, or the opening slice of one, cheaply. Like :func:`read_metadata` this is a
+    lenient peek: anything not a whole DSSST1 header gives None, and :func:`loads` stays the authoritative decode.
+    """
+    if not isinstance(data, (bytes, bytearray, memoryview)) or len(data) < 8:
+        return None
+    header_len = int.from_bytes(bytes(data[:8]), "little")
+    if header_len <= 0 or header_len > _MAX_HEADER_BYTES or 8 + header_len > len(data):
+        return None
+    try:
+        header = json.loads(bytes(data[8 : 8 + header_len]).decode("utf-8"))
+        info = json.loads(header["__metadata__"][_STRUCT_KEY])
+    except (UnicodeDecodeError, ValueError, KeyError, TypeError):
+        return None
+    if not isinstance(info, dict) or info.get("v") != WIRE_FORMAT_VERSION or "tree" not in info:
+        return None
+    index = {key: entry for key, entry in header.items() if key != "__metadata__" and key != _PLACEHOLDER_KEY}
+    return index, info["tree"]
 
 
 # ---------------------------------------------------------------------------
