@@ -1610,13 +1610,14 @@ class InferenceWorker(StreamingWorkerMixin):
             mm_config = model_config.multimodal_config
             if mm_config is None:
                 raise ValueError(f"Model {model_config.model} does not take multi_modal_data")
-            # Decoding is CPU work: keep it off the event loop.
-            effective_prompt = await asyncio.to_thread(
-                decode_media, effective_prompt, mm_config.media_io_kwargs
-            )
-            media_hashes = _media_hashes(
-                effective_prompt, model_config, self.llm.renderer, request_id
-            )
+            renderer = self.llm.renderer
+
+            def decode_and_hash(raw: dict) -> tuple[dict, dict[str, list[str]]]:
+                decoded = decode_media(raw, mm_config.media_io_kwargs)
+                return decoded, _media_hashes(decoded, model_config, renderer, request_id)
+
+            # Decoding and hashing are CPU work over every media byte: one thread hop, off the event loop.
+            effective_prompt, media_hashes = await asyncio.to_thread(decode_and_hash, effective_prompt)
             prompt_input: Any = TokensPrompt(**effective_prompt)
         elif isinstance(effective_prompt, list):
             prompt_input = {"prompt_token_ids": effective_prompt}

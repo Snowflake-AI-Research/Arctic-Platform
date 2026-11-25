@@ -1581,3 +1581,32 @@ def test_a_decoder_failure_bad_bytes_do_not_explain_is_not_the_callers(fake_load
     assert not isinstance(caught.value, ValueError)
     assert str(caught.value) == f"image 0: the decoder failed ({cls.__name__})"
     assert caught.value.__cause__ is None and caught.value.__context__ is None
+
+
+def test_media_is_decoded_and_hashed_off_the_event_loop(fake_loaders, monkeypatch):
+    import threading
+
+    threads = {}
+    decode, hashes = worker_module.decode_media, worker_module._media_hashes
+
+    def recording_decode(*args, **kwargs):
+        threads["decode"] = threading.get_ident()
+        return decode(*args, **kwargs)
+
+    def recording_hashes(*args, **kwargs):
+        threads["hash"] = threading.get_ident()
+        return hashes(*args, **kwargs)
+
+    monkeypatch.setattr(worker_module, "decode_media", recording_decode)
+    monkeypatch.setattr(worker_module, "_media_hashes", recording_hashes)
+    loop_thread = []
+
+    async def run():
+        loop_thread.append(threading.get_ident())
+        worker = _new_worker()
+        worker.llm = _FakeEngine()
+        return await worker.generate(_media_prompt(multi_modal_data={"image": [PNG]}), {"max_tokens": 1})
+
+    result = asyncio.run(run())
+    assert result["mm_hashes"].keys() == {"image"}
+    assert threads["decode"] == threads["hash"] != loop_thread[0]
