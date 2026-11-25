@@ -339,8 +339,9 @@ def test_all_linear_lora_skips_the_vision_tower():
 TEXT_ONLY_INPUT_IDS = torch.tensor([[2, 3, 4, 5, 6, 7]])
 
 
-def test_text_only_microbatch_still_touches_a_trainable_vision_tower():
+def test_text_only_microbatch_of_a_media_job_still_touches_a_trainable_vision_tower():
     model = _model().train()
+    model.model.media_job = True
     input_ids = TEXT_ONLY_INPUT_IDS
 
     model(input_ids=input_ids).logits.float().square().mean().backward()
@@ -358,6 +359,7 @@ def _count_vision_forwards(model):
 
 def test_dummy_vision_forward_leaves_text_only_logits_and_language_grads_bitwise_unchanged():
     model = _model().train()
+    model.model.media_job = True
     reference = _model().train()
     reference.model.visual.requires_grad_(False)
     calls, _ = _count_vision_forwards(model)
@@ -377,8 +379,20 @@ def test_dummy_vision_forward_leaves_text_only_logits_and_language_grads_bitwise
             torch_assert_equal(language_grads[name].grad, parameter.grad, msg=name)
 
 
+def test_a_job_that_takes_no_media_skips_the_dummy_forward():
+    """Not a media job (the default): text-only training is as before media, the vision tower out of backward."""
+    model = _model().train()
+    calls, _ = _count_vision_forwards(model)
+
+    model(input_ids=TEXT_ONLY_INPUT_IDS).logits.float().square().mean().backward()
+
+    assert calls == []
+    assert all(parameter.grad is None for parameter in model.model.visual.parameters())
+
+
 def test_frozen_vision_tower_skips_the_dummy_forward():
     model = _model().train()
+    model.model.media_job = True
     model.model.visual.requires_grad_(False)
     calls, _ = _count_vision_forwards(model)
 
@@ -390,6 +404,7 @@ def test_frozen_vision_tower_skips_the_dummy_forward():
 
 def test_no_grad_and_eval_skip_the_dummy_forward():
     model = _model().train()
+    model.model.media_job = True
     calls, _ = _count_vision_forwards(model)
 
     with torch.no_grad():

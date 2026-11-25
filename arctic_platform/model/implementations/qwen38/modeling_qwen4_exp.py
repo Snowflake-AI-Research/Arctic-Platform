@@ -363,6 +363,11 @@ class Qwen4ExpTextDecoderLayerPrimeRL(Qwen4ExpTextDecoderLayer):
 
 
 class Qwen4ExpModelPrimeRL(Qwen4ExpModel):
+    # Whether this model trains in a job that takes media. Set per call by run_pipeline from ``meta["media_job"]``,
+    # which the caller sends alike on every rank of such a job. Only then does a text-only microbatch run the dummy
+    # vision forward; a text-only job keeps the vision tower out of backward, as before media.
+    media_job: bool = False
+
     def forward(self, input_ids=None, attention_mask=None, position_ids=None, *args, **kwargs):
         if position_ids is not None:
             kwargs["ple_position_ids"] = position_ids if position_ids.ndim == 2 else position_ids[0]
@@ -386,7 +391,7 @@ class Qwen4ExpModelPrimeRL(Qwen4ExpModel):
             handle.remove()
 
     def _needs_dummy_vision_forward(self, kwargs) -> bool:
-        if not (self.training and torch.is_grad_enabled()):
+        if not (self.media_job and self.training and torch.is_grad_enabled()):
             return False
         if kwargs.get("pixel_values") is not None or kwargs.get("pixel_values_videos") is not None:
             return False

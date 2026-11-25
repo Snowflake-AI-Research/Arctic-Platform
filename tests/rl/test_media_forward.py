@@ -661,3 +661,25 @@ def test_prepacked_window_with_no_image_drops_the_empty_image_leaves(model):
         handle.remove()
     (call,) = calls
     assert "pixel_values" not in call and "image_grid_thw" not in call
+
+
+@pytest.mark.parametrize("media_job", [True, False])
+def test_run_pipeline_sets_media_job_from_meta(model, media_job):
+    """The job's media flag reaches the model on every call: on in a media job, off (main's behaviour) otherwise."""
+    trainable = _model().train()
+    trainable.model.media_job = not media_job  # a stale value from an earlier call is overwritten
+    batch = _padded_batch([dict(tokens=list(range(10, 20)))])
+    meta = {"pad_token_id": PAD_TOKEN_ID, **({"media_job": True} if media_job else {})}
+    run_pipeline(
+        trainable,
+        (),
+        batch,
+        meta,
+        {"post": [], "loss_fn": None},
+        "cpu",
+        backward=False,
+        pack=False,
+        max_tokens_per_mb=10240,
+        return_tensors=True,
+    )
+    assert trainable.model.media_job is media_job

@@ -150,6 +150,7 @@ def _identity_language_model(model):
 def test_dummy_vision_forward_gives_zero_vision_grads_under_cp(monkeypatch, world_size, rank):
     model, group = _cp_model(monkeypatch, world_size)
     model.train()
+    model.model.media_job = True
     group.rank = rank
     _identity_language_model(model)
     calls, _ = _count_vision_forwards(model)

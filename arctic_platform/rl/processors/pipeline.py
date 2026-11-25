@@ -239,6 +239,24 @@ def _has_media(media: dict) -> bool:
     return any(media.get(kind.values_key) is not None for kind in MEDIA_KINDS)
 
 
+def set_media_job(engine, media_job: bool) -> None:
+    """Tell the engine's modules whether they train in a job that takes media.
+
+    ``run_pipeline`` calls it on every call from ``meta["media_job"]``; a caller that drives the engine directly (an
+    SFT step, say) calls it itself, with the same value on every rank.
+
+    A model with a ``media_job`` attribute (qwen4_exp) runs its dummy vision forward on text-only microbatches only
+    in such a job, which keeps ZeRO's gradient buckets in step across ranks whose microbatches differ in media. The
+    flag is the job's, not the call's, so the caller sends the same value on every rank.
+    """
+    model = getattr(engine, "module", engine)
+    if not isinstance(model, torch.nn.Module):
+        return  # an engine stand-in with no modules holds no flag
+    for module in model.modules():
+        if hasattr(module, "media_job"):
+            module.media_job = media_job
+
+
 def _check_prepacked_media(engine, batch: dict) -> dict:
     """*batch* for an already-packed call (``cu_seqlens`` on meta), refusing media run_pipeline cannot vouch for.
 
@@ -670,6 +688,7 @@ def run_pipeline(
                 meta = {**meta, "calculate_entropy": False}
 
     # --- forward ---
+    set_media_job(engine, bool(meta.get("media_job")))
     pack_with_unpad = True  # XXX: make configurable?
     unpadded_media_rows = False
     already_packed = "cu_seqlens" in meta

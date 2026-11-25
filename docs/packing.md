@@ -77,6 +77,8 @@ The Qwen-VL entry is registered for `qwen4_exp` only: its Arctic modeling takes 
 
 ### Media under context parallelism
 
+In a job that takes media, a caller sends `meta["media_job"]` on every `run_pipeline` call of every rank (or calls `set_media_job(engine, True)` itself when it drives the engine directly): only then does qwen4_exp run its dummy vision forward on a text-only microbatch, which keeps ZeRO's gradient buckets in step across ranks whose microbatches differ in media. A job that sends nothing trains text-only as before.
+
 A media call is sharded for CP by window: `token_shard` gives each rank its window with the whole media items in it, and refuses an item that straddles windows. A caller's data plane does the windowing; `run_pipeline` forwards a windowed call as it comes, and the Qwen3.8 CP wrapper (`qwen38/context_parallel.py`) runs it as it does a text-only call.
 
 ## Cost

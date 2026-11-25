@@ -109,6 +109,7 @@ from .pipeline import metric_is_summed
 from .pipeline import register_loss_fn
 from .pipeline import register_post_processor
 from .pipeline import run_pipeline
+from .pipeline import set_media_job
 
 # SFT loss + pipeline (importing registers "sft" / "sft_ce" into LOSS_FNS)
 from .sft import LOGIT_LOSS_FNS
@@ -151,6 +152,7 @@ __all__ = [
     "register_loss_fn",
     "_resolve_fn",
     "run_pipeline",
+    "set_media_job",
     "identity_post",
     "compute_entropy_and_logprobs_post",
     "compute_logprobs_post",
