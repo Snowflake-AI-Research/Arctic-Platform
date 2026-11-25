@@ -423,9 +423,9 @@ def test_text_only_adapters_unchanged_by_vision_policy(exclude_modules):
 
 
 class _TinyVLM(nn.Module):
-    def __init__(self):
+    def __init__(self, model_type="qwen4_exp"):
         super().__init__()
-        self.config = SimpleNamespace(model_type="qwen3_vl")
+        self.config = SimpleNamespace(model_type=model_type)
         self.model = nn.Module()
         self.model.visual = nn.Module()
         self.model.visual.proj = nn.Linear(4, 4)
@@ -461,3 +461,15 @@ def test_vision_policy_covers_target_parameters():
 
     with pytest.raises(ValueError, match="only match the frozen vision tower"):
         apply_peft(_TinyVLM(), {**config, "target_parameters": ["visual.proj.weight"]})
+
+
+def test_a_vision_model_with_no_media_spec_keeps_adapters_on_its_tower():
+    """The policy follows the media spec: a VLM this repo does not train on media keeps main's PEFT behaviour."""
+    config = {"peft_type": "LORA", "r": 2, "target_modules": ["proj", "down"]}
+    model = apply_peft(_TinyVLM(model_type="qwen3_vl"), config)
+
+    adapted = {name.split(".lora_")[0].removeprefix("base_model.model.") for name in _adapter_names(model)}
+    assert adapted == {
+        "model.visual.proj", "model.visual.down", "model.language_model.proj", "model.language_model.down",
+    }
+    assert model.peft_config["default"].exclude_modules is None

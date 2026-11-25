@@ -140,12 +140,20 @@ def _resolve_peft_config_class(peft_module: Any, peft_config: dict[str, Any]) ->
 def exclude_vision_encoder(model: nn.Module, peft_config: dict[str, Any]) -> dict[str, Any]:
     """Return ``peft_config`` with the vision encoder's modules added to PEFT's ``exclude_modules``.
 
-    Adapters train the language model only; the vision tower stays frozen whatever the targets. Text-only models
-    get ``peft_config`` back unchanged. PEFT matches a string ``exclude_modules`` as a full-name regex and a list by
-    name suffix, so a caller's exclusion is folded into one regex alongside the vision prefix. PEFT does not apply
+    For a model type with a media spec (``common.packing.media_spec``, the models this repo trains on images and
+    video), adapters train the language model only; the vision tower stays frozen whatever the targets. Text-only
+    models, and vision models with no media spec, get ``peft_config`` back unchanged, as before media specs.
+
+    PEFT matches a string ``exclude_modules`` as a full-name regex and a list by name suffix, so a caller's
+    exclusion is folded into one regex alongside the vision prefix. PEFT does not apply
     ``exclude_modules`` to ``target_parameters``, so a suffix that also matches vision parameters is replaced by the
     full names of its language-model matches.
     """
+    from arctic_platform.common.packing.media_spec import media_spec_for
+
+    model_type = getattr(getattr(model, "config", None), "model_type", None)
+    if media_spec_for(model_type or "") is None:
+        return peft_config
     vision = get_vision_encoder(model)
     if vision is None:
         return peft_config
@@ -188,7 +196,8 @@ def apply_peft(
     ``peft_type`` accepts PEFT's canonical registry names (e.g. ``LORA``) and
     legacy config-class names (e.g. ``Lora``). FP8 bases disable PEFT's adapter autocast and cast all trainable
     tensors to ``optimization_dtype`` (default bf16) before optimizer flat buffers are built.
-    A model with a vision encoder gets no adapters on it, whatever the targets (see ``exclude_vision_encoder``).
+    A model with a media spec gets no adapters on its vision encoder, whatever the targets (see
+    ``exclude_vision_encoder``).
     Expert integration is installed by the registered patch after PEFT wraps the
     fully transformed model.
     """
