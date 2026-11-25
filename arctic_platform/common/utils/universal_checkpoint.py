@@ -24,6 +24,10 @@ restores the fp32 master weights exactly, and the Adam moments and LR scheduler 
 ``load_checkpoint_with_dp_resize`` is the collective entry point for a training worker. The other helpers are its
 building blocks, for callers that choose where the converted copy goes and which ranks convert it. Torch and
 DeepSpeed are imported lazily.
+
+Expert-parallel checkpoints convert through DeepSpeed's AutoEP support when the caller saved each EP rank's experts
+as a ``{name: tensor}`` file: ``convert_to_universal(..., expert_shards=...)`` lays the checkpoint out as AutoEP saves
+it. The universal load then gives each EP rank its contiguous block of experts, so the EP size must not change.
 """
 
 from __future__ import annotations
@@ -40,6 +44,8 @@ import time
 import uuid
 from collections.abc import Iterable
 from collections.abc import Iterator
+from collections.abc import Mapping
+from collections.abc import Sequence
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -51,6 +57,10 @@ SEQUENCE_PARALLEL_MIN_DEEPSPEED = "0.20.2"
 _MODEL_STATES = "mp_rank_00_model_states.pt"
 _OPTIM_SHARD_RE = re.compile(r"(?:^|/)(?:bf16_)?zero_pp_rank_(\d+)_mp_rank_\d+_optim_states\.pt$")
 _OUTPUT_TAIL_CHARS = 4000
+# The fused expert weights DeepSpeed's AutoEP conversion consolidates: [local experts, ...] blocks along dim 0.
+_EXPERT_WEIGHT_RE = re.compile(r"^(.+\.experts)\.(w[123])$")
+_EXPERT_WEIGHTS = ("w1", "w2", "w3")
+_AUTOEP_INPUT_SUFFIX = ".autoep-input"
 
 
 def optimizer_shard_ranks(names: Iterable[str]) -> set[int]:
@@ -118,21 +128,146 @@ def require_complete_checkpoint(tag_dir: str) -> int:
     return saved
 
 
-def convert_to_universal(src_tag_dir: str, out_tag_dir: str) -> None:
+def autoep_layers_metadata(
+    param_shapes: Mapping[str, Sequence[int]], expert_names: Iterable[str], ep_size: int
+) -> list[dict]:
+    """DeepSpeed AutoEP layer metadata for expert weights split over ``ep_size`` ranks along dim 0.
+
+    ``param_shapes`` maps each trainable parameter to its shape on one rank, as a checkpoint's ``param_shapes`` do, and
+    ``expert_names`` names the expert-parallel parameters. Each must be a trainable ``<prefix>.experts.w1``, ``w2`` or
+    ``w3`` holding the rank's contiguous block of experts, the only layout ``ds_to_universal`` consolidates.
+    """
+    from deepspeed.checkpoint.constants import AUTOEP_EP_SIZE
+    from deepspeed.checkpoint.constants import AUTOEP_EXPERT_KEY_PREFIX
+    from deepspeed.checkpoint.constants import AUTOEP_NUM_EXPERTS
+    from deepspeed.checkpoint.constants import AUTOEP_NUM_LOCAL_EXPERTS
+
+    layers: dict[str, dict[str, tuple[int, ...]]] = {}
+    for name in expert_names:
+        match = _EXPERT_WEIGHT_RE.match(name)
+        if match is None:
+            raise ValueError(
+                f"expert-parallel parameter {name!r} is not an experts.w1/w2/w3 weight; ds_to_universal cannot "
+                "consolidate it"
+            )
+        if name not in param_shapes:
+            raise ValueError(
+                f"expert-parallel parameter {name!r} has no optimizer state; frozen expert weights cannot be "
+                "converted to a universal checkpoint"
+            )
+        layers.setdefault(match.group(1), {})[match.group(2)] = tuple(param_shapes[name])
+    if not layers:
+        raise ValueError("no expert-parallel parameters to describe")
+    metadata = []
+    for layer_id, prefix in enumerate(sorted(layers)):
+        shapes = layers[prefix]
+        if sorted(shapes) != list(_EXPERT_WEIGHTS):
+            raise ValueError(f"{prefix} has expert weights {sorted(shapes)}, expected {list(_EXPERT_WEIGHTS)}")
+        local = {shape[0] for shape in shapes.values()}
+        if len(local) != 1:
+            raise ValueError(f"{prefix} expert weights disagree on the local expert count: {shapes}")
+        num_local = local.pop()
+        metadata.append(
+            {
+                "moe_layer_id": layer_id,
+                AUTOEP_EXPERT_KEY_PREFIX: prefix,
+                AUTOEP_NUM_EXPERTS: num_local * ep_size,
+                AUTOEP_NUM_LOCAL_EXPERTS: num_local,
+                AUTOEP_EP_SIZE: ep_size,
+            }
+        )
+    return metadata
+
+
+def stage_autoep_input(src_tag_dir: str, staging_dir: str, expert_shards: Sequence[str]) -> list[dict]:
+    """Lay out ``src_tag_dir`` in ``staging_dir`` as DeepSpeed's AutoEP saves a ZeRO-1/2 checkpoint.
+
+    ``expert_shards[r]`` is a ``{name: tensor}`` file with expert-parallel rank ``r``'s experts, which the
+    checkpoint's own model states hold only for rank 0. ``staging_dir`` gets links to the source files, a copy of the
+    model states carrying ``ds_autoep_layers``, and one file per (layer, expert). Returns the layer metadata.
+    """
+    import torch
+    from deepspeed.checkpoint.constants import AUTOEP_EXPERT_KEY_PREFIX
+    from deepspeed.checkpoint.constants import AUTOEP_LAYERS_KEY
+    from deepspeed.checkpoint.constants import AUTOEP_NUM_EXPERTS
+    from deepspeed.checkpoint.constants import AUTOEP_NUM_LOCAL_EXPERTS
+    from deepspeed.checkpoint.constants import PARAM_SHAPES
+
+    state = _saved_model_state(src_tag_dir)
+    if state is None:
+        raise RuntimeError(f"no {_MODEL_STATES} under {src_tag_dir!r}")
+    if _has_model_parallelism(state):
+        raise RuntimeError(f"{src_tag_dir!r} has tensor or pipeline parallelism; AutoEP conversion needs neither")
+    param_shapes = {name: shape for group in state[PARAM_SHAPES] for name, shape in group.items()}
+    shards = [torch.load(path, map_location="cpu", mmap=True, weights_only=True) for path in expert_shards]
+    if not shards:
+        raise ValueError("expert_shards is empty")
+    names = set(shards[0])
+    for rank, shard in enumerate(shards):
+        if set(shard) != names:
+            raise RuntimeError(
+                f"expert shard {expert_shards[rank]!r} holds {sorted(set(shard) ^ names)} unlike rank 0's shard"
+            )
+    layers = autoep_layers_metadata(param_shapes, names, len(shards))
+
+    os.makedirs(staging_dir)
+    with os.scandir(src_tag_dir) as entries:
+        for entry in entries:
+            if entry.name != _MODEL_STATES:
+                os.symlink(os.path.abspath(entry.path), os.path.join(staging_dir, entry.name))
+    state[AUTOEP_LAYERS_KEY] = layers
+    torch.save(state, os.path.join(staging_dir, _MODEL_STATES))
+    del state
+    for layer in layers:
+        prefix, num_local = layer[AUTOEP_EXPERT_KEY_PREFIX], layer[AUTOEP_NUM_LOCAL_EXPERTS]
+        for weight in _EXPERT_WEIGHTS:
+            for rank, shard in enumerate(shards):
+                rows = shard[f"{prefix}.{weight}"].shape[0]
+                if rows != num_local:
+                    raise RuntimeError(
+                        f"{expert_shards[rank]!r} holds {rows} experts of {prefix}.{weight}, expected {num_local}"
+                    )
+        for expert in range(layer[AUTOEP_NUM_EXPERTS]):
+            rank, local = divmod(expert, num_local)
+            # clone: saving a view would write the whole shard's storage into every expert file.
+            tensors = {
+                f"{prefix}.{weight}.{expert}": shards[rank][f"{prefix}.{weight}"][local].clone()
+                for weight in _EXPERT_WEIGHTS
+            }
+            name = f"layer_{layer['moe_layer_id']}_expert_{expert}_mp_rank_00_model_states.pt"
+            torch.save(tensors, os.path.join(staging_dir, name))
+    return layers
+
+
+def convert_to_universal(src_tag_dir: str, out_tag_dir: str, *, expert_shards: Sequence[str] | None = None) -> None:
     """Convert one checkpoint tag with ``ds_to_universal`` into ``out_tag_dir``, replacing anything there.
 
     Runs in a subprocess: the converter forks worker processes, which a process holding CUDA and NCCL state must not.
     A checkpoint without TP or PP needs no client merge patterns, so the converter may add the version-only
-    ``universal_checkpoint_info`` that older DeepSpeed releases do not write.
+    ``universal_checkpoint_info`` that older DeepSpeed releases do not write. ``expert_shards`` lists each EP rank's
+    ``{name: tensor}`` expert file, in EP rank order, for a checkpoint with expert parallelism (see
+    ``stage_autoep_input``); the staged input is removed afterwards.
     """
-    cmd = [sys.executable, "-m", "deepspeed.checkpoint.ds_to_universal"]
-    cmd += ["--input_folder", src_tag_dir, "--output_folder", out_tag_dir]
-    if not _has_model_parallelism(_saved_model_state(src_tag_dir)):
-        cmd.append("--inject_missing_state")
     shutil.rmtree(out_tag_dir, ignore_errors=True)
     os.makedirs(os.path.dirname(out_tag_dir) or ".", exist_ok=True)
-    started = time.monotonic()
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    staging = None
+    input_dir = src_tag_dir
+    if expert_shards is not None:
+        staging = out_tag_dir.rstrip("/") + _AUTOEP_INPUT_SUFFIX
+        shutil.rmtree(staging, ignore_errors=True)
+    try:
+        if staging is not None:
+            stage_autoep_input(src_tag_dir, staging, expert_shards)
+            input_dir = staging
+        cmd = [sys.executable, "-m", "deepspeed.checkpoint.ds_to_universal"]
+        cmd += ["--input_folder", input_dir, "--output_folder", out_tag_dir]
+        if not _has_model_parallelism(_saved_model_state(src_tag_dir)):
+            cmd.append("--inject_missing_state")
+        started = time.monotonic()
+        result = subprocess.run(cmd, capture_output=True, text=True)
+    finally:
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
     if result.returncode != 0:
         raise RuntimeError(
             f"ds_to_universal failed on {src_tag_dir!r} (exit {result.returncode}):\n"
@@ -141,6 +276,15 @@ def convert_to_universal(src_tag_dir: str, out_tag_dir: str) -> None:
     logger.info(
         "converted %s to universal checkpoint %s in %.1fs", src_tag_dir, out_tag_dir, time.monotonic() - started
     )
+
+
+def expert_parallel_parameter_names(module) -> list[str]:
+    """Names of ``module``'s parameters that DeepSpeed shards over an expert-parallel group."""
+    return [
+        name
+        for name, param in module.named_parameters()
+        if getattr(param, "allreduce", True) is False and getattr(param, "group_name", None)
+    ]
 
 
 @contextlib.contextmanager
@@ -283,6 +427,11 @@ def load_checkpoint_with_dp_resize(
     if source is None:
         return engine.load_checkpoint(load_dir, tag, **load_kwargs)
     require_resize_support(engine)
+    if expert_parallel_parameter_names(engine.module):
+        raise RuntimeError(
+            "load_checkpoint_with_dp_resize does not convert expert-parallel checkpoints, whose experts it cannot "
+            "locate; pass each EP rank's expert file to convert_to_universal(expert_shards=...) instead"
+        )
     out_root = scratch_dir or load_dir
     out_tag = source + UNIVERSAL_TAG_SUFFIX
     converter = converts_for_filesystem(out_root)

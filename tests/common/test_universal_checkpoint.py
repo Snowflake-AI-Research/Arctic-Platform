@@ -41,12 +41,37 @@ def _write_checkpoint(tag_dir: Path, *, dp: int, shards: list[int] | None = None
     (tag_dir.parent / "latest").write_text(tag_dir.name, encoding="utf-8")
 
 
+_EXPERTS = "layers.0.mlp.experts"
+_EXPERT_SHAPES = {"w1": (2, 3, 4), "w2": (2, 4, 3), "w3": (2, 3, 4)}
+
+
+def _expert_shard_paths(tag_dir: Path) -> list[str]:
+    return [str(tag_dir / f"experts_ep_rank_{rank:03d}.pt") for rank in range(2)]
+
+
+def _write_expert_parallel_checkpoint(tag_dir: Path) -> dict:
+    """A DP 2 x EP 2 checkpoint with two local experts per rank; returns each EP rank's expert tensors."""
+    import torch
+
+    param_shapes = [{"dense.weight": (4, 4)}, {f"{_EXPERTS}.{w}": shape for w, shape in _EXPERT_SHAPES.items()}]
+    _write_checkpoint(tag_dir, dp=2, param_shapes=param_shapes, module={"dense.weight": torch.zeros(4, 4)})
+    shards = {}
+    for rank, path in enumerate(_expert_shard_paths(tag_dir)):
+        shards[rank] = {
+            f"{_EXPERTS}.{w}": torch.arange(torch.Size(shape).numel(), dtype=torch.float32).view(shape) + 100 * rank
+            for w, shape in _EXPERT_SHAPES.items()
+        }
+        torch.save(shards[rank], path)
+    return shards
+
+
 class _FakeEngine:
     """Records each ``load_checkpoint`` call with the universal flag it saw."""
 
-    def __init__(self, dp: int, stage: int = 2, mpu=None):
+    def __init__(self, dp: int, stage: int = 2, mpu=None, params: dict | None = None):
         self.seq_dp_world_size = dp
         self.mpu = mpu
+        self.module = SimpleNamespace(named_parameters=lambda: iter((params or {}).items()))
         self._stage = stage
         self._config = SimpleNamespace(load_universal_checkpoint=False)
         self.loads: list[tuple[str, str | None, bool, dict]] = []
@@ -122,11 +147,97 @@ class TestConversion(TestCasePlus):
         with self.assertRaisesRegex(RuntimeError, r"(?s)exit 3.*AssertionError: boom"):
             uc.convert_to_universal(str(root / TAG), str(root / "out"))
 
+    def test_expert_shards_are_staged_as_autoep_input_and_removed(self):
+        root = Path(self.get_auto_remove_tmp_dir())
+        _write_expert_parallel_checkpoint(root / TAG)
+        out = root / "out" / TAG
+        staged = []
+
+        def fake_run(cmd, **kwargs):
+            input_dir = Path(cmd[cmd.index("--input_folder") + 1])
+            staged.append((input_dir, sorted(p.name for p in input_dir.iterdir())))
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        original = uc.subprocess.run
+        uc.subprocess.run = fake_run
+        self.addCleanup(setattr, uc.subprocess, "run", original)
+        uc.convert_to_universal(str(root / TAG), str(out), expert_shards=_expert_shard_paths(root / TAG))
+        ((input_dir, names),) = staged
+        self.assertEqual(input_dir, Path(str(out) + ".autoep-input"))
+        self.assertIn("layer_0_expert_3_mp_rank_00_model_states.pt", names)
+        self.assertIn("bf16_zero_pp_rank_1_mp_rank_00_optim_states.pt", names)
+        self.assertFalse(input_dir.exists())
+
     def test_universal_load_flips_the_engine_flag_for_one_load(self):
         engine = _FakeEngine(dp=2)
         with uc.universal_load(engine):
             self.assertTrue(engine._config.load_universal_checkpoint)
         self.assertFalse(engine._config.load_universal_checkpoint)
+
+
+@require_deepspeed
+class TestAutoEPStaging(TestCasePlus):
+    def test_metadata_describes_each_experts_block(self):
+        shapes = {f"layers.{i}.mlp.experts.{w}": s for i in (0, 1) for w, s in _EXPERT_SHAPES.items()}
+        layers = uc.autoep_layers_metadata({"dense.weight": (4, 4), **shapes}, list(shapes), ep_size=4)
+        self.assertEqual(
+            layers,
+            [
+                {
+                    "moe_layer_id": i,
+                    "expert_key_prefix": f"layers.{i}.mlp.experts",
+                    "num_experts": 8,
+                    "num_local_experts": 2,
+                    "ep_size": 4,
+                }
+                for i in (0, 1)
+            ],
+        )
+
+    def test_metadata_refuses_what_the_converter_cannot_consolidate(self):
+        shapes = {f"{_EXPERTS}.{w}": s for w, s in _EXPERT_SHAPES.items()}
+        engram = "layers.0.engram.embedding.weight"
+        with self.assertRaisesRegex(ValueError, "not an experts.w1/w2/w3 weight"):
+            uc.autoep_layers_metadata({**shapes, engram: (8, 4)}, [*shapes, engram], ep_size=2)
+        with self.assertRaisesRegex(ValueError, "has no optimizer state"):
+            uc.autoep_layers_metadata({}, list(shapes), ep_size=2)
+        with self.assertRaisesRegex(ValueError, r"expected \['w1', 'w2', 'w3'\]"):
+            uc.autoep_layers_metadata(shapes, list(shapes)[:2], ep_size=2)
+        uneven = {**shapes, f"{_EXPERTS}.w3": (3, 3, 4)}
+        with self.assertRaisesRegex(ValueError, "disagree on the local expert count"):
+            uc.autoep_layers_metadata(uneven, list(uneven), ep_size=2)
+
+    def test_staged_input_matches_autoep_layout(self):
+        import torch
+
+        root = Path(self.get_auto_remove_tmp_dir())
+        src = root / TAG
+        shards = _write_expert_parallel_checkpoint(src)
+        staging = root / "staging"
+        layers = uc.stage_autoep_input(str(src), str(staging), _expert_shard_paths(src))
+        state = torch.load(staging / "mp_rank_00_model_states.pt", weights_only=False)
+        self.assertEqual(state["ds_autoep_layers"], layers)
+        self.assertEqual(layers[0]["num_experts"], 4)
+        self.assertTrue(torch.equal(state["module"]["dense.weight"], torch.zeros(4, 4)))
+        for name in ("bf16_zero_pp_rank_0_mp_rank_00_optim_states.pt", "experts_ep_rank_001.pt"):
+            self.assertEqual(os.readlink(staging / name), str(src / name))
+        for expert in range(4):
+            rank, local = divmod(expert, 2)
+            saved = torch.load(staging / f"layer_0_expert_{expert}_mp_rank_00_model_states.pt", weights_only=True)
+            self.assertEqual(sorted(saved), [f"{_EXPERTS}.{w}.{expert}" for w in ("w1", "w2", "w3")])
+            for w in ("w1", "w2", "w3"):
+                tensor = saved[f"{_EXPERTS}.{w}.{expert}"]
+                self.assertTrue(torch.equal(tensor, shards[rank][f"{_EXPERTS}.{w}"][local]))
+                self.assertEqual(tensor.untyped_storage().nbytes(), tensor.numel() * tensor.element_size())
+
+    def test_shards_with_different_parameters_are_refused(self):
+        import torch
+
+        root = Path(self.get_auto_remove_tmp_dir())
+        _write_expert_parallel_checkpoint(root / TAG)
+        torch.save({f"{_EXPERTS}.w1": torch.zeros(2, 3, 4)}, _expert_shard_paths(root / TAG)[1])
+        with self.assertRaisesRegex(RuntimeError, r"holds \['layers.0.mlp.experts.w2'"):
+            uc.stage_autoep_input(str(root / TAG), str(root / "staging"), _expert_shard_paths(root / TAG))
 
 
 @require_deepspeed
@@ -191,6 +302,14 @@ class TestLoadWithDpResize(TestCasePlus):
         uc.load_checkpoint_with_dp_resize(engine, str(self.root), TAG, scratch_dir=str(scratch))
         self.assertEqual(self.converted[0][1], str(scratch / (TAG + uc.UNIVERSAL_TAG_SUFFIX)))
         self.assertEqual(list(scratch.iterdir()), [])
+
+    def test_expert_parallel_engine_is_refused_before_converting(self):
+        _write_checkpoint(self.root / TAG, dp=4)
+        expert = SimpleNamespace(allreduce=False, group_name="ep_size_2")
+        engine = _FakeEngine(dp=2, params={f"{_EXPERTS}.w1": expert, "dense.weight": SimpleNamespace()})
+        with self.assertRaisesRegex(RuntimeError, r"convert_to_universal\(expert_shards=\.\.\.\)"):
+            uc.load_checkpoint_with_dp_resize(engine, str(self.root))
+        self.assertEqual((self.converted, engine.loads), ([], []))
 
     def test_partial_checkpoint_fails_before_loading(self):
         _write_checkpoint(self.root / TAG, dp=4, shards=[0, 1, 2])
