@@ -70,7 +70,9 @@ def vision_position_ids(
     """
     grid_t, grid_h, grid_w = (int(value) for value in grid_thw.tolist())
     if grid_h % spatial_merge_size or grid_w % spatial_merge_size:
-        raise MediaBatchError(f"grid {[grid_t, grid_h, grid_w]} does not divide by spatial_merge_size {spatial_merge_size}")
+        raise MediaBatchError(
+            f"grid {[grid_t, grid_h, grid_w]} does not divide by spatial_merge_size {spatial_merge_size}"
+        )
     grid_h //= spatial_merge_size
     grid_w //= spatial_merge_size
     temporal = torch.arange(grid_t, device=device) + start_position

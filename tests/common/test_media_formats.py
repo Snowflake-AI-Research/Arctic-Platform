@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The media formats the sampling worker decodes, checked without the worker (``common.media_formats``)."""
+"""The media formats Arctic decodes, checked without vLLM (``common.media_formats``)."""
 
 import subprocess
 import sys
@@ -31,14 +31,14 @@ from arctic_platform.common.media_formats import sniff_media_format
         (b"\xff\xd8\xff\xe0" + b"\0" * 8, "jpeg"),
         (b"\0\0\0\x18ftypisom" + b"\0" * 8, "mp4"),
         (b"\0\0\0\x18ftypavc1" + b"\0" * 8, "mp4"),
-        (b"\0\0\0\x18ftyphvc1" + b"\0" * 8, None),  # HEVC: not a brand decode_media takes
+        (b"\0\0\0\x18ftyphvc1" + b"\0" * 8, None),  # HEVC: not a brand Arctic decodes
         (b"\0\0\0\x18ftypav01" + b"\0" * 8, None),
         (b"\0\0\0\x08free\0\0\0\x18ftypisom", None),  # ftyp must be the first box
         (b"GIF89a" + b"\0" * 8, None),
         (b"", None),
     ],
 )
-def test_sniff_media_format_names_what_the_worker_decodes(data, expected):
+def test_sniff_media_format_names_what_arctic_decodes(data, expected):
     assert sniff_media_format(data) == expected
     assert sniff_media_format(memoryview(bytearray(data))) == expected
     allowed = {

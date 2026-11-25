@@ -69,7 +69,12 @@ def test_read_frame_index_reads_the_header_alone():
     header_end = 8 + int.from_bytes(frame[:8], "little")
     start, end = index["ids"]["data_offsets"]
     assert torch.frombuffer(bytearray(frame[header_end + start : header_end + end]), dtype=torch.int32).tolist() == [
-        0, 1, 2, 3, 4, 5,
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
     ]
     # Only the header has to be there, and a memoryview is read without copying the frame.
     assert wire.read_frame_index(memoryview(frame)[:header_end]) == (index, tree)
