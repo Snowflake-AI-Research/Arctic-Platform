@@ -1583,6 +1583,23 @@ def test_a_decoder_failure_bad_bytes_do_not_explain_is_not_the_callers(fake_load
     assert caught.value.__cause__ is None and caught.value.__context__ is None
 
 
+def test_a_decoder_failure_logs_where_it_failed_but_not_its_message(fake_loaders, monkeypatch, caplog):
+    from arctic_platform.inference.server import media_prompts
+
+    class _Loader:
+        def load_bytes(self, data):
+            raise TypeError(data.hex())  # a decoder message that echoes the input
+
+    monkeypatch.setattr(media_prompts, "_make_loader", lambda *args, **kwargs: _Loader())
+    with caplog.at_level("ERROR", logger=media_prompts.__name__):
+        with pytest.raises(media_prompts.MediaDecoderError):
+            media_prompts.decode_media(_media_prompt(multi_modal_data={"image": [PNG]}))
+    [record] = [r for r in caplog.records if r.name == media_prompts.__name__]
+    # The frames, with their source lines, but not the exception's message: the input never reaches the log.
+    assert "load_bytes" in record.getMessage() and "TypeError" in record.getMessage()
+    assert PNG.hex() not in record.getMessage()
+
+
 def test_media_is_decoded_and_hashed_off_the_event_loop(fake_loaders, monkeypatch):
     import threading
 

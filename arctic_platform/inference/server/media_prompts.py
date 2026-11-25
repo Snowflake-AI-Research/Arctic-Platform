@@ -16,7 +16,9 @@ Importing this module does not import vLLM or any video library.
 from __future__ import annotations
 
 import importlib.util
+import logging
 import os
+import traceback
 from typing import Any
 
 # The encoded formats ``decode_media`` hands to vLLM's loaders live in ``common.media_formats``, which imports
@@ -26,6 +28,8 @@ from arctic_platform.common.media_formats import sniff_media_format
 from arctic_platform.inference.server.token_prompts import check_token_tensor, is_token_tensor
 
 SUPPORTS_MEDIA = True
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "MEDIA_FORMATS",
@@ -227,15 +231,23 @@ def decode_media(prompt: dict, media_io_kwargs: dict[str, dict[str, Any]] | None
             media_io = loader(modality)
             failed = None
             caller_fault = True
+            frames: list[str] = []
             try:
                 out.append(media_io.load_bytes(bytes(item)))
             except Exception as error:
                 failed = type(error).__name__
                 caller_fault = isinstance(error, _BUILTIN_DECODE_ERRORS + _library_decode_errors())
+                if not caller_fault:
+                    # Where it failed, for the operator; not the message, which may echo the input.
+                    frames = traceback.format_tb(error.__traceback__)
             if failed is not None:
                 # Raised outside the handler, so the decoder's exception is not even the context.
                 if caller_fault:
                     raise MediaDecodeError(f"could not decode {modality} {index} ({failed})") from None
+                logger.error(
+                    "media decoder failed on %s %d (%s; message withheld, it may echo the input):\n%s",
+                    modality, index, failed, "".join(frames),
+                )
                 raise MediaDecoderError(f"{modality} {index}: the decoder failed ({failed})") from None
         decoded[modality] = out[0] if single else out
     return {**prompt, "multi_modal_data": decoded}
