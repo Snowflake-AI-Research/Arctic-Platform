@@ -53,6 +53,8 @@ from typing import Tuple
 
 import torch
 
+from .errors import MediaBatchError
+from .errors import MediaStraddleError
 from .mrope import IMAGE_TOKEN_TYPE
 from .mrope import TEXT_TOKEN_TYPE
 from .mrope import VIDEO_TOKEN_TYPE
@@ -75,40 +77,6 @@ IMAGE_MEDIA = MediaKind("image", "pixel_values", "image_grid_thw", "image_row_id
 VIDEO_MEDIA = MediaKind("video", "pixel_values_videos", "video_grid_thw", "video_row_ids", VIDEO_TOKEN_TYPE)
 MEDIA_KINDS = (IMAGE_MEDIA, VIDEO_MEDIA)
 MEDIA_KEYS = frozenset(key for kind in MEDIA_KINDS for key in kind.keys)
-
-
-class MediaBatchError(ValueError):
-    """The caller's media batch is malformed: its media leaves disagree with each other, its rows or its tokens.
-
-    A ValueError, so callers that catch ValueError still do; a caller that must tell a bad batch from an
-    internal error catches this instead of matching the message.
-    """
-
-
-class MediaStraddleError(MediaBatchError):
-    """A media item's tokens straddle a window boundary, so no window can hold the item whole.
-
-    A MediaBatchError; a caller that must tell this refusal from other malformed media (to change its layout
-    and retry, say) catches this instead of matching the message.
-    ``kind`` is the media kind's name (``"image"`` or ``"video"``), ``index`` the item's position among that
-    kind's items in the call, ``span`` its ``(start, end)`` token range and ``boundary`` the token it crosses.
-    """
-
-    def __init__(self, kind: str, index: int, span: Tuple[int, int], boundary: int) -> None:
-        start, end = span
-        super().__init__(
-            f"{kind} {index}'s tokens [{start}, {end}) straddle the window boundary at token {boundary}; "
-            "each window would get all its pixels but only part of its tokens. Move the boundary off "
-            "the item: pad or reorder the text before it so it sits inside one window"
-        )
-        self.kind = kind
-        self.index = index
-        self.span = (start, end)
-        self.boundary = boundary
-
-    def __reduce__(self):
-        # Rebuild from the attributes, not the message, so the error survives a trip across processes.
-        return type(self), (self.kind, self.index, self.span, self.boundary)
 
 
 def split_media(batch: Mapping[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:

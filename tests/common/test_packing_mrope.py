@@ -22,6 +22,7 @@ The image expectations are the hand-written tensors of prime-rl's packed M-RoPE 
 import pytest
 import torch
 
+from arctic_platform.common.packing import MediaBatchError
 from arctic_platform.common.packing import cu_seqlens_from_position_ids
 from arctic_platform.common.packing import mrope_position_ids
 from arctic_platform.common.packing import vision_position_ids
@@ -237,12 +238,13 @@ def test_vision_position_ids_are_row_major_over_t_h_w():
     ],
 )
 def test_inconsistent_inputs_are_rejected(types, cu_seqlens, grids, match):
-    with pytest.raises(ValueError, match=match):
+    # MediaBatchError, a ValueError: the caller's batch is malformed, not the code.
+    with pytest.raises(MediaBatchError, match=match):
         mrope_position_ids(types, cu_seqlens, spatial_merge_size=2, image_grid_thw=grids)
 
 
 def test_partly_used_video_is_rejected():
-    with pytest.raises(ValueError, match="rows no video tokens use"):
+    with pytest.raises(MediaBatchError, match="rows no video tokens use"):
         mrope_position_ids(
             _types(0, 2, 2, 2, 2), _cu(5), spatial_merge_size=2, video_grid_thw=torch.tensor([[2, 4, 4]])
         )

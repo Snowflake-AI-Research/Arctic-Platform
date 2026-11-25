@@ -27,6 +27,9 @@ The returned layout has four channels, ``[4, 1, T]``:
   derive from the positions, and what packed-attention code reads to find where rows start;
 * channels 1-3 are the temporal, height and width positions the rotary embedding consumes.
 
+Inputs that do not describe a valid packed media call raise ``MediaBatchError`` (a ``ValueError``): they come
+from the caller's batch, so a service can report them as the caller's.
+
 Every row restarts at 0 on every channel, so a packed row gets exactly the positions it would get alone. Tail
 padding past the last row (``pad_packed_microbatch``) gets 0 on every channel, matching the 2-D convention.
 
@@ -44,6 +47,8 @@ from typing import List
 from typing import Optional
 
 import torch
+
+from .errors import MediaBatchError
 
 TEXT_TOKEN_TYPE = 0
 IMAGE_TOKEN_TYPE = 1
@@ -65,7 +70,7 @@ def vision_position_ids(
     """
     grid_t, grid_h, grid_w = (int(value) for value in grid_thw.tolist())
     if grid_h % spatial_merge_size or grid_w % spatial_merge_size:
-        raise ValueError(f"grid {[grid_t, grid_h, grid_w]} does not divide by spatial_merge_size {spatial_merge_size}")
+        raise MediaBatchError(f"grid {[grid_t, grid_h, grid_w]} does not divide by spatial_merge_size {spatial_merge_size}")
     grid_h //= spatial_merge_size
     grid_w //= spatial_merge_size
     temporal = torch.arange(grid_t, device=device) + start_position
@@ -105,16 +110,16 @@ def _media_positions(
 ) -> tuple[List[torch.Tensor], int]:
     """Positions for one run of ``run_length`` media tokens, consuming as many grids as the run holds."""
     if grids is None:
-        raise ValueError(f"{what}_grid_thw is required for {what} tokens")
+        raise MediaBatchError(f"{what}_grid_thw is required for {what} tokens")
     pieces: List[torch.Tensor] = []
     remaining = run_length
     while remaining:
         grid = next(grids, None)
         if grid is None:
-            raise ValueError(f"not enough {what}_grid_thw rows for the {what} tokens")
+            raise MediaBatchError(f"not enough {what}_grid_thw rows for the {what} tokens")
         positions = vision_position_ids(current_position, grid, spatial_merge_size, device=device)
         if positions.shape[1] > remaining:
-            raise ValueError(
+            raise MediaBatchError(
                 f"{what} token run of {run_length} does not match {what}_grid_thw: a grid of "
                 f"{positions.shape[1]} tokens needs more than the {remaining} left in the run"
             )
@@ -143,9 +148,9 @@ def mrope_position_ids(
     total_tokens = int(token_types.numel())
     boundaries = [int(value) for value in cu_seqlens.tolist()]
     if not boundaries or boundaries[0] != 0 or boundaries[-1] > total_tokens:
-        raise ValueError(f"cu_seqlens {boundaries} do not describe rows inside {total_tokens} packed tokens")
+        raise MediaBatchError(f"cu_seqlens {boundaries} do not describe rows inside {total_tokens} packed tokens")
     if (token_types[boundaries[-1] :] != TEXT_TOKEN_TYPE).any():
-        raise ValueError("tail padding past the last packed row must have token type 0 (text)")
+        raise MediaBatchError("tail padding past the last packed row must have token type 0 (text)")
 
     images = iter(image_grid_thw) if image_grid_thw is not None else None
     frames_grid = _video_frames(video_grid_thw)
@@ -155,7 +160,7 @@ def mrope_position_ids(
     for row_start, row_end in zip(boundaries[:-1], boundaries[1:]):
         row_length = row_end - row_start
         if row_length < 0:
-            raise ValueError(f"cu_seqlens must be non-decreasing, got {boundaries}")
+            raise MediaBatchError(f"cu_seqlens must be non-decreasing, got {boundaries}")
         current_position = 0
         pieces: List[torch.Tensor] = []
         row_types = token_types[row_start:row_end].tolist()
@@ -176,12 +181,12 @@ def mrope_position_ids(
                 )
                 pieces.extend(media)
             else:
-                raise ValueError(f"unsupported multimodal token type {token_type}")
+                raise MediaBatchError(f"unsupported multimodal token type {token_type}")
         if pieces:
             position_ids[1:, 0, row_start:row_end] = torch.cat(pieces, dim=1)
         position_ids[0, 0, row_start:row_end] = torch.arange(row_length, device=device)
 
     for leftover, what in ((images, "image"), (frames, "video")):
         if leftover is not None and next(leftover, None) is not None:
-            raise ValueError(f"{what}_grid_thw has rows no {what} tokens use")
+            raise MediaBatchError(f"{what}_grid_thw has rows no {what} tokens use")
     return position_ids
