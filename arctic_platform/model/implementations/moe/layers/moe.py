@@ -1100,6 +1100,10 @@ class MoE(nn.Module):
         self._replica_index = -1
         self._replica_manager: ExpertReplicaManager | None = None
         self._replica_counts: torch.Tensor | None = None
+        # Static expert placement (expert_placement.py), set by the loader: logical expert id -> physical slot, and
+        # back. None: slot == logical id.
+        self.expert_slot: torch.Tensor | None = None
+        self.slot_expert: torch.Tensor | None = None
         self.router = TokenChoiceTopKRouter(
             dim=dim,
             num_experts=num_experts,
@@ -1190,6 +1194,16 @@ class MoE(nn.Module):
             routed_output = apply_routing_weights(routed_output, top_scores_experts_sorted, out_dtype=x.dtype)
 
         return routed_output
+
+    def _to_expert_slots(
+        self, selected_experts_indices: torch.Tensor, num_tokens_per_expert: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The router's logical expert choices and per-expert counts as physical expert slots, which the replica
+        planners, the dispatch and the experts' weights use (``expert_placement.py``). The router, its expert bias and
+        ``tokens_per_expert`` stay in logical ids."""
+        if self.expert_slot is None:
+            return selected_experts_indices, num_tokens_per_expert
+        return self.expert_slot[selected_experts_indices], num_tokens_per_expert[self.slot_expert]
 
     def _run_deepep_routed_experts(
         self,
@@ -1443,6 +1457,9 @@ class MoE(nn.Module):
         # routed expert compute below.
         with torch.no_grad():
             self.tokens_per_expert.add_(num_tokens_per_expert)
+        selected_experts_indices, num_tokens_per_expert = self._to_expert_slots(
+            selected_experts_indices, num_tokens_per_expert
+        )
 
         if uses_dispatch_ep(self.ep_comm_backend):
             routed_output = self._run_deepep_routed_experts(
