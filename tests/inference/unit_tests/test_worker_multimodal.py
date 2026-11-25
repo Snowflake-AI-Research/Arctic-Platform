@@ -1546,3 +1546,12 @@ def test_driver_media_modalities_pass_the_pools_answer_through(monkeypatch):
         asyncio.run(driver.media_modalities("other"))
     with pytest.raises(ValueError, match="model_id is required"):
         asyncio.run(driver.media_modalities())
+
+
+
+@pytest.mark.parametrize("brand", [b"isom", b"avc1", b"hvc1", b"av01"])
+def test_decode_media_refuses_exactly_what_sniff_media_format_does(brand):
+    from arctic_platform.inference.server import media_prompts
+
+    data = b"\0\0\0\x18ftyp" + brand + b"\0" * 8
+    assert media_prompts._is_allowed_format("video", data) == (media_prompts.sniff_media_format(data) == "mp4")

@@ -19,6 +19,10 @@ import importlib.util
 import os
 from typing import Any
 
+# The encoded formats ``decode_media`` hands to vLLM's loaders live in ``common.media_formats``, which imports
+# nothing heavy, so a service without vLLM can run the same check at its edge.
+from arctic_platform.common.media_formats import MEDIA_FORMATS
+from arctic_platform.common.media_formats import sniff_media_format
 from arctic_platform.inference.server.token_prompts import check_token_tensor, is_token_tensor
 
 SUPPORTS_MEDIA = True
@@ -31,6 +35,7 @@ __all__ = [
     "decodable_modalities",
     "decode_media",
     "is_media_prompt",
+    "sniff_media_format",
     "valid_token_ids",
     "validate_media_prompt",
 ]
@@ -38,18 +43,6 @@ __all__ = [
 MEDIA_PROMPT_KEYS = frozenset(
     {"prompt_token_ids", "multi_modal_data", "mm_processor_kwargs", "multi_modal_uuids"}
 )
-
-# The encoded formats ``decode_media`` hands to vLLM's loaders, by modality, as
-# (offset, leading bytes) signatures: PNG and JPEG images, and MP4 video (an
-# ISO-BMFF file whose first box is ``ftyp`` with one of these major brands).
-# Bytes in any other format are refused before a loader sees them, so Pillow's
-# other plugins and the video codec's other demuxers never parse request bytes.
-_MP4_BRANDS = (b"isom", b"iso2", b"iso4", b"iso5", b"iso6", b"mp41", b"mp42", b"avc1")
-MEDIA_FORMATS: dict[str, tuple[tuple[int, bytes], ...]] = {
-    "image": ((0, b"\x89PNG\r\n\x1a\n"), (0, b"\xff\xd8\xff")),
-    "video": tuple((4, b"ftyp" + brand) for brand in _MP4_BRANDS),
-}
-
 
 class MediaDecodeError(ValueError):
     """A media item's bytes could not be decoded.
