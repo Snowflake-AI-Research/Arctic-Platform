@@ -633,3 +633,23 @@ def test_prepacked_video_is_refused_for_a_model_type_with_no_media_spec(model):
     batch.update(pixel_values_videos=torch.zeros(4, batch["pixel_values"].shape[-1]), video_grid_thw=VIDEO_GRIDS)
     with pytest.raises(ValueError, match="model_type 'qwen3_5_moe' has no media spec.*pixel_values_videos"):
         _run_prepacked(other, batch, meta)
+
+
+def test_prepacked_window_with_no_image_drops_the_empty_image_leaves(model):
+    """``token_shard`` keeps an empty kind in a window that holds none of its items; it must not reach the model."""
+    rows = _with_pixels(model, _rows())
+    tokens = rows[2]["tokens"]  # a text-only row
+    batch = dict(
+        input_ids=torch.tensor([tokens]),
+        position_ids=torch.arange(len(tokens))[None],
+        pixel_values=rows[0]["pixel_values"][:0],
+        image_grid_thw=rows[0]["image_grid"][:0],
+    )
+    meta = {"pad_token_id": PAD_TOKEN_ID, "cu_seqlens": torch.tensor([0, len(tokens)], dtype=torch.int32)}
+    calls, handle = _record_model_calls(model)
+    try:
+        _run_prepacked(model, batch, meta)
+    finally:
+        handle.remove()
+    (call,) = calls
+    assert "pixel_values" not in call and "image_grid_thw" not in call

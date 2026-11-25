@@ -239,17 +239,28 @@ def _has_media(media: dict) -> bool:
     return any(media.get(kind.values_key) is not None for kind in MEDIA_KINDS)
 
 
-def _check_prepacked_media(engine, batch: dict) -> None:
-    """Refuse media in an already-packed call (``cu_seqlens`` on meta) that run_pipeline cannot vouch for.
+def _check_prepacked_media(engine, batch: dict) -> dict:
+    """*batch* for an already-packed call (``cu_seqlens`` on meta), refusing media run_pipeline cannot vouch for.
 
     The caller packed the call, so this path builds no M-RoPE positions and moves no media: it forwards the batch
     as sent. A model type with no media spec gets the same refusals as on the unpacked path (``_media_spec``). With
     a spec, media needs the caller's own ``[4, 1, T]`` M-RoPE ``position_ids`` over the call's ``T`` tokens (as
-    ``mrope_position_ids`` builds them): text positions would silently mis-place every image and video token.
+    ``mrope_position_ids`` builds them): text positions would silently mis-place every image and video token. A
+    media kind with no item in the call (``token_shard`` keeps empty kinds in a window with none) is left out, as on
+    the unpacked path, so a window with no image or video runs the text-only path and its dummy vision forward.
     """
     _, media = split_media(batch)
-    if _media_spec(engine, media) is None or not _has_media(media):
-        return
+    if _media_spec(engine, media) is None:
+        return batch
+    empty = [
+        kind for kind in MEDIA_KINDS
+        if torch.is_tensor(media.get(kind.grid_key)) and media[kind.grid_key].shape[0] == 0
+    ]
+    if empty:
+        batch = {key: value for key, value in batch.items() if not any(key in kind.keys for kind in empty)}
+        _, media = split_media(batch)
+    if not _has_media(media):
+        return batch
     positions = batch.get("position_ids")
     input_ids = batch.get("input_ids")
     tokens = input_ids.shape[-1] if torch.is_tensor(input_ids) else None
@@ -264,6 +275,7 @@ def _check_prepacked_media(engine, batch: dict) -> None:
             f"an already-packed call (cu_seqlens on meta) with media needs [{MROPE_CHANNELS}, 1, {tokens}] M-RoPE"
             f" position_ids (build them with mrope_position_ids), got {shape}"
         )
+    return batch
 
 
 def _media_with_row_ids(media: dict, n_rows: int) -> dict:
@@ -664,7 +676,7 @@ def run_pipeline(
         # Inner packing call and pack_for_dss already flattened sequences.
         # Unpad expects attention_mask / prompts that packed mb_kwargs omit.
         pack_with_unpad = False
-        _check_prepacked_media(engine, batch)
+        batch = _check_prepacked_media(engine, batch)
 
     # XXX: could the zorro parts be folded back into the model? this will also change when we start packing on the client side
     zorro_train_enable = meta.get("zorro_train_enable", False)
