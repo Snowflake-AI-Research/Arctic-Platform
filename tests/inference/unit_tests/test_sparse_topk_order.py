@@ -1,5 +1,7 @@
 """Interpret vLLM's expansion kernels on CPU with two emission orders for one selection."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from triton.runtime.interpreter import InterpretedFunction
@@ -27,17 +29,87 @@ def interpret(monkeypatch, module, name):
     monkeypatch.setattr(module, name, InterpretedFunction(getattr(module, name).fn))
 
 
-def test_glm_pool_order(monkeypatch):
+def glm_metadata(decode):
+    # Rows at positions 2053 and 4: one prefill chunk, or two one-token decodes.
+    chunk = SimpleNamespace(
+        token_start=0,
+        token_end=2,
+        skip_kv_gather=True,
+        local_cu_seq_lens=torch.tensor([0, 514]),
+        local_total_seq_lens=514,
+        max_local_total_seq_lens=514,
+        max_seqlen_k=514,
+        cu_seqlen_ks=torch.zeros(2, dtype=torch.int32),
+        cu_seqlen_ke=torch.tensor([513, 1], dtype=torch.int32),
+    )
+    decodes = SimpleNamespace(
+        decode_lens=torch.ones(2, dtype=torch.int32),
+        requires_padding=False,
+        seq_lens=torch.tensor([[513], [1]]),
+        block_table=None,
+        schedule_metadata=None,
+        indices=None,
+    )
+    return SimpleNamespace(
+        slot_mapping=torch.zeros(2),
+        max_seq_len=2054,
+        num_decodes=2 * decode,
+        num_decode_tokens=2 * decode,
+        num_prefills=2 * (not decode),
+        decode=decodes if decode else None,
+        prefill=None if decode else SimpleNamespace(max_prefill_seq_len=2054, chunks=[chunk]),
+    )
+
+
+@pytest.mark.parametrize("dcp", [1, 8], ids=["dcp1", "dcp8"])
+@pytest.mark.parametrize("decode", [False, True], ids=["prefill", "decode"])
+def test_glm_pool_order(monkeypatch, decode, dcp):
     apply_required_vllm_patches()
-    ops = sparse_indexer.kpool_ops
-    interpret(monkeypatch, ops, "_expand_pools_and_append_tail_kernel")
-    seq_lens = torch.tensor([2054, 5], dtype=torch.int32)
+    interpret(monkeypatch, sparse_indexer.kpool_ops, "_expand_pools_and_append_tail_kernel")
+    emitted = []
+
+    def emit(dst):
+        dst.copy_(emitted[-1])
+
+    # GPU kernels: zero scores; the local top-k emits the pool list, and at dcp > 1 the cross-rank merge re-emits it.
+    monkeypatch.setattr(sparse_indexer, "fp8_fp4_mqa_logits", lambda *args: torch.zeros(2, 514))
+    monkeypatch.setattr(sparse_indexer, "fp8_fp4_paged_mqa_logits", lambda *args, **kwargs: torch.zeros(2, 514))
+    monkeypatch.setattr(torch.ops._C, "top_k_per_row_prefill", lambda _, lo, hi, dst, *a: emit(dst), raising=False)
+    monkeypatch.setattr(sparse_indexer, "get_indexer_topk", lambda backend: lambda logits, lens, n, dst, *a: emit(dst))
+    monkeypatch.setattr(sparse_indexer, "_merge_dcp_topk_global", lambda logits, dst, *a, **kw: dcp > 1 and emit(dst))
+    workspace = SimpleNamespace(get_simultaneous=lambda *specs: [torch.empty(s, dtype=d) for s, d in specs])
+    monkeypatch.setattr(sparse_indexer, "current_workspace_manager", lambda: workspace)
+    monkeypatch.setattr(sparse_indexer, "DeepseekV32IndexerMetadata", SimpleNamespace)
+    context = SimpleNamespace(attn_metadata={"indexer": glm_metadata(decode)})
+    monkeypatch.setattr(sparse_indexer, "get_forward_context", lambda: context)
     short = torch.full((2051,), -1, dtype=torch.int32)
     short[:4] = torch.arange(4)
     short[2048] = 4
-    expected = torch.stack([expected_tokens(), short])
     for selected in selections():
-        torch.testing.assert_close(ops.expand_pools_and_append_tail(selected, seq_lens, 4), expected)
+        emitted.append(selected.int())
+        buffer = torch.zeros(2, 2051, dtype=torch.int32)
+        sparse_indexer.sparse_attn_indexer_kpool(
+            hidden_states=torch.empty(2, 1),
+            k_cache_prefix="indexer",
+            kv_cache=torch.empty(1, 1, 1),
+            q_quant=torch.empty(2, 1, 1),
+            q_scale=None,
+            k=None,
+            weights=torch.empty(2, 1),
+            quant_block_size=128,
+            scale_fmt="ue8m0",
+            topk_tokens=2048,
+            head_dim=128,
+            max_pool_len=514,
+            total_seq_lens=514,
+            topk_indices_buffer=buffer,
+            skip_k_cache_insert=True,
+            index_kpool=4,
+            positions=torch.tensor([2053, 4]),
+            dcp_world_size=dcp,
+            cp_kv_cache_interleave_size=4,
+        )
+        torch.testing.assert_close(buffer, torch.stack([expected_tokens(), short]))
 
 
 @pytest.mark.parametrize("decode", [False, True], ids=["prefill", "decode"])
