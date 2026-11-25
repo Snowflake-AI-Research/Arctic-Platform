@@ -117,6 +117,40 @@ def dispatched(monkeypatch, ep):
     return SimpleNamespace(output=output, event_calls=event_calls, handle=handle, args=args, finalizers=finalizers)
 
 
+def test_a_new_buffer_first_hands_pytorchs_cached_blocks_back(ep, monkeypatch):
+    # The buffer is allocated outside PyTorch's caching allocator. GLM-5.3's first RL step created it with 16.8 GiB
+    # cached (134.4 GiB reserved, 117.6 GiB allocated, the frozen-offloaded experts still resident) and 0.27 GiB free:
+    # "CUDA error deep_ep.cpp:69 'out of memory'".
+    journal = []
+
+    class Config:
+        def get_nvl_buffer_size_hint(self, hidden_bytes, num_ranks):
+            return hidden_bytes
+
+        def get_rdma_buffer_size_hint(self, hidden_bytes, num_ranks):
+            return 0
+
+    class Buffer:
+        get_dispatch_config = staticmethod(lambda num_ranks: Config())
+        get_combine_config = staticmethod(lambda num_ranks: Config())
+
+        def __init__(self, group, num_nvl_bytes, num_rdma_bytes):
+            journal.append(("buffer", num_nvl_bytes))
+            self.group, self.num_nvl_bytes, self.num_rdma_bytes = group, num_nvl_bytes, num_rdma_bytes
+
+    monkeypatch.setattr(ep, "Buffer", Buffer)
+    monkeypatch.setattr(ep, "_buffer", None)
+    monkeypatch.setattr(ep, "_configure_backward_barrier", lambda group: None, raising=False)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: journal.append("empty_cache"))
+    group = SimpleNamespace(size=lambda: 8)
+
+    first = ep.get_buffer(group, 1024)
+    assert ep.get_buffer(group, 512) is first
+    ep.get_buffer(group, 2048)
+
+    assert journal == ["empty_cache", ("buffer", 1024), "empty_cache", ("buffer", 2048)]
+
+
 def test_live_dispatch_does_not_finalize_during_interpreter_shutdown(dispatched):
     assert len(dispatched.finalizers) == 1
     assert dispatched.finalizers[0].alive

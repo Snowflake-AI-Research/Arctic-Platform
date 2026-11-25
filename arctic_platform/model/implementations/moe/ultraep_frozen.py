@@ -111,10 +111,16 @@ class FrozenUltraEPState:
         self.rank = dist.get_rank(group)
         (w1, w2, w3), (s1, s2, s3) = _stacks(experts)
         if w1.numel() == 0:
-            raise RuntimeError(
-                "UltraEP: the experts' codes are not on the GPU (frozen expert offload); its state is built at the "
-                "first MoE call, before the offload moves them"
-            )
+            # The frozen expert offload moved the codes to the host when the first decoder layer ran, before this first
+            # MoE call: the managers need only the stacks' shapes and dtype, which it keeps.
+            from .frozen_offload import offloaded_code_stack
+
+            held = [offloaded_code_stack(experts, name) for name in _NAMES]
+            if any(t is None for t in held):
+                raise RuntimeError(
+                    "UltraEP: the experts' codes are neither on the GPU nor in the frozen expert offload"
+                )
+            w1, w2, w3 = held
         L = w1.shape[0]
         self.experts_per_rank = L
         self.n2_half = w2[0].numel() // 2
@@ -169,8 +175,8 @@ class FrozenUltraEPState:
             )
             # One staging pair serves every layer: a layer's sync and reduce finish before the next layer's start.
             width = max(self.fc1_numel, self.fc2_numel)
-            self.lora_stage = torch.zeros(L, 2, width, dtype=dtype, device=w1.device)
-            self.lora_grads = torch.zeros(L, 2, width, dtype=torch.float32, device=w1.device)
+            self.lora_stage = torch.zeros(L, 2, width, dtype=dtype, device=s1.device)
+            self.lora_grads = torch.zeros(L, 2, width, dtype=torch.float32, device=s1.device)
         self.layer_of: dict[int, int] = {}
         self.pooled: set[int] = set()
         self.kept_routes: dict[int, deque] = {}

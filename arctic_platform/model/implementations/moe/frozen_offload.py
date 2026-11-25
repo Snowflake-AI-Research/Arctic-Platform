@@ -1,0 +1,442 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Keep the frozen routed-expert weights in pinned host memory; copy each layer's in around every call of its experts.
+
+GLM-5.3's block-FP8 routed experts are 91 GiB per GPU at EP8, which leaves too little of an H200 for a 256K-token
+sequence. With LoRA they are frozen and every layer reads them twice per step: in its forward and in its
+activation-checkpoint recompute (the backward reuses the recompute's copy). So each rank keeps its experts' codes in
+one host buffer, registered with CUDA, and a layer's codes (1.2 GiB per GPU for GLM-5.3) are copied in on a side
+stream for each call, into one of two persistent GPU buffers by the layer's parity: a layer's codes always sit at the
+same addresses (which UltraEP's spare slots, ``moe/ultraep_frozen.py``, read in place), and no call allocates. The
+next layer in call order (forward: the next one; backward: the previous one) is prefetched while the current one runs,
+so the copy overlaps compute.
+
+The offload happens when the model's first decoder layer first runs, after PEFT and DeepSpeed have wrapped the model
+and after a restore: before the first step allocates (its attention, the first MoE layer's DeepEP buffer) and not
+beside a restore's optimizer state (a restored GLM-5.3 LoRA job ran out of memory in layer 0's attention with the codes
+still on the GPU). UltraEP's spare slots build their state from the stacks' shapes then (``offloaded_code_stack``). The
+expert parameters keep their objects with empty data, and during a call each is replaced by a temporary parameter
+viewing the copied bytes. The temporaries are tagged ``_ap_transient``: the expert GEMMs then save them with
+``save_for_backward`` (``fp8.stash_frozen``), so the checkpointed forward drops them after the layer and only the
+recompute's copy lives until that layer's backward. Only the code stacks ``w1`` / ``w2`` / ``w3`` move; their scales
+stay on the GPU (block FP8's FP32 scales are a 4,096th of the codes' bytes; W4A8 rewrites INT4 group scales in place on
+first use).
+
+The offload is a holding of the model's frozen weights (``moe/frozen_held.py``): the weight export copies a layer's
+codes into its buffer and points the parameters at them for that layer's export unit, so a weights-only checkpoint
+holds the experts' codes; inside ``frozen_held.whole_frozen_weights`` the parameters view their codes in the host
+buffer, for the state dict and DeepSpeed's checkpoint.
+
+A layer whose experts are not recomputed (``ac_config.layers`` leaves its block out of checkpointing) saves its
+expert weights for backward, so a copy of its codes would live until then and hold a buffer the next layers need: such
+layers keep their codes on the GPU and are not managed.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import os
+import weakref
+from collections.abc import Iterator
+from collections.abc import Sequence
+
+import torch
+from torch import nn
+
+OFFLOAD_FROZEN_EXPERTS_ENV = "ARL_OFFLOAD_FROZEN_EXPERTS"
+_ALIGN = 256
+_NAMES = ("w1", "w2", "w3")
+
+
+_configured: bool | None = None  # loader option moe.frozen_expert_offload (moe/runtime_options.py); None: the env
+
+
+def configure_from_options(value: bool | None) -> None:
+    global _configured
+    _configured = value
+
+
+def frozen_expert_offload_requested() -> bool:
+    if _configured is not None:
+        return _configured
+    return os.environ.get(OFFLOAD_FROZEN_EXPERTS_ENV, "0") not in ("", "0", "false", "False")
+
+
+def _align(n: int) -> int:
+    return (n + _ALIGN - 1) // _ALIGN * _ALIGN
+
+
+def _inner_layer(layer: nn.Module) -> nn.Module:
+    return getattr(layer, "_checkpoint_wrapped_module", layer)
+
+
+def _slot(module: nn.Module, name: str) -> tuple[nn.Module, str]:
+    """Where an expert stack ``name`` lives right now: the experts' own parameter, or the ``original`` of its PEFT
+    parametrization (PEFT's ParamWrapper registers one around each call on a BF16 base, so look it up per call)."""
+    parametrizations = getattr(module, "parametrizations", None)
+    if parametrizations is not None and name in parametrizations:
+        return parametrizations[name], "original"
+    return module, name
+
+
+def _expert_code_params(layer: nn.Module):
+    """``(experts module, name, param)`` of every frozen routed-expert code stack in ``layer``."""
+    from arctic_platform.model.implementations.moe.layers.moe import GroupedExperts
+
+    for module in layer.modules():
+        if not isinstance(module, GroupedExperts):
+            continue
+        for name in _NAMES:
+            owner, key = _slot(module, name)
+            param = owner._parameters.get(key)
+            if param is None or param.requires_grad or param.numel() == 0:
+                continue
+            yield module, name, param
+
+
+class FrozenExpertOffload:
+    """The host copies of every managed layer's expert codes, and the per-call copies in."""
+
+    def __init__(self, layers: list[nn.Module]) -> None:
+        _OFFLOADS.add(self)
+        self.layers = layers
+        # Per layer: [(experts module, name, param, shape, dtype, offset in the layer's bytes, nbytes)], its offset
+        # in the host buffer, and its size.
+        self.entries: list[list[tuple]] = []
+        self.host_offsets: list[int] = []
+        self.layer_bytes: list[int] = []
+        self.host: torch.Tensor | None = None
+        self.registered = False
+        self.stream: torch.cuda.Stream | None = None
+        # Which layer's codes each buffer holds (or is being copied), and the copy's event.
+        self.resident: list[int] = [-1, -1]
+        self.events: list[torch.cuda.Event | None] = [None, None]
+        # Two persistent GPU buffers: layer i always copies into buffers[i % 2], so its codes keep their addresses
+        # from call to call (UltraEP's pointer pools read them in place) and no call allocates. Each buffer
+        # remembers the temporaries of the layer that last used it, to refuse an overwrite while they live.
+        self.buffers: list[torch.Tensor] = []
+        self.holders: list[tuple[int, list]] = [(-1, []), (-1, [])]
+        self.installed: set[int] = set()
+        self.last: tuple[int, bool] | None = None
+        self.copies = 0
+        self.prefetched = 0
+        # The managed layer of every offloaded parameter, and the depth of whole_on_host.
+        self.layer_of: dict[int, int] = {}
+        self.whole = 0
+
+    @property
+    def offloaded(self) -> bool:
+        return self.host is not None
+
+    def _offload_all(self) -> None:
+        total = 0
+        for layer in self.layers:
+            entries, offset = [], 0
+            for module, name, param in _expert_code_params(layer):
+                nbytes = param.numel() * param.element_size()
+                entries.append((module, name, param, param.shape, param.dtype, offset, nbytes))
+                self.layer_of[id(param)] = len(self.entries)
+                offset = _align(offset + nbytes)
+            self.entries.append(entries)
+            self.host_offsets.append(total)
+            self.layer_bytes.append(offset)
+            total += offset
+        # One pageable buffer registered with CUDA: the caching pinned allocator rounds every block up to a power of
+        # two, which for 91 GiB per rank in 1.2 GiB layers would take 1.6x the host memory.
+        raw = torch.empty(max(total, 1) + 4096, dtype=torch.uint8)
+        start = -raw.data_ptr() % 4096
+        host = raw[start : start + max(total, 1)]
+        if total:
+            err = torch.cuda.cudart().cudaHostRegister(host.data_ptr(), host.numel(), 0)
+            if int(err) != 0:
+                raise RuntimeError(f"cudaHostRegister of {total / 2**30:.1f} GiB of expert codes failed: {err}")
+            self.registered = True
+            # Unregister before the buffer's memory goes back to the host allocator, or a later registration (or
+            # pinning) of reused memory fails with cudaErrorAlreadyMapped.
+            weakref.finalize(raw, torch.cuda.cudart().cudaHostUnregister, host.data_ptr())
+        self.host = host
+        for i, entries in enumerate(self.entries):
+            base = self.host_offsets[i]
+            for _, _, param, _, dtype, start, nbytes in entries:
+                self.host[base + start : base + start + nbytes].copy_(
+                    param.data.contiguous().view(torch.uint8).view(-1)
+                )
+                param.data = torch.empty(0, dtype=dtype, device=param.device)
+        self.stream = torch.cuda.Stream()
+        # The codes' GPU blocks went back to PyTorch's cache; hand them to the driver too, or NCCL and DeepEP, which
+        # allocate outside the cache, still see the memory as taken (out of memory in an NCCL call).
+        torch.cuda.empty_cache()
+        size = max(self.layer_bytes, default=0)
+        device = torch.device("cuda", torch.cuda.current_device())
+        self.buffers = [torch.empty(size, dtype=torch.uint8, device=device) for _ in range(2)]
+
+    def _check_free(self, i: int) -> None:
+        owner, refs = self.holders[i % 2]
+        if owner != i and any(ref() is not None for ref in refs):
+            raise RuntimeError(
+                f"frozen expert offload: layer {i} would overwrite buffer {i % 2} while layer {owner}'s copy is still "
+                "in use (the layers were called out of the forward / reverse-recompute order)"
+            )
+
+    def _fetch(self, i: int) -> None:
+        """Start copying layer ``i``'s codes into its buffer, unless the buffer holds them already."""
+        b = i % 2
+        if self.resident[b] == i or not self.layer_bytes[i]:
+            return
+        assert self.host is not None and self.stream is not None
+        current = torch.cuda.current_stream()
+        self._check_free(i)
+        # The side stream starts after everything queued on the compute stream, the last reads of this buffer included;
+        # the compute stream waits for the copy's event before reading it.
+        buffer = self.buffers[b][: self.layer_bytes[i]]
+        self.stream.wait_stream(current)
+        with torch.cuda.stream(self.stream):
+            base = self.host_offsets[i]
+            buffer.copy_(self.host[base : base + self.layer_bytes[i]], non_blocking=True)
+            event = torch.cuda.Event()
+            event.record(self.stream)
+        self.resident[b], self.events[b] = i, event
+        self.copies += 1
+
+    def before(self, i: int) -> None:
+        """Install layer ``i``'s codes for one call of its experts (one dispatch chunk, or its recompute)."""
+        if not self.offloaded:
+            self._offload_all()
+        self.after(i)
+        if not self.layer_bytes[i]:
+            return
+        from arctic_platform.model.implementations.gpu.router_replay_recompute import _in_recompute
+        from arctic_platform.model.implementations.gpu.router_replay_recompute import _install_recompute_detector
+
+        _install_recompute_detector()
+        b = i % 2
+        recompute = _in_recompute()
+        # The first call of this layer in this pass (later calls are the same layer's other dispatch chunks).
+        first_call = self.last != (i, recompute)
+        if first_call and self.resident[b] == i:
+            self.prefetched += 1
+        self._fetch(i)
+        event = self.events[b]
+        if event is not None:
+            torch.cuda.current_stream().wait_event(event)
+        buffer = self.buffers[b]
+        refs = self.holders[b][1] if self.holders[b][0] == i else []
+        for module, name, param, shape, dtype, start, nbytes in self.entries[i]:
+            temporary = nn.Parameter(buffer[start : start + nbytes].view(dtype).view(shape), requires_grad=False)
+            for attr in ("allreduce", "_dss_keep_fp32", "ds_shape"):
+                if hasattr(param, attr):
+                    setattr(temporary, attr, getattr(param, attr))
+            temporary._ap_transient = True
+            owner, key = _slot(module, name)
+            owner._parameters[key] = temporary
+            refs = [*refs, weakref.ref(temporary)]
+        self.holders[b] = (i, refs)
+        self.installed.add(i)
+        if first_call:
+            # The forward runs the layers up, the recompute (in backward) down; prefetch the next in that order.
+            following = i + (-1 if recompute else 1)
+            if 0 <= following < len(self.layers):
+                self._fetch(following)
+        self.last = (i, recompute)
+
+    def after(self, i: int) -> None:
+        if i not in self.installed:
+            return
+        for module, name, param, *_ in self.entries[i]:
+            owner, key = _slot(module, name)
+            owner._parameters[key] = param
+        self.installed.discard(i)
+
+    def host_bytes(self) -> int:
+        return 0 if self.host is None else self.host.numel()
+
+    # The weight export and the state dict (moe/frozen_held.py's FrozenHolding).
+
+    @property
+    def held(self) -> bool:
+        return self.offloaded and not self.whole
+
+    def _point(self, i: int, codes: torch.Tensor) -> None:
+        for _, _, param, shape, dtype, start, nbytes in self.entries[i]:
+            param.data = codes[start : start + nbytes].view(dtype).view(shape)
+
+    def _empty(self, i: int) -> None:
+        device = self.buffers[0].device
+        for _, _, param, _, dtype, *_ in self.entries[i]:
+            param.data = torch.empty(0, dtype=dtype, device=device)
+
+    @contextlib.contextmanager
+    def materialize(self, tensors: Sequence[torch.Tensor]) -> Iterator[None]:
+        """The offloaded codes among ``tensors`` on this rank's GPU: each managed layer that holds one, in the order of
+        ``tensors``, copied into its persistent buffer (a second layer of the same parity into a copy of its own).
+        Local to the rank, no collective."""
+        layers = list(dict.fromkeys(self.layer_of[id(t)] for t in tensors if id(t) in self.layer_of))
+        if not self.held or not layers:
+            yield
+            return
+        assert self.host is not None
+        filled: list[int] = []
+        taken: set[int] = set()
+        try:
+            for i in layers:
+                if not self.layer_bytes[i]:
+                    continue
+                b = i % 2
+                if b in taken:
+                    base = self.host_offsets[i]
+                    codes = self.buffers[b].new_empty(self.layer_bytes[i])
+                    codes.copy_(self.host[base : base + self.layer_bytes[i]])
+                else:
+                    self._fetch(i)
+                    event = self.events[b]
+                    if event is not None:
+                        torch.cuda.current_stream().wait_event(event)
+                    codes = self.buffers[b]
+                    taken.add(b)
+                filled.append(i)
+                self._point(i, codes)
+            yield
+        finally:
+            for i in filled:
+                self._empty(i)
+
+    @contextlib.contextmanager
+    def whole_on_host(self) -> Iterator[None]:
+        """Inside, every offloaded parameter views its codes in the host buffer: the state dict holds them, and a load
+        writes them there."""
+        if not self.offloaded:  # before the first call the parameters still hold their codes
+            yield
+            return
+        if not self.whole:
+            assert self.stream is not None and self.host is not None
+            self.stream.synchronize()  # no copy in flight reads the host codes a load may write
+            for i in range(len(self.layers)):
+                self._point(i, self.host[self.host_offsets[i] : self.host_offsets[i] + self.layer_bytes[i]])
+        self.whole += 1
+        try:
+            yield
+        finally:
+            self.whole -= 1
+            if not self.whole:
+                for i in range(len(self.layers)):
+                    self._empty(i)
+                # A load may have written new codes: no buffer holds a current copy of any layer.
+                self.resident = [-1, -1]
+
+
+_OFFLOADS: weakref.WeakSet[FrozenExpertOffload] = weakref.WeakSet()
+
+
+def offloaded_code_stack(experts: nn.Module, name: str) -> torch.Tensor | None:
+    """A meta tensor of the shape and dtype of ``experts``' code stack ``name`` while an offload holds its codes on the
+    host (the parameter holds no data outside its layer's calls), else None."""
+    for offload in _OFFLOADS:
+        if not offload.offloaded:
+            continue
+        for entries in offload.entries:
+            for module, key, _, shape, dtype, *_ in entries:
+                if module is experts and key == name:
+                    return torch.empty(shape, dtype=dtype, device="meta")
+    return None
+
+
+def experts_recomputed(layer: nn.Module) -> bool:
+    """Whether a decoder layer's routed experts run again in its backward: the whole block checkpointed, or a selective
+    checkpoint around them. Otherwise their saved tensors keep the codes alive until backward."""
+    if hasattr(layer, "_checkpoint_wrapped_module"):
+        return True
+    from arctic_platform.model.implementations.moe.layers.checkpointing import _PATCHED_METHODS_ATTR
+
+    mlp = getattr(layer, "mlp", None)
+    patched = getattr(mlp, _PATCHED_METHODS_ATTR, ()) if mlp is not None else ()
+    return bool({"_run_routed_experts", "_run_local_routed_experts"} & set(patched))
+
+
+def _expert_call_sites(layer: nn.Module):
+    """The modules the MoE calls for its routed experts: ``<moe>.experts`` as installed, which is PEFT's outermost
+    ParamWrapper when expert LoRA wraps the experts, else the experts themselves."""
+    from arctic_platform.model.implementations.moe.layers.moe import GroupedExperts
+
+    seen = set()
+    for module in layer.modules():
+        site = getattr(module, "experts", None)
+        if not isinstance(site, nn.Module) or id(site) in seen:
+            continue
+        base = site
+        while hasattr(base, "base_layer"):
+            base = base.base_layer
+        if isinstance(base, GroupedExperts):
+            seen.add(id(site))
+            yield site
+
+
+def install_frozen_expert_offload(layers: nn.ModuleList, *, root: nn.Module) -> FrozenExpertOffload:
+    """Offload the frozen routed-expert codes of every decoder layer whose experts are recomputed; copied in per call.
+
+    The hooks sit on the module the MoE calls for its experts (PEFT's outermost wrapper with expert LoRA: the copy is
+    installed before PEFT registers its parametrization over the weights), so they run for every call of the experts:
+    each dispatch chunk, the forward and the recompute, a selective recompute of the experts alone included. PEFT may
+    wrap the experts after this returns (the trainer applies LoRA to the loaded model), so each layer binds its hooks
+    to the call sites at its first call. The codes move to the host when the first of ``layers`` first runs.
+
+    Layers whose experts are not recomputed (``ac_config.layers`` leaves them out) keep their codes on the GPU: their
+    saved tensors hold them until backward.
+
+    ``root`` is the model whose weight export and state dict see the codes (``moe/frozen_held.py``).
+    """
+    managed = []
+    for layer in layers:
+        if not experts_recomputed(layer):
+            continue
+        inner = _inner_layer(layer)
+        if any(True for _ in _expert_call_sites(inner)):
+            managed.append(inner)
+    offload = FrozenExpertOffload(managed)
+    for i, inner in enumerate(managed):
+        _bind_at_first_call(offload, i, inner)
+    if managed:
+        _offload_at_first_call(offload, _inner_layer(layers[0]))
+    from .frozen_held import hold_frozen_weights
+
+    hold_frozen_weights(root, offload)
+    return offload
+
+
+def _offload_at_first_call(offload: FrozenExpertOffload, first: nn.Module) -> None:
+    """Move every managed layer's codes to the host when ``first`` (the first decoder layer) first runs, then drop this
+    hook. A load before then (inside ``whole_frozen_weights``) writes the codes on the GPU."""
+    handle = None
+
+    def offload_all(module, args):
+        if not offload.offloaded:
+            offload._offload_all()
+        handle.remove()
+
+    handle = first.register_forward_pre_hook(offload_all)
+
+
+def _bind_at_first_call(offload: FrozenExpertOffload, i: int, layer: nn.Module) -> None:
+    """Hook layer ``i``'s experts call sites as they are when the layer first runs, then drop this hook."""
+    handle = None
+
+    def bind(module, args):
+        for site in _expert_call_sites(layer):
+            # First, so any other pre-hook on the experts already sees the installed copy.
+            site.register_forward_pre_hook(lambda module, args: offload.before(i), prepend=True)
+            site.register_forward_hook(lambda module, args, output: offload.after(i))
+            site._ap_frozen_expert_offload = offload
+        handle.remove()
+
+    handle = layer.register_forward_pre_hook(bind)
