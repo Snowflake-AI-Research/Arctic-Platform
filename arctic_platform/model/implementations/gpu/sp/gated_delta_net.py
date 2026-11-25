@@ -954,12 +954,6 @@ def _module_head_counts(module: nn.Module) -> tuple[int, int]:
 
 
 GATED_DELTA_CHUNK_SIZE = 64
-# Exact versions whose initial_state / final-state handoff has been checked on GPU against an unshared run.
-_PREFIX_CONTINUATION_VERSIONS = {
-    "fla-core": "0.6.0",
-    "flash-linear-attention": "0.6.0",
-    "causal-conv1d": "1.7.0",
-}
 _SPLIT_PROJECTIONS = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
 _FUSED_PROJECTIONS = ("in_proj_qkvz", "in_proj_ba", "fix_query_key_value_ordering")
 
@@ -992,14 +986,6 @@ def prefix_continuation_kernel_blocker(causal_convolution, gated_delta_rule) -> 
         return (
             "prefix sharing needs causal-conv1d's causal_conv1d_fn with seq_idx; the torch fallback ignores boundaries"
         )
-    checked = ["fla-core", "flash-linear-attention"]
-    if str(getattr(causal_convolution, "__module__", "")).startswith("causal_conv1d"):
-        checked.append("causal-conv1d")
-    for distribution in checked:
-        installed = _installed_version(distribution)
-        wanted = _PREFIX_CONTINUATION_VERSIONS[distribution]
-        if installed is not None and installed != wanted:
-            return f"prefix sharing is verified on {distribution}=={wanted}, found {installed}"
     if _installed_version("fla-core") is None and _installed_version("flash-linear-attention") is None:
         return "prefix sharing needs flash-linear-attention installed"
     return None

@@ -376,7 +376,7 @@ class FakeHybrid(torch.nn.Module):
 
 @pytest.fixture
 def verified_kernels(monkeypatch):
-    """The reference kernels stand in for FLA / causal-conv1d, whose versions the GPU gate pins."""
+    """The reference kernels stand in for FLA / causal-conv1d, which the ``[gdn]`` extra pins."""
     monkeypatch.setattr(gated_delta_net, "prefix_continuation_kernel_blocker", lambda conv, rule: None)
 
 

@@ -691,8 +691,8 @@ def test_qwen3_5_moe_segment_boundaries_come_from_the_stash():
         assert stopped.value.args == (offset.cu_seqlens.tolist(), offset.max_len_q)
 
 
-# GatedDeltaNet hybrids. The CPU references stand in for FLA's chunk rule and causal-conv1d (whose pinned
-# versions and CUDA numerics are the GPU gate's job): in transformers' stock forward, which the per-row runs take,
+# GatedDeltaNet hybrids. The CPU references stand in for FLA's chunk rule and causal-conv1d (pinned in the [gdn]
+# extra; their CUDA numerics are the GPU gate's job): in transformers' stock forward, which the per-row runs take,
 # and in the prefix-continuation adapter, which every run inside using_layout takes.
 GDN_LENGTHS = (70, 67, 72, 66)
 # The shared root is the first 64 tokens: GatedDeltaNet roots must fill whole 64-token chunks.
