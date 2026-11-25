@@ -246,3 +246,22 @@ def test_ds_worker_config_accepts_zorro_train_with_eager():
 
     assert spec.attn_implementation == "eager"
     assert spec.patches.zorro_train is not None
+
+
+def _checkpointing_spec(training_options):
+    return dense_model_spec(
+        model_path="Qwen/Qwen3-8B",
+        dtype="bfloat16",
+        attn_implementation="flash_attention_3",
+        sequence_parallel=1,
+        liger=False,
+        training_options=training_options,
+    )
+
+
+def test_ac_config_layers_lists_the_checkpointed_layers():
+    spec = _checkpointing_spec({"activation_checkpointing": True, "ac_config": {"layers": [0, 1, 3]}})
+    assert spec.patches.gradient_checkpointing == [0, 1, 3]
+    assert _checkpointing_spec({"activation_checkpointing": 2}).patches.gradient_checkpointing == 2
+    with pytest.raises(ValueError, match="set activation_checkpointing to true"):
+        _checkpointing_spec({"activation_checkpointing": False, "ac_config": {"layers": [0]}})
