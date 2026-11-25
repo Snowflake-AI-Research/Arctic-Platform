@@ -207,17 +207,23 @@ def assert_expert_data_parallel_group_holds_every_replica(ep_name: str) -> None:
         )
 
 
-def _register_independent_expert_groups(ep_size: int, world_size: int, ep_rank_groups) -> None:
+def _register_independent_expert_groups(ep_size: int, world_size: int, ep_rank_groups, existing_ep_group=None) -> None:
     """Register EP groups from ``ep_rank_groups`` and expert-DP from ``intra_node_ep_replica_groups``.
 
     Used by decoupled intra-node EP and host-complete EP: both overlay consecutive-or-block EP on already
     built contiguous SP, and both name a shard by ``rank % ep``. ``dist.new_group`` is collective, so every
-    rank walks the same lists and keeps only the groups it belongs to.
+    rank walks the same lists and keeps only the groups it belongs to. ``existing_ep_group``: every rank already
+    holds a group over its block of ``ep_rank_groups``, registered as is (no new communicator).
     """
     rank = dist.get_rank()
     ep_name = ep_group_name(ep_size)
 
     for ranks in ep_rank_groups:
+        if existing_ep_group is not None:
+            if rank in ranks:
+                ds_groups._EXPERT_PARALLEL_GROUP[ep_name] = existing_ep_group
+                ds_groups._EXPERT_PARALLEL_GROUP_RANKS[ep_name] = list(ranks)
+            continue
         group = dist.new_group(ranks)
         if rank in ranks:
             ds_groups._EXPERT_PARALLEL_GROUP[ep_name] = group
@@ -233,6 +239,48 @@ def _register_independent_expert_groups(ep_size: int, world_size: int, ep_rank_g
     ds_groups._EXPERT_DATA_PARALLEL_GROUP[ep_name] = expert_dp_group
     ds_groups._EXPERT_DATA_PARALLEL_GROUP_RANKS[ep_name] = expert_dp_ranks
     assert_expert_data_parallel_group_holds_every_replica(ep_name)
+
+
+def _group_over(ranks: list[int]):
+    """An NCCL process group this rank holds over exactly ``ranks`` (global ranks, in group-rank order), or None."""
+    from torch.distributed import distributed_c10d as c10d
+
+    for group, members in c10d._world.pg_group_ranks.items():
+        if sorted(members, key=members.__getitem__) == ranks and dist.get_backend(group) == "nccl":
+            return group
+    return None
+
+
+def setup_consecutive_expert_groups(size: int):
+    """Register ``ep_size_<size>`` as consecutive blocks of ``size`` ranks, with the strided expert-DP groups (the
+    ranks at the same position in every block), and return this rank's block group; when that name is registered
+    already (the job's own EP degree), check it has this layout and return its group.
+
+    The node groups of ``moe/dense_shard.py``: DeepSpeed reduces and partitions a parameter tagged with this name over
+    its expert-DP group. When every rank already holds a process group over exactly its block (a node's
+    sequence-parallel group), that group is registered instead of a new one: each NCCL communicator of a node's 8
+    GPUs costs ~0.5 GiB per GPU on H200. Collective on the default group when it registers.
+    """
+    world_size, rank = dist.get_world_size(), dist.get_rank()
+    name = ep_group_name(size)
+    blocks = topology.host_complete_ep_groups(world_size, size)
+    block = blocks[rank // size]
+    if name not in ds_groups._EXPERT_PARALLEL_GROUP:
+        existing = _group_over(block)
+        everywhere: list[Any] = [None] * world_size
+        dist.all_gather_object(everywhere, existing is not None)
+        _register_independent_expert_groups(size, world_size, blocks, existing if all(everywhere) else None)
+    replicas = [peer for peer in range(world_size) if peer % size == rank % size]
+    registered = list(ds_groups._EXPERT_PARALLEL_GROUP_RANKS[name])
+    registered_dp = sorted(ds_groups._EXPERT_DATA_PARALLEL_GROUP_RANKS[name])
+    if registered != block or registered_dp != replicas:
+        raise RuntimeError(
+            f"rank {rank}: the expert groups {name} are registered as {registered} (expert-DP {registered_dp}), "
+            f"not as the consecutive block {block} with expert-DP {replicas}; a dense shard group of {size} needs "
+            "the job's EP groups of that size to be consecutive blocks (another shard group size, or another EP "
+            "layout)"
+        )
+    return ds_groups._EXPERT_PARALLEL_GROUP[name]
 
 
 def setup_decoupled_expert_groups(ep_size: int, world_size: int, gpus_per_node: int) -> None:

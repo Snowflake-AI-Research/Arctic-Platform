@@ -165,6 +165,14 @@ def register(registry: Registry) -> None:
         registry=registry,
     )
     register_option(
+        "moe.shard_frozen_dense",
+        runs_in="trainer",
+        goal="memory",
+        why="Each recomputed layer's frozen replicated weights sharded over the ranks, all-gathered per call (LoRA).",
+        source="`loader_options.shard_frozen_dense`; `ARL_SHARD_FROZEN_DENSE` when unset",
+        registry=registry,
+    )
+    register_option(
         "moe.w4a8_experts",
         runs_in="trainer",
         goal="speed",
@@ -239,6 +247,18 @@ def register(registry: Registry) -> None:
             " input gradients stay BF16 GEMMs on the decoded weights."
         ),
         source="`loader_options.w8a8_experts`; `ARL_W8A8_EXPERTS` when unset",
+        registry=registry,
+    )
+    register_option(
+        "shard_dense",
+        runs_in="trainer",
+        goal="memory",
+        why=(
+            "Full fine-tuning of a Hugging Face model: the decoder layers' and the input embedding's trainable weights"
+            " sharded over the GPUs of each node, gathered around each layer call and reduce-scattered in its"
+            " backward; the LM head stays whole."
+        ),
+        source="`patches.dense_shard`",
         registry=registry,
     )
     register_option(

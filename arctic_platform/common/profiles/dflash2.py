@@ -36,6 +36,7 @@ def register(registry: Registry) -> None:
             "numerics.optimization_dtype",
         ],
         unsupported={
+            "shard_dense": "the dflash2 loader trains only its draft; dense_shard is the huggingface loader's",
             "checkpointing.mode": (
                 "the loader has no activation checkpointing; it rejects `patches.gradient_checkpointing`"
             ),

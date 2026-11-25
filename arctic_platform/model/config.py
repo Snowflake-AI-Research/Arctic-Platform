@@ -204,6 +204,15 @@ class Patches(BaseModel):
     zorro_train: ZorroTrainPatch | None = Field(None, description="ZoRRo Train patch (None disables).")
     peft: dict | None = Field(None, description="PEFT config; wrap after other patches, before the optimizer.")
 
+    dense_shard: StrictBool | PositiveInt = Field(
+        False,
+        description=(
+            "Full fine-tuning: shard the text decoder's layers' and the input embedding's trainable weights over the"
+            " GPUs of a node, gathered around each call (patches/dense_shard.py). true: the GPUs of one host; an"
+            " integer: that many consecutive ranks of one host. The LM head stays whole."
+        ),
+    )
+
     _validate_peft = field_validator("peft")(validate_peft_config)
 
     @model_validator(mode="after")
@@ -211,6 +220,13 @@ class Patches(BaseModel):
         if self.activation_offload is not None:
             if self.gradient_checkpointing is False:
                 raise ValueError("activation_offload requires gradient_checkpointing")
+        if self.dense_shard and self.peft is not None:
+            raise ValueError("dense_shard shards trainable weights for full fine-tuning; it does not support PEFT")
+        if self.dense_shard and self.tiled_mlp is not None:
+            raise ValueError(
+                "dense_shard gathers a layer's weights only around its calls, and the tiled MLP reads the MLP's"
+                " weights again in its backward: unset tiled_mlp"
+            )
         if self.tiled_mlp is not None and self.compile is not None and self.compile.fullgraph:
             raise ValueError("compile.fullgraph cannot be combined with tiled_mlp")
         return self
