@@ -159,9 +159,9 @@ Forwarded in the `initialize` payload (`JobConfig`):
 
 ## Weight Conversion Cache
 
-Converted checkpoints are published as complete directories. Node-local caches use a writer lock; shared caches use global rank 0 as the writer.
+Converted checkpoints are published as complete directories. Node-local caches use a writer lock; shared caches use global rank 0 as the writer. Standalone preparation never starts a distributed collective.
 
-Shared-cache launchers should choose a new `DSS_WEIGHT_CONVERSION_ATTEMPT_ID` for every retry. Distributed loading establishes an identity collectively before checkpoint discovery when the launcher does not supply one.
+For standalone shared-cache conversion, set the same `DSS_WEIGHT_CONVERSION_ATTEMPT_ID` on every process and choose a new value for every retry. Native-format checkpoints and ready converted caches do not need this variable. Distributed loading establishes an identity collectively before checkpoint discovery.
 
 **Distributed weight loading requires every process-group rank.** The Qwen and GLM `load_dcp_from_hf` entry points use the default process group's barriers and distributed checkpoint reader, including for native checkpoints that need no conversion. Call these loaders on every rank, in the same order. A subset of ranks must not use these collective load entry points.
 

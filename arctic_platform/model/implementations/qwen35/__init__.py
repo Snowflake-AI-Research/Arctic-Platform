@@ -6,6 +6,7 @@ the public ``qwen3_5_moe`` model loader.
 
 __all__ = [
     "load_qwen3_5_moe_model",
+    "prepare_qwen3_5_moe_weights",
     "load_moe_model_for_deepspeed",
     "patch_deepspeed_moe_detection",
 ]

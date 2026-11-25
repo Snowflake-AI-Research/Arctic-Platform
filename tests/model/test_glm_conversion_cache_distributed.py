@@ -21,6 +21,7 @@ import multiprocessing
 import os
 import signal
 import time
+import uuid
 from datetime import timedelta
 from pathlib import Path
 
@@ -57,7 +58,7 @@ def _write_fixture(root):
     (source / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
 
 
-def _load(root, wave, *, kill_writer=False):
+def _load(root, wave, *, kill_writer=False, prepare=False):
     import torch
     import torch.distributed as dist
     from safetensors.torch import load_file
@@ -89,6 +90,10 @@ def _load(root, wave, *, kill_writer=False):
     model.stream_convert_to_prime = convert
     # Exercise real streamed-cache publication and recovery, not direct HF loading.
     model_builder.supports_direct_hf_loading = lambda model: False
+    if prepare:
+        model_builder.prepare_weight_conversion(
+            model, config, source, rank=rank, local_rank=int(os.environ["LOCAL_RANK"])
+        )
     model_builder.load_dcp_from_hf(model, config, None)
     expected = load_file(root / "expected.safetensors")
     actual = model.state_dict()
@@ -103,7 +108,7 @@ def _load(root, wave, *, kill_writer=False):
     dist.barrier()
 
 
-def _worker(rank, rendezvous, root, wave, kill_writer):
+def _worker(rank, rendezvous, root, wave, kill_writer, prepare):
     import torch
     import torch.distributed as dist
 
@@ -116,10 +121,12 @@ def _worker(rank, rendezvous, root, wave, kill_writer):
         DSS_WEIGHT_CONVERSION_TIMEOUT="5",
     )
     os.environ.pop("DSS_WEIGHT_CONVERSION_ATTEMPT_ID", None)
+    if prepare:
+        os.environ["DSS_WEIGHT_CONVERSION_ATTEMPT_ID"] = f"{root}-{wave}"
     torch.set_num_threads(1)
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=30))
     try:
-        _load(Path(root), wave, kill_writer=kill_writer)
+        _load(Path(root), wave, kill_writer=kill_writer, prepare=prepare)
     except TimeoutError as error:
         if not kill_writer or rank == 0:
             raise
@@ -128,11 +135,12 @@ def _worker(rank, rendezvous, root, wave, kill_writer):
         dist.destroy_process_group()
 
 
-def _run_pair(root, wave, *, kill_writer=False):
+def _run_pair(root, wave, *, kill_writer=False, prepare=False):
     context = multiprocessing.get_context("spawn")
     rendezvous = f"file://{root / ('rendezvous-' + wave)}"
     processes = [
-        context.Process(target=_worker, args=(rank, rendezvous, str(root), wave, kill_writer)) for rank in range(2)
+        context.Process(target=_worker, args=(rank, rendezvous, str(root), wave, kill_writer, prepare))
+        for rank in range(2)
     ]
     started = time.monotonic()
     try:
@@ -200,6 +208,14 @@ def test_malformed_conversion_cache_is_not_ready(tmp_path, index):
     assert conversion_cache_ready(destination) is False
 
 
+def test_glm_preparation_cache_is_loaded_by_real_dcp(tmp_path):
+    _write_fixture(tmp_path)
+    _run_pair(tmp_path, "prepared", prepare=True)
+    assert [path.name for path in tmp_path.glob("conversion-prepared-rank*")] == ["conversion-prepared-rank0"]
+    reports = [json.loads((tmp_path / f"loaded-prepared-rank{rank}.json").read_text()) for rank in range(2)]
+    assert reports[0] == reports[1]
+
+
 def _main():
     import torch
     import torch.distributed as dist
@@ -207,17 +223,22 @@ def _main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--shared-root", type=Path, required=True)
     parser.add_argument("--wave", choices=["cold", "killed", "retry", "warm"], required=True)
+    parser.add_argument("--prepare", action="store_true")
     args = parser.parse_args()
     os.environ["DSS_WEIGHT_CONVERSION_CACHE_SCOPE"] = "shared"
     os.environ.pop("DSS_WEIGHT_CONVERSION_ATTEMPT_ID", None)
     torch.set_num_threads(1)
     dist.init_process_group("gloo", timeout=timedelta(seconds=180))
     try:
+        if args.prepare:
+            tokens = [uuid.uuid4().hex if dist.get_rank() == 0 else None]
+            dist.broadcast_object_list(tokens, src=0)
+            os.environ["DSS_WEIGHT_CONVERSION_ATTEMPT_ID"] = tokens[0]
         if args.wave in {"cold", "killed"}:
             if dist.get_rank() == 0:
                 _write_fixture(args.shared_root)
             dist.barrier()
-        _load(args.shared_root, args.wave, kill_writer=args.wave == "killed")
+        _load(args.shared_root, args.wave, kill_writer=args.wave == "killed", prepare=args.prepare)
         if dist.get_rank() == 0:
             converters = [path.name for path in args.shared_root.glob(f"conversion-{args.wave}-rank*")]
             assert converters == ([] if args.wave == "warm" else [f"conversion-{args.wave}-rank0"])

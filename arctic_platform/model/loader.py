@@ -20,6 +20,7 @@ import functools
 from dataclasses import asdict
 from dataclasses import dataclass
 from dataclasses import field
+from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
@@ -232,6 +233,8 @@ class LoadedModel:
 Loader = Callable[[LoaderContext], LoadedModel]
 Matcher = Callable[[LoaderContext], bool]
 SpecValidator = Callable[[ModelSpec], None]
+# ``(spec, *, world_size, rank, local_rank) -> converted-weight cache dir | None``
+WeightPreparer = Callable[..., Path | None]
 
 
 @dataclass
@@ -240,6 +243,7 @@ class _LoaderEntry:
     matches: Matcher | None
     options: type[BaseModel] | None = None
     validate_spec: SpecValidator | None = None
+    prepare_weights: WeightPreparer | None = None
 
 
 _LOADERS: dict[str, _LoaderEntry] = {}
@@ -252,11 +256,14 @@ def register_loader(
     default: bool = False,
     options: type[BaseModel] | None = None,
     validate_spec: SpecValidator | None = None,
+    prepare_weights: WeightPreparer | None = None,
 ) -> Callable[[Loader], Loader]:
     """Register a loader by name.
 
     Optionally give it a ``matches`` predicate, mark it the ``default``, or attach an
     ``options`` pydantic model used to validate ``ModelSpec.loader_options``.
+    ``prepare_weights`` converts the checkpoint into the loader's cache without a process group; see
+    ``prepare_model_weights``.
     """
 
     def decorator(fn: Loader) -> Loader:
@@ -270,6 +277,7 @@ def register_loader(
             matches=matches,
             options=options,
             validate_spec=validate_spec,
+            prepare_weights=prepare_weights,
         )
         return fn
 
@@ -303,6 +311,23 @@ def resolve_loader_name(spec: ModelSpec) -> str:
 
     assert _DEFAULT_LOADER is not None, "no default loader registered"
     return _DEFAULT_LOADER
+
+
+def prepare_model_weights(spec: ModelSpec, *, world_size: int, rank: int, local_rank: int) -> Path | None:
+    """Fill the converted-weight cache ``build_model(spec)`` will load from, on this node, without a process group.
+
+    ``world_size`` is the training job's process count; ``rank`` must be its global rank.
+    Rank 0 writes a shared cache; the first local process holding the cache lock writes a node-local cache.
+    Standalone shared-cache preparation requires the same ``DSS_WEIGHT_CONVERSION_ATTEMPT_ID`` on every process,
+    with a new value for each retry. All callers wait for a ready cache or an attempt-scoped failure.
+    Returns the cache path, or None when the spec's loader converts nothing.
+    """
+    name = spec.loader
+    assert name is not None, "spec.loader must be resolved before prepare_model_weights"
+    prepare = _LOADERS[name].prepare_weights
+    if prepare is None:
+        return None
+    return prepare(spec, world_size=world_size, rank=rank, local_rank=local_rank)
 
 
 def select_loader(ctx: LoaderContext) -> Loader:

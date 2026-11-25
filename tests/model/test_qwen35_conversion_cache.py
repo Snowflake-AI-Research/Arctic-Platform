@@ -425,9 +425,11 @@ def test_node_local_conversion_cache_uses_lock_and_skips_ready_cache(tmp_path):
     assert conversion_cache.conversion_cache_ready(cache_path) is True
 
 
-def test_failed_node_local_conversion_removes_tmp_cache(tmp_path):
+@pytest.mark.parametrize("scope", ["node-local", "shared"])
+def test_failed_node_local_conversion_removes_tmp_cache(tmp_path, monkeypatch, scope):
     from arctic_platform.model.implementations.qwen35 import conversion_cache
 
+    monkeypatch.setenv("DSS_WEIGHT_CONVERSION_CACHE_SCOPE", scope)
     source_path = tmp_path / "source"
     source_path.mkdir()
     cache_path = tmp_path / "cache" / "prime"
@@ -456,6 +458,7 @@ def test_failed_node_local_conversion_removes_tmp_cache(tmp_path):
     leftovers = [p.name for p in cache_path.parent.iterdir() if p.name == "prime" or p.name.startswith("prime.")]
     assert sorted(leftovers) == ["prime.failed"]
     assert "disk full" in (cache_path.parent / "prime.failed").read_text()
+    assert not conversion_cache.conversion_cache_ready(cache_path)
 
 
 def test_forced_node_local_ready_sibling_does_not_write_or_lock(monkeypatch, tmp_path):
@@ -1400,7 +1403,8 @@ def test_lazy_preparation_does_not_impose_a_default_startup_deadline(monkeypatch
     assert clock[0] == 301
 
 
-def test_node_local_conversion_uses_checkpoint_callback_and_reuses_ready_cache(tmp_path):
+@pytest.mark.parametrize("callback_name", ["stream_convert_fn"])
+def test_node_local_conversion_uses_checkpoint_callback_and_reuses_ready_cache(tmp_path, callback_name):
     from arctic_platform.model.implementations.moe import conversion_cache
 
     source = tmp_path / "source"
@@ -1429,7 +1433,7 @@ def test_node_local_conversion_uses_checkpoint_callback_and_reuses_ready_cache(t
             unexpected_bulk_call,
             rank=0,
             local_rank=0,
-            stream_convert_fn=convert_checkpoint,
+            **{callback_name: convert_checkpoint},
         )
 
     assert len(converted) == 1
@@ -1437,8 +1441,39 @@ def test_node_local_conversion_uses_checkpoint_callback_and_reuses_ready_cache(t
     assert conversion_cache.conversion_cache_ready(destination)
 
 
+def test_bulk_conversion_preserves_in_place_contract_when_converter_returns_other_data(tmp_path):
+    from arctic_platform.model.implementations.moe import conversion_cache
+
+    saved = []
+    original = {"original": object()}
+
+    def convert(state):
+        assert state is original
+        state["converted"] = state.pop("original")
+        return {"not_a_full_state_dict": "converter metadata"}
+
+    def save(state, path):
+        saved.append(state.copy())
+        _write_ready_cache(path)
+
+    conversion_cache.ensure_node_local_conversion_cache(
+        tmp_path,
+        tmp_path / "prime",
+        convert,
+        "HF",
+        "PrimeRL",
+        lambda path: original,
+        save,
+        rank=0,
+        local_rank=0,
+    )
+    assert saved == [original]
+    assert set(saved[0]) == {"converted"}
+
+
 @pytest.mark.parametrize("failure", ["exception", "missing-index", "missing-shard"])
-def test_checkpoint_callback_failure_never_publishes_cache(tmp_path, failure):
+@pytest.mark.parametrize("callback_name", ["stream_convert_fn"])
+def test_checkpoint_callback_failure_never_publishes_cache(tmp_path, failure, callback_name):
     from arctic_platform.model.implementations.moe import conversion_cache
 
     source = tmp_path / "source"
@@ -1471,8 +1506,62 @@ def test_checkpoint_callback_failure_never_publishes_cache(tmp_path, failure):
             unexpected_bulk_call,
             rank=0,
             local_rank=0,
-            stream_convert_fn=convert_checkpoint,
+            **{callback_name: convert_checkpoint},
         )
 
     assert not destination.exists()
     assert not list(destination.parent.glob("prime.tmp-*"))
+
+
+def test_shared_conversion_sweeps_durably_failed_workspace_before_conversion(monkeypatch, tmp_path):
+    from arctic_platform.model.implementations.moe import conversion_cache as cache
+
+    destination = tmp_path / "prime"
+    orphan = destination.with_name("prime.tmp-rank0-pid123-old")
+    orphan.mkdir()
+    owner = orphan.with_name(f"{orphan.name}.owner")
+    cache._write_cache_marker(owner, dict(host="another-node", pid=123, state="failed"))
+    monkeypatch.setattr(cache, "_ABANDONED_CACHE_AGE", 0.02)
+    monkeypatch.setattr(cache, "_CACHE_HEARTBEAT_INTERVAL", 0.01)
+
+    def convert(source, output):
+        assert not orphan.exists(), "durable failure must be reclaimed before allocating the next copy"
+        assert not owner.exists()
+        _write_ready_cache(output)
+
+    cache.ensure_node_local_conversion_cache(
+        tmp_path,
+        destination,
+        lambda state: None,
+        "HF",
+        "PrimeRL",
+        lambda path: {},
+        lambda *args: None,
+        rank=0,
+        local_rank=0,
+        stream_convert_fn=convert,
+        node_local=False,
+    )
+    assert cache.conversion_cache_ready(destination)
+
+
+def test_shared_workspace_cleanup_preserves_unconfirmed_remote_writer_despite_clock_skew(monkeypatch, tmp_path):
+    import os
+
+    from arctic_platform.model.implementations.moe import conversion_cache as cache
+
+    destination = tmp_path / "prime"
+    live = tmp_path / "prime.tmp-rank0-pid123-live"
+    dead = tmp_path / "prime.tmp-rank1-pid124"
+    live.mkdir()
+    dead.mkdir()
+    owner = live.with_name(f"{live.name}.owner")
+    cache._write_cache_marker(owner, dict(host="other-node", pid=123, heartbeat=0))
+    os.utime(owner, ns=(1, 1))
+    cache._cleanup_abandoned_conversion_workspaces(destination)
+    assert live.exists() and dead.exists()
+    cache._write_cache_marker(owner, dict(host="other-node", pid=123, heartbeat=1))
+    os.utime(owner, ns=(1, 1))
+    cache._cleanup_abandoned_conversion_workspaces(destination)
+    assert live.exists()
+    assert dead.exists(), "unknown remote ownership is not proof that a writer is dead"
