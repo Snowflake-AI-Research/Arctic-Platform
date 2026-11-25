@@ -154,6 +154,29 @@ def register(registry: Registry) -> None:
         registry=registry,
     )
     register_option(
+        "moe.w4a8_experts",
+        runs_in="trainer",
+        goal="speed",
+        why=(
+            "INT4 routed experts run with FP8 activations at the checkpoint's static scales instead of decoded to"
+            " BF16."
+        ),
+        source="`loader_options.w4a8_experts`; `ARL_W4A8_EXPERTS` when unset",
+        registry=registry,
+    )
+    register_option(
+        "moe.w8a8_experts",
+        runs_in="trainer",
+        goal="speed",
+        why=(
+            "Frozen block-FP8 routed experts' forward GEMMs as W8A8 through DeepGEMM on Hopper (activations quantized"
+            " per token per 128 inputs, the FP8 release's activation_scheme), instead of decoding the weights to BF16;"
+            " input gradients stay BF16 GEMMs on the decoded weights."
+        ),
+        source="`loader_options.w8a8_experts`; `ARL_W8A8_EXPERTS` when unset",
+        registry=registry,
+    )
+    register_option(
         "attention.backend",
         runs_in="trainer",
         goal="speed",
