@@ -31,6 +31,15 @@ def _layer_indices(state_dict: dict[str, Tensor]) -> list[int]:
     return sorted({int(match.group(1)) for name in state_dict if (match := _LAYER_RE.match(name)) is not None})
 
 
+def checkpoint_conversion_groups(names: tuple[str, ...]) -> list[list[str]]:
+    """Keep each language layer's fused projections and expert scales together."""
+    groups: dict[str, list[str]] = {}
+    for name in names:
+        match = _LAYER_RE.match(name)
+        groups.setdefault(match.group(0) if match is not None else name, []).append(name)
+    return list(groups.values())
+
+
 def _rename(state_dict: dict[str, Tensor], old: str, new: str) -> None:
     if old in state_dict:
         state_dict[new] = state_dict.pop(old)
