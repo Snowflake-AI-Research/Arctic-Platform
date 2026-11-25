@@ -823,12 +823,18 @@ def test_nested_using_layout_restores_previous():
 def test_nested_using_layout_refuses_another_layout_on_held_modules():
     _, outer = _shared_layout()
     _, inner = _shared_layout(lengths=(5, 5))
+    # Built from the same batch but for another call: equal contents do not make it the same layout.
+    _, twin = _shared_layout()
     model = FlashAttention()
     shares_q = FlashAttention()
     shares_q.q = model.q
     with using_layout(model, outer):
+        # A .to() copy is the same call's layout, so it nests.
+        with using_layout(model, outer.to("cpu")) as copy:
+            assert get_stashed_layout(model.q) is copy
+        assert get_stashed_layout(model.q) is outer
         # The outer call's backward or checkpoint recompute inside the inner context would read the inner layout.
-        for nested_model, nested_layout in ((model, inner), (model, None), (shares_q, inner)):
+        for nested_model, nested_layout in ((model, inner), (model, twin), (model, None), (shares_q, inner)):
             with pytest.raises(RuntimeError, match="already stashed with another layout"):
                 with using_layout(nested_model, nested_layout):
                     pass

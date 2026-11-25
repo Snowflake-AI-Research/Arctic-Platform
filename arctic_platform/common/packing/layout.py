@@ -720,6 +720,13 @@ def _owning_thread() -> Iterator[None]:
                 _CONTEXT_OWNER = None
 
 
+def _same_layout(a: PackedLayout | None, b: PackedLayout | None) -> bool:
+    """``True`` if ``a`` and ``b`` are one call's layout, such as a layout and its :meth:`PackedLayout.to` copy."""
+    if a is None or b is None:
+        return a is b
+    return a.origin is b.origin
+
+
 @contextmanager
 def using_layout(model: torch.nn.Module, layout: PackedLayout | None) -> Iterator[PackedLayout | None]:
     """Stash ``layout`` on every submodule of ``model`` for one forward + loss + backward.
@@ -731,10 +738,10 @@ def using_layout(model: torch.nn.Module, layout: PackedLayout | None) -> Iterato
     entry are restored, so contexts nest on one thread; another thread entering while a
     context is active raises.
 
-    Nested contexts must cover disjoint modules unless they hold the same layout: a module stashed by an active
-    context with another layout (the same model, or a submodule two models share) raises, since the outer call's
-    backward or activation-checkpoint recompute inside the inner context would read the inner layout. Contexts
-    must exit innermost first; one exiting out of order raises.
+    Nested contexts must cover disjoint modules unless they hold the same layout (or its :meth:`PackedLayout.to`
+    copy): a module stashed by an active context with another layout (the same model, or a submodule two models
+    share) raises, since the outer call's backward or activation-checkpoint recompute inside the inner context
+    would read the inner layout. Contexts must exit innermost first; one exiting out of order raises.
 
     Keep the context open through backward. With activation checkpointing, recompute after
     exit raises ``CheckpointError`` for ``use_reentrant=False`` and silently drops the prefix
@@ -749,7 +756,7 @@ def using_layout(model: torch.nn.Module, layout: PackedLayout | None) -> Iterato
         stack.enter_context(_owning_thread())
         previous_stash = [(module, module.__dict__.get(LAYOUT_ATTR, _MISSING)) for module in model.modules()]
         for module, previous in previous_stash:
-            if previous is not _MISSING and previous is not layout:
+            if previous is not _MISSING and not _same_layout(previous, layout):
                 raise RuntimeError(
                     f"{type(module).__name__} is already stashed with another layout by an active using_layout; "
                     "the outer call's backward or activation-checkpoint recompute would read this context's "

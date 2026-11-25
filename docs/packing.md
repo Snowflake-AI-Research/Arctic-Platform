@@ -45,6 +45,28 @@ Two rules keep it there:
 - Read tensor contents into Python once per call, never once per row. A `.item()` inside a row loop blocks the host on the accelerator every iteration: at 128 rows that is 27.6 ms instead of 0.36.
 - Rewrite a batch through `map_batch_values`, which walks sub-dicts and so reaches RL's `context` leaves as well as the top-level inputs. Every rewrite here goes through it -- packing, padding, window slicing, and `select_rows`, which takes a group's rows out of a shard. A rewrite that misses `context` leaves two token widths in one batch, which passes dispatch and fails at the model call.
 
+## Prefix sharing
+
+Rows that share a prompt can share one packed copy of it. `PackedLayout.build(attention_mask, groups, shared, position_ids, input_ids=...)` takes the row plan as prompt groups plus, per group, how many valid tokens to store once. Each group's prefix becomes a root segment, gathered from the group's first row, and every row's remainder becomes a continuation that attends to its root's K/V as well as its own tokens. `pack_with_layout(data, layout)` packs a batch with that layout, and `layout.unpack(packed)` returns every row with its prefix.
+
+A model call runs inside `using_layout(model, layout)`, which stashes the layout on every submodule. Mixers read their boundaries from the stash rather than from `position_ids == 0`, since a continuation's positions do not restart at 0. A call holds one of three kinds of layout:
+
+- `None`: every mixer keeps its stock path. This marks a model as wrapped, so it can run inside another model's sharing context.
+- Unshared: every row is its own root (`unshared_groups(B)`). The call packs as `pack_microbatch` does, with the layout's segments.
+- Sharing: at least one group of two or more rows has `shared > 0`. `has_sharing` is computed per call, so a sharing job still gets unshared layouts for calls whose groups are all singletons.
+
+Sharing is fail-closed:
+
+- `build` and `pack_with_layout` refuse a group whose rows disagree on the prefix's `input_ids` or `position_ids`, loss weight on a shared cell, and a batch that is not the one the layout was built from. Router-replay ids that disagree on a group's prefix turn that group's sharing off.
+- `using_layout` refuses a sharing layout unless every sequence mixer supports continuation (flash-attn 2 >= 2.1, FA3, or FA4 with a varlen backward) and an MoE model has an explicit router-replay decision. The loss must be token-mean.
+- Code with no stash that reads boundaries while a sharing context is active (another model's attention, `position_ids == 0` helpers) raises instead of reading another call's segments.
+
+Context rules:
+
+- Keep the context open through backward. The prefix gather runs again in activation-checkpoint recompute, and `unpack`'s backward hook raises if the context has exited.
+- One thread holds contexts at a time. They nest on that thread over disjoint modules, or with the same layout (or its `.to()` copy). A different layout on a module another active context holds raises, since the outer call's backward or recompute would read the inner layout. Contexts exit innermost first.
+- Sequence-parallel shards and padded calls cannot run inside a context yet.
+
 ## What a worker receives
 
 Its window of each packed call, plus metadata. No token rows: carrying those beside the windows would put every token on the wire twice. For an RL shard of seven `[B, S]` leaves at `sp=2`, the rows would be 53% of the payload when they are full and 69% when they are half padding, since packing drops the padding and a row chunk keeps it.
