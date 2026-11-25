@@ -236,7 +236,9 @@ def _engine_forward_kwargs(batch: dict, meta: dict) -> dict:
 
 
 def _has_media(media: dict) -> bool:
-    return any(media.get(kind.values_key) is not None for kind in MEDIA_KINDS)
+    # Any media leaf, not just pixel values: a grid or row ids sent without their pixels must reach check_media, which
+    # refuses a kind whose leaves do not travel together.
+    return any(media.get(key) is not None for kind in MEDIA_KINDS for key in kind.keys)
 
 
 def set_media_job(engine, media_job: bool) -> None:

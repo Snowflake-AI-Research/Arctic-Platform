@@ -40,6 +40,7 @@ import transformers.models.qwen4_exp.modeling_qwen4_exp as hf_qwen4_exp
 
 from arctic_platform.common.packing import IMAGE_MEDIA
 from arctic_platform.common.packing import QWEN_VL_MEDIA_SPEC
+from arctic_platform.common.packing import MediaBatchError
 from arctic_platform.common.packing import cu_seqlens_from_position_ids
 from arctic_platform.common.packing import media_spec as media_spec_module
 from arctic_platform.common.packing import mrope_position_ids
@@ -683,3 +684,15 @@ def test_run_pipeline_sets_media_job_from_meta(model, media_job):
         return_tensors=True,
     )
     assert trainable.model.media_job is media_job
+
+
+@pytest.mark.parametrize("pack", [True, False], ids=["packed", "unpacked"])
+@pytest.mark.parametrize("keep", ["image_grid_thw", "image_row_ids"])
+def test_media_leaves_without_their_pixels_are_refused(model, pack, keep):
+    rows = _with_pixels(model, _rows())
+    batch = _padded_batch([rows[0], rows[2]])
+    for key in ("pixel_values", "image_grid_thw", "image_row_ids"):
+        if key != keep:
+            batch.pop(key)
+    with pytest.raises(MediaBatchError):
+        _run(model, batch, pack=pack)
