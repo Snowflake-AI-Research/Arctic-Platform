@@ -253,7 +253,8 @@ def _check_prepacked_media(engine, batch: dict) -> dict:
     if _media_spec(engine, media) is None:
         return batch
     empty = [
-        kind for kind in MEDIA_KINDS
+        kind
+        for kind in MEDIA_KINDS
         if torch.is_tensor(media.get(kind.grid_key)) and media[kind.grid_key].shape[0] == 0
     ]
     if empty:

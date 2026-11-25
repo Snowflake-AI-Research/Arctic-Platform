@@ -77,7 +77,7 @@ The Qwen-VL entry is registered for `qwen4_exp` only: its Arctic modeling takes 
 
 ### Media under context parallelism
 
-A CP rank's model call takes a media call windowed, which is what every dispatch sends: a caller's data plane and `run_pipeline`. Each rank gets `token_shard`'s window with the whole media items in it; `token_shard` refuses an item that straddles windows. The call is already sharded, so the Qwen3.8 CP wrapper (`qwen38/context_parallel.py`) runs it as it does a text-only call.
+A media call is sharded for CP by window: `token_shard` gives each rank its window with the whole media items in it, and refuses an item that straddles windows. A caller's data plane does the windowing; `run_pipeline` forwards a windowed call as it comes, and the Qwen3.8 CP wrapper (`qwen38/context_parallel.py`) runs it as it does a text-only call.
 
 ## Cost
 

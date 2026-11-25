@@ -595,7 +595,15 @@ def _prepacked(model, rows, positions):
 
 def _run_prepacked(model, batch, meta):
     return run_pipeline(
-        model, (), batch, meta, PROCESSING, "cpu", backward=False, pack=False, max_tokens_per_mb=10240,
+        model,
+        (),
+        batch,
+        meta,
+        PROCESSING,
+        "cpu",
+        backward=False,
+        pack=False,
+        max_tokens_per_mb=10240,
         return_tensors=True,
     )
 

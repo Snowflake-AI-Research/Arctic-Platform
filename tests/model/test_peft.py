@@ -470,6 +470,9 @@ def test_a_vision_model_with_no_media_spec_keeps_adapters_on_its_tower():
 
     adapted = {name.split(".lora_")[0].removeprefix("base_model.model.") for name in _adapter_names(model)}
     assert adapted == {
-        "model.visual.proj", "model.visual.down", "model.language_model.proj", "model.language_model.down",
+        "model.visual.proj",
+        "model.visual.down",
+        "model.language_model.proj",
+        "model.language_model.down",
     }
     assert model.peft_config["default"].exclude_modules is None
