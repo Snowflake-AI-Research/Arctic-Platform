@@ -27,6 +27,8 @@ import torch.nn.functional as F
 
 from .groups import batch_position_ids
 from .groups import batch_tensor
+from .media import check_media
+from .media import split_media
 from .walk import DROP
 from .walk import map_batch_values
 
@@ -91,7 +93,11 @@ def pack_microbatch(data: Dict[str, Any]) -> tuple[Dict[str, Any], PackMetadata]
     boundaries ride on the returned ``PackMetadata`` instead, because they describe this call's rows while a
     sharded model call needs the *global* boundaries, which the provider adapters rebuild from all-gathered
     ``position_ids``.
+
+    Media leaves (see ``media.py``) are checked against the rows and passed through unchanged: packing keeps the
+    rows in order, so each item's row id still names its row in the packed call.
     """
+    data, media = split_media(data)
     attention_mask = batch_tensor(data, "attention_mask", min_dims=2)
     position_ids = batch_position_ids(data)
     if attention_mask is None or attention_mask.ndim != 2:
@@ -108,6 +114,7 @@ def pack_microbatch(data: Dict[str, Any]) -> tuple[Dict[str, Any], PackMetadata]
         )
 
     batch_size, sequence_length = attention_mask.shape
+    check_media(media, batch_size)
     valid_sequence_lengths = attention_mask.sum(dim=1, dtype=torch.int32)
     # Each row is billed its token count and then read from its first column, so validity has to sit at the
     # front. A left-padded row would pack pad tokens and drop as many real ones, and nothing downstream can
@@ -141,6 +148,7 @@ def pack_microbatch(data: Dict[str, Any]) -> tuple[Dict[str, Any], PackMetadata]
         return value
 
     packed = map_batch_values(data, packed_value)
+    packed.update(media)
 
     return packed, PackMetadata(
         batch_size,
@@ -162,6 +170,7 @@ def pad_packed_microbatch(
     goes at the tail with per-key neutral values: ``labels`` get ``IGNORE_INDEX`` so pad tokens contribute no
     loss, and ``position_ids`` get 0 so each pad token reads as its own single-token sequence rather than
     extending the last real one.
+    Multimodal ``[channels, 1, T]`` positions get 0 on every channel, and media leaves are left alone.
 
     Nested dicts are padded too, and by their own leaf key, because RL ships its per-token tensors inside a
     ``context`` sub-dict. A leaf left at the unpadded width would no longer match the width ``token_shard``
@@ -175,14 +184,33 @@ def pad_packed_microbatch(
         return packed, metadata
 
     pad_tokens = padded_tokens - current_tokens
+    packed, media = split_media(packed)
 
     def padded_value(key: str, value: Any) -> Any:
+        if is_mrope_position_ids(key, value, current_tokens):
+            return F.pad(value, (0, pad_tokens), value=0)
         if torch.is_tensor(value) and value.ndim >= 2 and int(value.shape[1]) == current_tokens:
             pad_widths = [0, 0] * (value.ndim - 2) + [0, pad_tokens]
             return F.pad(value, pad_widths, value=sequence_pad_value(key))
         return value
 
-    return map_batch_values(packed, padded_value), replace(metadata, padded_tokens=padded_tokens)
+    padded = map_batch_values(packed, padded_value)
+    padded.update(media)
+    return padded, replace(metadata, padded_tokens=padded_tokens)
+
+
+def is_mrope_position_ids(key: str, value: Any, token_count: int) -> bool:
+    """Whether ``value`` is a packed call's multimodal ``[channels, 1, T]`` positions (``mrope.py``).
+
+    Their token axis is the last one, not the second, so the generic token-leaf rules would leave them whole.
+    """
+    return (
+        key == "position_ids"
+        and torch.is_tensor(value)
+        and value.ndim == 3
+        and int(value.shape[1]) == 1
+        and int(value.shape[2]) == token_count
+    )
 
 
 def unpack_output(
