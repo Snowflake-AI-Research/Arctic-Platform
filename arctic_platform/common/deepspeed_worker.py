@@ -1255,13 +1255,17 @@ class DeepSpeedWorker:
 
     @maybe_finish_router_replay_after_destroy
     def destroy(self) -> bool:
-        if self._weight_sender is not None:
-            self._weight_sender.destroy()
+        try:
+            if self._weight_sender is not None:
+                self._weight_sender.destroy()
+        finally:
             self._weight_sender = None
-        if dist.is_initialized():
-            dist.destroy_process_group()
-        self.engine = None
-        self._gpu_mem_preallocation = None
+            try:
+                if dist.is_initialized():
+                    dist.destroy_process_group()
+            finally:
+                self.engine = None
+                self._gpu_mem_preallocation = None
         return True
 
 
