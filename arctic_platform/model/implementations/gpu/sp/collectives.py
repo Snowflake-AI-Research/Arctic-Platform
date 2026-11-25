@@ -99,3 +99,24 @@ def gather_sequence(tensor: torch.Tensor, group) -> torch.Tensor:
     if group is None or dist.get_world_size(group) == 1:
         return tensor
     return _GatherSequence.apply(group, tensor)
+
+
+@torch.no_grad()
+def gather_packed_positions(position_ids: torch.Tensor, group) -> torch.Tensor:
+    """All-gather each rank's ``position_ids`` window into the packed call's ``[batch, sequence]`` positions.
+
+    Takes text ``[batch, W]`` ids or packed M-RoPE ``[channels, batch, W]`` ids (channel 0 holds the row
+    positions, each row restarting at 0). Shards are contiguous in rank order, so concatenating the windows on
+    the token axis rebuilds the unsharded call, from which ``cu_seqlens_from_position_ids`` reads the global
+    row boundaries. Concatenating M-RoPE windows on dim 1 instead would stack the ranks on the batch axis.
+    """
+    if position_ids.ndim == 3:
+        position_ids = position_ids[0]
+    if position_ids.ndim != 2:
+        raise ValueError(
+            "packed position_ids must be [batch, sequence] or M-RoPE [channels, batch, sequence], "
+            f"got {tuple(position_ids.shape)}"
+        )
+    gathered = [torch.empty_like(position_ids) for _ in range(dist.get_world_size(group))]
+    dist.all_gather(gathered, position_ids.contiguous(), group=group)
+    return torch.cat(gathered, dim=-1)

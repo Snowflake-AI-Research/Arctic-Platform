@@ -73,11 +73,13 @@ An item's token count is not in the spec: `media_token_spans`, `mrope_position_i
 
 The Qwen-VL entry is registered for `qwen4_exp` only: its Arctic modeling takes `[4, 1, T]` M-RoPE `position_ids` and both `pixel_values` and `pixel_values_videos`. Other Qwen vision-language model types are left out until their Arctic code path does the same: Arctic's `qwen3_5_moe` modeling flattens `position_ids.view(-1)` to find its packed rows and has no `pixel_values_videos` parameter, and `qwen3_vl`, `qwen3_vl_moe` and `qwen3_5` have no Arctic modeling that reads `[4, 1, T]` positions. A family with another layout adds its own with `register_media_spec(model_type, spec)`; a model type registered twice is refused.
 
-A caller that places media for a model takes its media kinds, merge factor and position layout from the spec of the model's `model_type` (`media_spec_for`), and checks each item's tokens with `media_token_spans`; `media_spec_for` gives None for a model type with no spec.
+`run_pipeline` takes its media kinds, merge factor and position layout from the spec of the engine's `model_type`, and checks each item's tokens with `media_token_spans`. A model type with no spec gets `pixel_values` and `image_grid_thw` as sent, with no M-RoPE positions or row ids, and any other media key is refused for it. `mm_token_type_ids` is read to build the positions and is not forwarded to the model.
 
 ### Media under context parallelism
 
-A media call is sharded for CP by window: `token_shard` gives each rank its window with the whole media items in it, and refuses an item that straddles windows.
+In a job that takes media, a caller sends `meta["media_job"]` on every `run_pipeline` call of every rank (or calls `set_media_job(engine, True)` itself when it drives the engine directly): only then does qwen4_exp run its dummy vision forward on a text-only microbatch, which keeps ZeRO's gradient buckets in step across ranks whose microbatches differ in media. A job that sends nothing trains text-only as before.
+
+A media call is sharded for CP by window: `token_shard` gives each rank its window with the whole media items in it, and refuses an item that straddles windows. A caller's data plane does the windowing; `run_pipeline` forwards a windowed call as it comes, and the Qwen3.8 CP wrapper (`qwen38/context_parallel.py`) runs it as it does a text-only call.
 
 ## Cost
 

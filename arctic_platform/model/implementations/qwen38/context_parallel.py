@@ -27,6 +27,7 @@ from torch import nn
 from torch.utils.checkpoint import set_checkpoint_early_stop
 
 from arctic_platform.model.implementations.gpu.packing import cu_seqlens_from_position_ids
+from arctic_platform.model.implementations.gpu.sp.collectives import gather_packed_positions
 from arctic_platform.model.implementations.gpu.sp.gated_delta_net import build_gated_delta_net_cp_context
 from arctic_platform.model.implementations.moe.logging_utils import get_logger
 from arctic_platform.model.implementations.moe.vlm import get_language_model
@@ -252,9 +253,7 @@ def _wrap_backbone_forward(backbone: nn.Module, linear_modules: list[nn.Module],
         local_positions = _text_position_ids(position_ids)
         global_cu_seqlens = kwargs.get("cu_seq_lens_q")
         if global_cu_seqlens is None:
-            gathered = [torch.empty_like(local_positions) for _ in range(world_size)]
-            dist.all_gather(gathered, local_positions.contiguous(), group=process_group)
-            global_cu_seqlens = cu_seqlens_from_position_ids(torch.cat(gathered, dim=1))
+            global_cu_seqlens = cu_seqlens_from_position_ids(gather_packed_positions(local_positions, process_group))
         global_cu_seqlens = _normalize_packed_cu_seqlens(
             global_cu_seqlens,
             sequence_length=local_positions.shape[-1] * world_size,

@@ -29,6 +29,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from ..packing import cu_seqlens_from_position_ids
+from .collectives import gather_packed_positions
 from .collectives import sequence_head_all_to_all
 
 logger = logging.getLogger(__name__)
@@ -863,11 +864,8 @@ def _install_global_boundary_wrapper(model: nn.Module, modules: list, process_gr
                 "rows: recurrent state has to reset at each row boundary, and a rank cannot see those "
                 "boundaries in its own window."
             )
-        world_size = dist.get_world_size(process_group)
-        gathered = [torch.empty_like(position_ids) for _ in range(world_size)]
-        dist.all_gather(gathered, position_ids.contiguous(), group=process_group)
         # SP shards are contiguous in rank order, so concatenation rebuilds the packed call's positions.
-        global_cu_seqlens = cu_seqlens_from_position_ids(torch.cat(gathered, dim=1))
+        global_cu_seqlens = cu_seqlens_from_position_ids(gather_packed_positions(position_ids, process_group))
         for module in modules:
             setattr(module, _GLOBAL_CU_SEQLENS_ATTRIBUTE, global_cu_seqlens)
         return original_forward(*args, **kwargs)

@@ -10,6 +10,7 @@ import torch.distributed as dist
 from torch import nn
 
 from arctic_platform.model.implementations.gpu.packing import cu_seqlens_from_position_ids
+from arctic_platform.model.implementations.gpu.sp.collectives import gather_packed_positions
 from arctic_platform.model.implementations.gpu.sp.collectives import sequence_head_all_to_all
 from arctic_platform.model.implementations.moe.logging_utils import get_logger
 from arctic_platform.model.implementations.moe.vlm import get_language_model
@@ -82,7 +83,6 @@ def _ulysses_attn_forward(
 def _make_backbone_sp_forward(
     original_forward, sp_group, softmax_attn_modules, linear_attn_modules, mamba_layers
 ):
-    sp_world_size = dist.get_world_size(sp_group)
     accepted = inspect.signature(original_forward).parameters
 
     def forward(
@@ -95,10 +95,7 @@ def _make_backbone_sp_forward(
         **kwargs,
     ):
         if position_ids is not None and (softmax_attn_modules or linear_attn_modules or mamba_layers):
-            gathered_position_ids = [torch.empty_like(position_ids) for _ in range(sp_world_size)]
-            dist.all_gather(gathered_position_ids, position_ids.contiguous(), group=sp_group)
-            global_position_ids = torch.cat(gathered_position_ids, dim=1)
-            cu_seqlens = cu_seqlens_from_position_ids(global_position_ids)
+            cu_seqlens = cu_seqlens_from_position_ids(gather_packed_positions(position_ids, sp_group))
             max_seqlen = int(cu_seqlens.diff().max().item())
             for module in softmax_attn_modules:
                 module._sp_cu_seqlens = cu_seqlens

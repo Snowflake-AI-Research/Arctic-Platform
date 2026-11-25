@@ -354,3 +354,23 @@ class TestBagIsolation(TestCasePlus):
                     "context": {"input_ids": torch.tensor([[1, 3]])},
                 }
             )
+
+
+def test_a_media_batch_is_not_cut_across_workers():
+    import pytest
+
+    from arctic_platform.common.packing import MediaBatchError
+
+    batch = {
+        "input_ids": torch.arange(8).view(4, 2),
+        "attention_mask": torch.ones(4, 2, dtype=torch.long),
+        "pixel_values": torch.zeros(6, 8),
+        "image_grid_thw": torch.tensor([[1, 2, 3]]),
+    }
+    envelope = {"batch": batch, "meta": {"balance_batch": False}, "processing": {"loss_fn": "ap_grpo"}}
+    with pytest.raises(MediaBatchError, match=r"media leaves \['image_grid_thw', 'pixel_values'\]"):
+        _split_batch(envelope, num_workers=2)
+    with pytest.raises(MediaBatchError):
+        _split_batch({**envelope, "batch": [batch]}, num_workers=2)
+    shards, _ = _split_batch(envelope, num_workers=1)
+    torch_assert_equal(shards[0]["batch"]["pixel_values"], batch["pixel_values"])
