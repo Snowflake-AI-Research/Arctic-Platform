@@ -71,6 +71,37 @@ class SamplingCounterContract(unittest.TestCase):
         result = worker._result_from_output(output, return_sampled_logprobs_only=True)
         self.assertNotIn('spec_decode_metrics', result)
 
+    def test_phase_timestamps_reach_results_and_non_streaming_records(self):
+        choice = NS(text='x', token_ids=[42], finish_reason='stop', logprobs=None,
+                    spec_decode_metrics=None)
+        stats = NS(queued_ts=10., scheduled_ts=10.25, first_token_ts=11.5, last_token_ts=12.)
+        output = NS(outputs=[choice], prompt_token_ids=[41], num_cached_tokens=0,
+                    prompt_logprobs=None, metrics=stats)
+
+        async def generate(prompt, sampling_params):
+            return worker._result_from_output(output, return_sampled_logprobs_only=True)
+
+        def remote(*args):
+            return NS(as_future=lambda: asyncio.ensure_future(generate(*args)))
+
+        handle = NS(generate=NS(remote=remote), set_replica_id=NS(remote=lambda _: None))
+        sched = scheduler.Scheduler([handle], capacity=1024)
+
+        async def run():
+            for output.metrics in (stats, None):
+                result = json.loads(json.dumps(await sched.submit([41], {})))
+                expected = dict(queued_ts=999_990., scheduled_ts=999_990.25, first_token_ts=999_991.5,
+                                last_token_ts=999_992.) if output.metrics else {}
+                self.assertEqual({k: v for k, v in result.items() if k.endswith('_ts')}, expected)
+            return sched._request_records.drain()
+
+        # Only the worker's clock is faked, so it disagrees with the scheduler's as on two hosts.
+        with patch.object(worker, 'time', NS(time=lambda: 1_000_000., monotonic=lambda: 20.)):
+            stamped, unstamped = asyncio.run(run())
+        self.assertAlmostEqual(stamped.completion_time - stamped.first_delta_time, .5, places=5)
+        self.assertLess(abs(stamped.first_delta_time - stamped.arrival_time), 60)
+        self.assertIsNone(unstamped.first_delta_time)
+
 
 if __name__ == '__main__':
     unittest.main()
