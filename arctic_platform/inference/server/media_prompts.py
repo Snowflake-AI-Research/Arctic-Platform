@@ -32,6 +32,7 @@ __all__ = [
     "MEDIA_PROMPT_KEYS",
     "SUPPORTS_MEDIA",
     "MediaDecodeError",
+    "MediaDecoderError",
     "decodable_modalities",
     "decode_media",
     "is_media_prompt",
@@ -51,6 +52,33 @@ class MediaDecodeError(ValueError):
     decoder's exception type or "unsupported format", never the bytes: the
     decoder's own message may echo the input.
     """
+
+
+class MediaDecoderError(RuntimeError):
+    """A media decoder failed in a way bad bytes do not explain (an API change, out of memory).
+
+    Not the caller's input, so not a ``MediaDecodeError``. The message names the
+    modality, the item's index and the exception type, never the bytes.
+    """
+
+
+# What a decoder raises for bytes it cannot decode: the builtin classes Pillow, OpenCV and
+# PyAV use (PyAV's InvalidDataError is a ValueError; Pillow's UnidentifiedImageError an
+# OSError), plus the library classes that subclass none of them.
+_BUILTIN_DECODE_ERRORS = (ValueError, OSError, EOFError, SyntaxError)
+
+
+def _library_decode_errors() -> tuple[type[BaseException], ...]:
+    """Pillow's DecompressionBombError and OpenCV's cv2.error, for the libraries already loaded."""
+    import sys
+
+    found = []
+    image = getattr(sys.modules.get("PIL.Image"), "DecompressionBombError", None)
+    cv2_error = getattr(sys.modules.get("cv2"), "error", None)
+    for cls in (image, cv2_error):
+        if isinstance(cls, type) and issubclass(cls, BaseException):
+            found.append(cls)
+    return tuple(found)
 
 
 # vLLM names two things in the ``video`` entry of ``media_io_kwargs``: the video
@@ -198,13 +226,17 @@ def decode_media(prompt: dict, media_io_kwargs: dict[str, dict[str, Any]] | None
                 continue
             media_io = loader(modality)
             failed = None
+            caller_fault = True
             try:
                 out.append(media_io.load_bytes(bytes(item)))
             except Exception as error:
                 failed = type(error).__name__
+                caller_fault = isinstance(error, _BUILTIN_DECODE_ERRORS + _library_decode_errors())
             if failed is not None:
                 # Raised outside the handler, so the decoder's exception is not even the context.
-                raise MediaDecodeError(f"could not decode {modality} {index} ({failed})") from None
+                if caller_fault:
+                    raise MediaDecodeError(f"could not decode {modality} {index} ({failed})") from None
+                raise MediaDecoderError(f"{modality} {index}: the decoder failed ({failed})") from None
         decoded[modality] = out[0] if single else out
     return {**prompt, "multi_modal_data": decoded}
 

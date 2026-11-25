@@ -1009,8 +1009,18 @@ def test_decoder_failure_classes_have_their_real_names():
     }
 
 
+@pytest.fixture
+def known_library_errors(monkeypatch):
+    """OpenCV is not installed here: make the stand-in cv2.error the class media_prompts knows."""
+    from arctic_platform.inference.server import media_prompts
+
+    from PIL import Image
+
+    monkeypatch.setattr(media_prompts, "_library_decode_errors", lambda: (Image.DecompressionBombError, _Cv2Error))
+
+
 @pytest.mark.parametrize("modality, cls", _DECODE_FAILURES, ids=lambda v: getattr(v, "__name__", v))
-def test_generate_raises_media_decode_error_for_each_decoder_failure(fake_loaders, modality, cls):
+def test_generate_raises_media_decode_error_for_each_decoder_failure(fake_loaders, known_library_errors, modality, cls):
     worker = _new_worker()
     worker.llm = _FakeEngine()
     good = _MEDIA[modality]
@@ -1024,7 +1034,7 @@ def test_generate_raises_media_decode_error_for_each_decoder_failure(fake_loader
     assert worker.llm.calls == []
 
 
-def test_a_bad_item_not_in_a_list_is_index_zero(fake_loaders):
+def test_a_bad_item_not_in_a_list_is_index_zero(fake_loaders, known_library_errors):
     prompt = _media_prompt(multi_modal_data={"image": [_image(b"good-0")], "video": _failing_bytes("video", _Cv2Error)})
     with pytest.raises(MediaDecodeError) as caught:
         _generate(_new_worker(), prompt)
@@ -1555,3 +1565,19 @@ def test_decode_media_refuses_exactly_what_sniff_media_format_does(brand):
 
     data = b"\0\0\0\x18ftyp" + brand + b"\0" * 8
     assert media_prompts._is_allowed_format("video", data) == (media_prompts.sniff_media_format(data) == "mp4")
+
+
+@pytest.mark.parametrize("cls", [TypeError, AttributeError, MemoryError, RuntimeError])
+def test_a_decoder_failure_bad_bytes_do_not_explain_is_not_the_callers(fake_loaders, monkeypatch, cls):
+    from arctic_platform.inference.server import media_prompts
+
+    class _Loader:
+        def load_bytes(self, data):
+            raise cls(f"boom {data!r}")
+
+    monkeypatch.setattr(media_prompts, "_make_loader", lambda *args, **kwargs: _Loader())
+    with pytest.raises(media_prompts.MediaDecoderError) as caught:
+        media_prompts.decode_media(_media_prompt(multi_modal_data={"image": [PNG]}))
+    assert not isinstance(caught.value, ValueError)
+    assert str(caught.value) == f"image 0: the decoder failed ({cls.__name__})"
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
