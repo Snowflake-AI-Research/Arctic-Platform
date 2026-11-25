@@ -894,7 +894,9 @@ def _run_configs(args, *, executor=None, snapshot=None) -> int:
         published_fixture = None
         local_full_model_path = None
         if local_full_model:
-            local_full_model_path = validate_local_full_model(backend, cfg, spec)
+            local_full_model_path = validate_local_full_model(
+                backend, cfg, spec, records_dir=args.reference_records_dir
+            )
             execution[cfg.config_id].update(
                 requested_model_name=cfg.model_name,
                 local_full_model_path=str(local_full_model_path),
@@ -1274,16 +1276,9 @@ def cmd_hosted(args) -> int:
 
 
 def cmd_list(args) -> int:
-    from ..api import catalog
+    from ..api import cmd_list as list_tests
 
-    print("Configurations:")
-    for identifier in catalog(Path(args.config_dir)):
-        print(f"  {identifier}")
-    print("Tests:")
-    for test in sorted(registered_tests().values(), key=lambda test: test.test_id):
-        print(f"{test.test_id:24s} {test.title}")
-        print(f"{'':24s} criterion: {test.criterion}")
-    return 0
+    return list_tests(args)
 
 
 def cmd_onboard(args) -> int:
@@ -1488,9 +1483,9 @@ def parse_args(argv=None):
     )
     publish.add_argument("--out", required=True, help="new publication receipt JSON path")
     publish.set_defaults(func=cmd_publish_fixture)
-    list_parser = sub.add_parser("list", help="show registered tests")
-    list_parser.add_argument("--config-dir", default=str(CONFIG_DIR))
-    list_parser.set_defaults(func=cmd_list)
+    from ..api import add_discovery_parsers
+
+    add_discovery_parsers(sub)
     h = sub.add_parser(
         "hosted",
         help="run Arctic Platform-against-Arctic Platform checks on the hosted server, which supplies the GPUs",
