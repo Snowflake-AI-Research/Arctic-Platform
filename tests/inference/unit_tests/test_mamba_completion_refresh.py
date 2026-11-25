@@ -124,6 +124,7 @@ def manager_methods(monkeypatch):
         ("spec_decode_grammar", "ensure_spec_decode_grammar_fix"),
         ("hybrid_state_fixes", "apply_hybrid_state_fixes"),
         ("tp_spec_decode_sync", "ensure_tp_spec_decode_sync"),
+        ("sparse_topk_order", "apply_sparse_topk_order_fix"),
         ("kv_group_size", "ensure_kv_group_size_patch"),
         ("mrope_yarn", "ensure_mrope_yarn_fix"),
         ("glm5next_lora", "ensure_glm5next_lora"),
