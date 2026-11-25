@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from collections.abc import Iterator
 
 import torch
@@ -13,24 +14,42 @@ def named_weight_sync_tensors(
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Yield parameters, expert biases and module-declared persistent buffers.
 
-    Weight sync passes ``include_export_buffers=False``: declared buffers are constant
-    checkpoint state the sampler loads with the model, and the receiver only accepts
-    parameter destinations.
+    Weight sync passes ``include_export_buffers=False``: buffers a module declares in
+    ``_dss_weight_export_buffers`` are constant checkpoint state the sampler loads with the
+    model, and the receiver only accepts parameter destinations. Those it declares in
+    ``_dss_weight_sync_buffers`` are parameters of the sampler's module and go with the
+    weight sync too. Parameters the model holds elsewhere (``moe/dense_shard.py``) come as
+    placeholders: read their data inside ``materialized_parameters``.
     """
-    yield from model.named_parameters()
+    from arctic_platform.model.weight_export import export_named_parameters
+
+    yield from export_named_parameters(model)
     for name, buffer in model.named_buffers():
         if name.endswith(".expert_bias"):
             yield name, buffer
             continue
-        if not include_export_buffers:
-            continue
         module_name, _, buffer_name = name.rpartition(".")
         owning_module = model.get_submodule(module_name)
-        sync_names = getattr(owning_module, "_dss_weight_export_buffers", ())
+        sync_names = set(getattr(owning_module, "_dss_weight_sync_buffers", ()))
+        if include_export_buffers:
+            sync_names |= set(getattr(owning_module, "_dss_weight_export_buffers", ()))
         if buffer_name not in sync_names:
             continue
         if buffer_name not in owning_module._non_persistent_buffers_set:
             yield name, buffer
+
+
+def weight_sync_skip_rule(model: nn.Module) -> Callable[[torch.Tensor], bool]:
+    """``tensor -> True`` for tensors a weight sync leaves out: marked ``_dss_skip_weight_sync`` themselves, or held
+    directly by a module so marked. Frozen checkpoint state the sampler keeps from its own load (DeepSeek-V4.1's
+    Engram tables, Qwen3.8's n-gram table); the marks survive the EP sharding and the DTensor unwrap."""
+    skipped = {
+        id(parameter)
+        for module in model.modules()
+        if getattr(module, "_dss_skip_weight_sync", False)
+        for parameter in module.parameters(recurse=False)
+    }
+    return lambda tensor: getattr(tensor, "_dss_skip_weight_sync", False) or id(tensor) in skipped
 
 
 def raise_unmapped_mlp_keys(packer: str, leftover: list[str]) -> None:
@@ -188,6 +207,7 @@ def build_iter_full_vllm_weights(model: nn.Module):
     import deepspeed.utils.groups as ds_groups
     import torch.distributed as dist
 
+    from arctic_platform.model.weight_export import materialized_parameters
     from arctic_platform.model.weight_export import wait_for_export_collective
 
     is_vlm = bool(getattr(model, "_is_vlm", False))
@@ -219,18 +239,17 @@ def build_iter_full_vllm_weights(model: nn.Module):
 
     def _iter():
         is_master = dist.get_rank() == 0
+        # The sampler keeps these from its own load. DeepSeek-V4.1's Engram table could not be gathered anyway: NCCL has
+        # no type for its UE8M0 scales, and its EP shards are uneven.
+        skipped = weight_sync_skip_rule(model)
         by_layer: dict[int, list[tuple[str, torch.Tensor]]] = {}
         for name, tensor in named_weight_sync_tensors(model, include_export_buffers=False):
-            by_layer.setdefault(_layer_idx(name), []).append((name, tensor))
+            if not skipped(tensor):
+                by_layer.setdefault(_layer_idx(name), []).append((name, tensor))
 
-        ordered_layers: list[int] = []
-        if -1 in by_layer:
-            ordered_layers.append(-1)
-        ordered_layers.extend(sorted(k for k in by_layer if k >= 0))
-
-        for layer_idx in ordered_layers:
+        def export_layer(layer_idx: int, tensors: list[tuple[str, torch.Tensor]]):
             layer_sd: dict[str, torch.Tensor] = {}
-            for name, tensor in by_layer[layer_idx]:
+            for name, tensor in tensors:
                 if (
                     hasattr(tensor, "group_name")
                     and getattr(tensor, "allreduce", True) is False
@@ -251,7 +270,7 @@ def build_iter_full_vllm_weights(model: nn.Module):
                     layer_sd[name] = tensor.data
 
             if not is_master:
-                continue
+                return
 
             layer_sd = {_strip_ac_wrapper(k): v for k, v in layer_sd.items()}
 
@@ -266,5 +285,16 @@ def build_iter_full_vllm_weights(model: nn.Module):
             for name, tensor in layer_sd.items():
                 out_name = to_vllm_vlm_name(name) if is_vlm else name
                 yield out_name, tensor
+
+        ordered_layers: list[int] = []
+        if -1 in by_layer:
+            ordered_layers.append(-1)
+        ordered_layers.extend(sorted(k for k in by_layer if k >= 0))
+
+        for layer_idx in ordered_layers:
+            # Held parameters (moe/dense_shard.py's node shards) are whole only for this layer; its tensors live in
+            # export_layer's frame, which ends before the next layer is materialized.
+            with materialized_parameters(model, [tensor for _, tensor in by_layer[layer_idx]]):
+                yield from export_layer(layer_idx, by_layer[layer_idx])
 
     return _iter

@@ -420,3 +420,25 @@ def test_initialize_logs_clear_cache_on_weight_sync(value, caplog):
 
     asyncio.run(run())
     assert f"clear_cache_on_weight_sync={value}" in caplog.text
+
+
+def test_broadcast_sync_gives_every_pipeline_stages_ranks_a_group_slot():
+    """Each rank of an engine joins as rank_offset + its engine-world rank, so a TP8 x PP2 replica takes 16 slots:
+    the group holds 1 + replicas x 16 ranks and the second replica starts at 17 (TP-only sizing left stage 2 out)."""
+    async def run():
+        events: list[str] = []
+        pool = _pool(events)
+        pool._config.tensor_parallel_size = 8
+        pool._config.pipeline_parallel_size = 2
+        pool._workers = [_FakeWorker(events), _FakeWorker(events)]
+        joins = []
+        for worker in pool._workers:
+            async def record(master_addr, master_port, *, rank_offset, world_size, **kwargs):
+                joins.append((rank_offset, world_size))
+                return {"status": "done", "params_loaded": 1}
+
+            worker.sync_weights_broadcast = _RemoteMethod(record)
+        await pool.sync_weights_broadcast("127.0.0.1", 12345, strategy="pause", pause_mode="keep")
+        assert joins == [(1, 33), (17, 33)]
+
+    asyncio.run(run())

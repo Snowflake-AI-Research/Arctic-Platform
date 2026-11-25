@@ -1822,7 +1822,7 @@ class ReplicaPool:
         """Shared pause/resume lifecycle for broadcast weight syncs.
 
         Only the broadcast payload differs between full-weight and LoRA syncs:
-        ``build_tasks(n, tp, world_size)`` returns the per-worker ``.remote(...)``
+        ``build_tasks(n, ranks, world_size)`` returns the per-worker ``.remote(...)``
         handles. ``extra_response`` is merged into the returned dict.
         """
         self._validate_weight_sync_strategy(strategy, pause_mode)
@@ -1835,8 +1835,10 @@ class ReplicaPool:
         async with self._stream_lifecycle():
             t0 = time.time()
             n = len(self._workers)
-            tp = self.tp_size
-            world_size = 1 + n * tp
+            # Every rank of an engine joins the group as rank_offset + its engine-world rank: TP ranks x PP
+            # stages, or a pipeline-parallel replica's later stages fall outside it.
+            ranks = self.world_size
+            world_size = 1 + n * ranks
             scheduler_was_paused = self._scheduler.paused
             available_workers = [
                 index for index in range(n)
@@ -1876,7 +1878,7 @@ class ReplicaPool:
                 self._updating_workers = set(range(n))
                 weight_update_started = True
                 results = await asyncio.gather(
-                    *build_tasks(n, tp, world_size), return_exceptions=True
+                    *build_tasks(n, ranks, world_size), return_exceptions=True
                 )
                 failed_workers = _failed_worker_indices(results)
                 if failed_workers:
@@ -1945,11 +1947,11 @@ class ReplicaPool:
         weight_format: str = "vllm",
     ) -> dict[str, Any]:
         """Join one NCCL broadcast group (rank 0 = trainer) and load weights into all replicas."""
-        def build_tasks(n, tp, world_size):
+        def build_tasks(n, ranks, world_size):
             return [
                 worker.sync_weights_broadcast.remote(
                     master_addr, master_port,
-                    rank_offset=1 + i * tp,
+                    rank_offset=1 + i * ranks,
                     world_size=world_size,
                     bucket_size=bucket_size,
                     engine_only=engine_only,
@@ -2002,11 +2004,11 @@ class ReplicaPool:
         lora_int_id = _SYNCED_LORA_ADAPTER_ID
         evict_first = strategy != "hotswap"
 
-        def build_tasks(n, tp, world_size):
+        def build_tasks(n, ranks, world_size):
             return [
                 worker.sync_lora_weights_broadcast.remote(
                     master_addr, master_port,
-                    rank_offset=1 + i * tp,
+                    rank_offset=1 + i * ranks,
                     world_size=world_size,
                     lora_int_id=lora_int_id,
                     lora_name=lora_name,
