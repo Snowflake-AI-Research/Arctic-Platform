@@ -124,6 +124,10 @@ class CombineReplay:
         self._by_forward: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
         self._outside: deque[tuple[torch.Tensor, int]] | None = None
         self._writing: object | None = None
+        # Dispatch handles kept for the recompute (``keep_dispatch`` / ``take_dispatch``), per forward like the
+        # outputs.
+        self._dispatch_by_forward: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+        self._dispatch_outside: deque[object] | None = None
 
     def start(self) -> None:
         """Begin a graph-building forward. Its recompute reads this queue; other forwards keep theirs."""
@@ -140,9 +144,11 @@ class CombineReplay:
                     "apart from an earlier one that has not been recomputed"
                 )
             self._outside = bucket
+            self._dispatch_outside = deque()
             self._writing = _OUTSIDE
             return
         self._by_forward[frame] = bucket
+        self._dispatch_by_forward[frame] = deque()
         self._writing = None
 
     def _queue(self, *, reading: bool) -> deque[tuple[torch.Tensor, int]] | None:
@@ -154,6 +160,32 @@ class CombineReplay:
         if self._writing is _OUTSIDE:
             return self._outside
         return None
+
+    def _dispatch_queue(self, *, reading: bool) -> deque[object] | None:
+        frame = _checkpoint_frame()
+        if frame is not None:
+            return self._dispatch_by_forward.get(frame)
+        if reading or self._writing is _OUTSIDE:
+            return self._dispatch_outside
+        return None
+
+    def keep_dispatch(self, handle: object) -> None:
+        """Keep a graph-building forward's dispatch handle for its recompute (``take_dispatch``)."""
+        if not torch.is_grad_enabled() or _in_recompute():
+            return
+        queue = self._dispatch_queue(reading=False)
+        if queue is None:
+            raise RuntimeError("dispatch replay: keep_dispatch() before start() on a graph-building forward")
+        queue.append(handle)
+
+    def take_dispatch(self) -> object:
+        """On the recompute, the handle of its forward's next dispatch. A backend whose received rows can come in
+        a different order each time dispatches the recompute with it, so the recompute rebuilds its saved tensors
+        in the row order of the graph the backward runs through."""
+        queue = self._dispatch_queue(reading=True)
+        if not queue:
+            raise RuntimeError("dispatch replay: a recompute found no dispatch handle from its forward")
+        return queue.popleft()
 
     def run(
         self,

@@ -25,6 +25,7 @@ from typing_extensions import Self
 
 from arctic_platform.model.config import ActivationCheckpointConfig
 from arctic_platform.model.config import ModelSpec
+from arctic_platform.model.implementations.moe.config_validation import validate_deepep_v2_recompute
 from arctic_platform.model.implementations.moe.config_validation import validate_lm_head_fused_ce_config
 from arctic_platform.model.implementations.moe.runtime_options import MoeRuntimeOptions
 from arctic_platform.model.loader import LoadedModel
@@ -43,7 +44,7 @@ class GenericMoeOptions(MoeRuntimeOptions):
 
     seq_len: int = Field(4096, gt=0)
     trust_remote_code: bool = False
-    ep_comm_backend: Literal["deepep", "uccl"] = "deepep"
+    ep_comm_backend: Literal["deepep", "deepep_v2", "uccl"] = "deepep"
     deepep_num_sms: int = Field(20, gt=0, multiple_of=2)
     reduce_dtype: Literal["bfloat16", "float32"] = "float32"
     moe_use_grouped_mm: bool = True
@@ -60,6 +61,11 @@ class GenericMoeOptions(MoeRuntimeOptions):
     @model_validator(mode="after")
     def _check_lm_head(self) -> Self:
         validate_lm_head_fused_ce_config(self.model_dump())
+        return self
+
+    @model_validator(mode="after")
+    def _deepep_v2_recompute_needs_its_forwards_dispatch(self) -> Self:
+        validate_deepep_v2_recompute(self.ep_comm_backend, self.ac_config)
         return self
 
 
