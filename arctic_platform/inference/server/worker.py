@@ -1701,8 +1701,8 @@ class InferenceWorker(StreamingWorkerMixin):
         engine's HF config through the model type's media spec (else the
         config's ``image_token_id`` / ``video_token_id``). A caller on another
         host can tell neither. ``{}`` before the engine is up, when media
-        prompts are unsupported, or when the model takes no media. Raises the
-        media spec's ``ValueError`` for a config it cannot place tokens with.
+        prompts are unsupported, or when the model takes no media. A modality
+        whose placeholder id the config lacks is left out.
         """
         if not self.supports_media or self.llm is None:
             return {}
