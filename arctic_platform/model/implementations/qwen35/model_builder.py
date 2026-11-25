@@ -518,7 +518,7 @@ def _move_buffers_to_cuda(model: nn.Module, config: ModelConfig) -> None:
 def resolve_weight_source(config: ModelConfig) -> Path:
     """Return the local checkpoint directory ``config.name`` loads from."""
     if not Path(config.name).exists():
-        return Path(snapshot_download(repo_id=config.name, repo_type="model"))
+        return Path(snapshot_download(repo_id=config.name, repo_type="model", allow_patterns=["*.safetensors", "*.safetensors.index.json"]))
     get_logger().info(
         f"Loading model weights from path {config.name}, skipping snapshot download. If this is not expected, "
         f"please remove the directory {config.name} and run again"
