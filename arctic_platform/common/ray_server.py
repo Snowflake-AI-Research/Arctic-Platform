@@ -1105,8 +1105,9 @@ class ArcticRLRayServer:
                         path = os.path.join(path, f"checkpoint-{int(f.read().strip())}")
                 except ValueError:
                     pass
+        resize = bool(body.get("universal_checkpoint_resize", False))
         steps = await self._gather_training_refs(
-            lambda: [w.load_checkpoint.remote(path) for w in self.training_workers]
+            lambda: [w.load_checkpoint.remote(path, resize) for w in self.training_workers]
         )
         return {"job_id": job_id, "path": path, "global_step": int(steps[0]) if steps else 0}
 

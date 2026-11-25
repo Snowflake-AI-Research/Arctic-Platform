@@ -170,6 +170,12 @@ class TestOpMapping:
         assert req.job_id == TRAINING
         assert req.body == {"path": "/tmp/x", "step": 2, "checkpoint_id": None, "source_job_id": None}
 
+    def test_load_checkpoint_universal_resize_is_on_prem_only(self, client):
+        _call(client, "load_checkpoint", path="/tmp/x", universal_checkpoint_resize=True)
+        assert _last(client).body["universal_checkpoint_resize"] is True
+        with pytest.raises(ValueError, match="training_config.universal_checkpoint_resize"):
+            _call(client, "load_checkpoint", checkpoint_id="cp_1", universal_checkpoint_resize=True)
+
     def test_generate_targets_sampling_and_unwraps_results(self, client):
         """generate -> sampling job; returns the 'results' list."""
         out = _call(client, "generate", ["hi"], sampling_params={"n": 1}, routing_key="k", strict=True)

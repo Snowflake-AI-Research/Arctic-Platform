@@ -158,9 +158,17 @@ def load_checkpoint_request(
     step: int | None = None,
     checkpoint_id: str | None = None,
     source_job_id: JobId | None = None,
+    universal_checkpoint_resize: bool = False,
 ) -> Request:
     # Cortex: checkpoint_id, optionally from source_job_id's store. On-prem SFT: path/step.
     body = {"path": path, "step": step, "checkpoint_id": checkpoint_id, "source_job_id": source_job_id}
+    if universal_checkpoint_resize:
+        if checkpoint_id is not None:
+            raise ValueError(
+                "universal_checkpoint_resize is an on-prem load option; on Cortex set "
+                "training_config.universal_checkpoint_resize when creating the training job"
+            )
+        body["universal_checkpoint_resize"] = True
     return Request("load-checkpoint", jobs.require("training"), body)
 
 

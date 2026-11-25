@@ -687,9 +687,18 @@ class DeepSpeedWorker:
             "global_step": int(self.engine.global_steps),
         }
 
-    def load_checkpoint(self, path: str) -> int:
-        """Restore DeepSpeed state. Returns restored ``global_steps``, or 0 if none found."""
-        load_path, _ = self.engine.load_checkpoint(path)
+    def load_checkpoint(self, path: str, universal_checkpoint_resize: bool = False) -> int:
+        """Restore DeepSpeed state. Returns restored ``global_steps``, or 0 if none found.
+
+        With ``universal_checkpoint_resize``, a ZeRO-1/2 checkpoint saved at another DP size is converted to a
+        DeepSpeed universal checkpoint under ``path`` and loaded from there.
+        """
+        if universal_checkpoint_resize:
+            from arctic_platform.common.utils.universal_checkpoint import load_checkpoint_with_dp_resize
+
+            load_path, _ = load_checkpoint_with_dp_resize(self.engine, path)
+        else:
+            load_path, _ = self.engine.load_checkpoint(path)
         if load_path is None:
             return 0
         return int(self.engine.global_steps)

@@ -1,0 +1,311 @@
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Copyright 2025 Snowflake Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""Load a DeepSpeed ZeRO-1/2 checkpoint at a different DP size through a universal checkpoint.
+
+A ZeRO-1/2 checkpoint is rigid: one optimizer shard per DP rank, so ``engine.load_checkpoint`` refuses it at any other
+DP size. Converting it with DeepSpeed's ``ds_to_universal`` and loading the copy with ``checkpoint.load_universal``
+restores the fp32 master weights exactly, and the Adam moments and LR scheduler when those are loaded too.
+
+``load_checkpoint_with_dp_resize`` is the collective entry point for a training worker. The other helpers are its
+building blocks, for callers that choose where the converted copy goes and which ranks convert it. Torch and
+DeepSpeed are imported lazily.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import logging
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import uuid
+from collections.abc import Iterable
+from collections.abc import Iterator
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+UNIVERSAL_TAG_SUFFIX = "_universal"
+# First DeepSpeed release that records and loads Ulysses sequence-parallel checkpoints as TP=1.
+SEQUENCE_PARALLEL_MIN_DEEPSPEED = "0.20.2"
+
+_MODEL_STATES = "mp_rank_00_model_states.pt"
+_OPTIM_SHARD_RE = re.compile(r"(?:^|/)(?:bf16_)?zero_pp_rank_(\d+)_mp_rank_\d+_optim_states\.pt$")
+_OUTPUT_TAIL_CHARS = 4000
+
+
+def optimizer_shard_ranks(names: Iterable[str]) -> set[int]:
+    """DP ranks with a ZeRO optimizer shard among the file names or paths in ``names``."""
+    return {int(m.group(1)) for name in names if (m := _OPTIM_SHARD_RE.search(name))}
+
+
+def latest_tag(load_dir: str) -> str | None:
+    """The tag DeepSpeed's ``latest`` marker under ``load_dir`` names, or ``None``."""
+    latest = os.path.join(load_dir, "latest")
+    if not os.path.isfile(latest):
+        return None
+    with open(latest, encoding="utf-8") as f:
+        return f.read().strip() or None
+
+
+def _int_field(state: Any, key: str) -> int | None:
+    value = state.get(key) if isinstance(state, dict) else None
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _saved_model_state(tag_dir: str) -> dict | None:
+    import torch
+
+    path = os.path.join(tag_dir, _MODEL_STATES)
+    if not os.path.isfile(path):
+        return None
+    # DeepSpeed's own load unpickles this file in full; mmap keeps the module weights off the host.
+    state = torch.load(path, map_location="cpu", mmap=True, weights_only=False)
+    return state if isinstance(state, dict) else None
+
+
+def saved_dp_world_size(tag_dir: str) -> int | None:
+    """DP size a ZeRO-1/2 checkpoint tag was saved at, from its model states; ``None`` when it has none."""
+    return _int_field(_saved_model_state(tag_dir), "dp_world_size")
+
+
+def _has_model_parallelism(state: dict | None) -> bool:
+    from deepspeed.checkpoint.constants import CHECKPOINT_PARALLEL_DIMS
+    from deepspeed.checkpoint.constants import CHECKPOINT_PP_DEGREE
+
+    if _int_field(state, "mp_world_size") != 1:
+        return True
+    dims = state.get(CHECKPOINT_PARALLEL_DIMS)
+    return isinstance(dims, dict) and dims.get(CHECKPOINT_PP_DEGREE, 1) != 1
+
+
+def require_complete_checkpoint(tag_dir: str) -> int:
+    """Return the saved DP size after checking ``tag_dir`` holds every DP rank's optimizer shard.
+
+    The converter infers the DP size from the shards it finds, so a partial set would convert without error into
+    wrong tensors. A node-local checkpoint written by a multi-node job holds only that node's shards.
+    """
+    saved = saved_dp_world_size(tag_dir)
+    if saved is None:
+        raise RuntimeError(f"no {_MODEL_STATES} with a dp_world_size under {tag_dir!r}")
+    with os.scandir(tag_dir) as entries:
+        present = optimizer_shard_ranks(entry.name for entry in entries if entry.is_file())
+    missing = sorted(set(range(saved)) - present)
+    if missing:
+        raise RuntimeError(
+            f"{tag_dir!r} was saved at DP size {saved} but lacks the optimizer shards of rank(s) {missing}; "
+            "converting it to a universal checkpoint needs every rank's shard."
+        )
+    return saved
+
+
+def convert_to_universal(src_tag_dir: str, out_tag_dir: str) -> None:
+    """Convert one checkpoint tag with ``ds_to_universal`` into ``out_tag_dir``, replacing anything there.
+
+    Runs in a subprocess: the converter forks worker processes, which a process holding CUDA and NCCL state must not.
+    A checkpoint without TP or PP needs no client merge patterns, so the converter may add the version-only
+    ``universal_checkpoint_info`` that older DeepSpeed releases do not write.
+    """
+    cmd = [sys.executable, "-m", "deepspeed.checkpoint.ds_to_universal"]
+    cmd += ["--input_folder", src_tag_dir, "--output_folder", out_tag_dir]
+    if not _has_model_parallelism(_saved_model_state(src_tag_dir)):
+        cmd.append("--inject_missing_state")
+    shutil.rmtree(out_tag_dir, ignore_errors=True)
+    os.makedirs(os.path.dirname(out_tag_dir) or ".", exist_ok=True)
+    started = time.monotonic()
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"ds_to_universal failed on {src_tag_dir!r} (exit {result.returncode}):\n"
+            f"{result.stdout[-_OUTPUT_TAIL_CHARS:]}\n{result.stderr[-_OUTPUT_TAIL_CHARS:]}"
+        )
+    logger.info(
+        "converted %s to universal checkpoint %s in %.1fs", src_tag_dir, out_tag_dir, time.monotonic() - started
+    )
+
+
+@contextlib.contextmanager
+def universal_load(engine) -> Iterator[None]:
+    """Turn on DeepSpeed's ``checkpoint.load_universal`` for one load; DeepSpeed reads it only at load time."""
+    config = engine._config
+    saved = config.load_universal_checkpoint
+    config.load_universal_checkpoint = True
+    try:
+        yield
+    finally:
+        config.load_universal_checkpoint = saved
+
+
+def require_resize_support(engine) -> None:
+    """Raise unless ``engine`` can load a universal checkpoint converted from another DP size."""
+    import deepspeed
+    from packaging.version import Version
+
+    stage = engine.zero_optimization_stage()
+    if stage not in (1, 2):
+        raise RuntimeError(f"universal-checkpoint DP resize supports ZeRO stages 1 and 2, not stage {stage}")
+    sequence_parallel = hasattr(engine.mpu, "initialize_sequence_parallel")
+    if sequence_parallel and Version(deepspeed.__version__) < Version(SEQUENCE_PARALLEL_MIN_DEEPSPEED):
+        raise RuntimeError(
+            "universal-checkpoint DP resize with Ulysses sequence parallelism needs "
+            f"deepspeed>={SEQUENCE_PARALLEL_MIN_DEEPSPEED}, found {deepspeed.__version__}"
+        )
+
+
+def _world() -> tuple[int, int]:
+    import torch.distributed as dist
+
+    if not dist.is_initialized():
+        return 0, 1
+    return dist.get_rank(), dist.get_world_size()
+
+
+def _from_rank0(value):
+    import torch.distributed as dist
+
+    if not dist.is_initialized():
+        return value
+    shared = [value]
+    dist.broadcast_object_list(shared, src=0)
+    return shared[0]
+
+
+def _gather(value) -> list:
+    import torch.distributed as dist
+
+    if not dist.is_initialized():
+        return [value]
+    gathered = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered, value)
+    return gathered
+
+
+def _barrier() -> None:
+    import torch.distributed as dist
+
+    if dist.is_initialized():
+        dist.barrier()
+
+
+def _raise_if_any_failed(error: BaseException | None, what: str) -> None:
+    """Collective: re-raise this rank's ``error``, or tell ranks that succeeded which ranks failed."""
+    failed = [rank for rank, err in enumerate(_gather(None if error is None else repr(error))) if err is not None]
+    if error is not None:
+        raise error
+    if failed:
+        raise RuntimeError(f"{what} failed on rank(s) {failed}")
+
+
+def resize_source_tag(load_dir: str, tag: str | None, *, dp_size: int) -> str | None:
+    """The tag to convert when ``load_dir/tag`` was saved at a DP size other than ``dp_size``, else ``None``.
+
+    Collective: rank 0 reads the checkpoint and broadcasts its decision. ``tag=None`` means the ``latest`` tag.
+    """
+    rank, _ = _world()
+    decision = error = None
+    if rank == 0:
+        try:
+            resolved = tag if tag is not None else latest_tag(load_dir)
+            if resolved is not None:
+                saved = saved_dp_world_size(os.path.join(load_dir, resolved))
+                if saved and saved != dp_size:
+                    decision = resolved
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+    decision, error = _from_rank0((decision, error))
+    if error is not None:
+        raise RuntimeError(f"rank 0 could not read the saved DP size of {load_dir!r} tag={tag!r}: {error}")
+    return decision
+
+
+def converts_for_filesystem(directory: str) -> bool:
+    """Whether this rank is the one that writes ``directory`` for the ranks sharing its filesystem. Collective.
+
+    Each node's lowest rank drops a probe file into ``directory``; a node then converts only if no lower-ranked
+    node's probe is visible. A shared filesystem is written once, by rank 0, and node-local disks once per node.
+    """
+    rank, _ = _world()
+    hosts = _gather(socket.gethostname())
+    leader = hosts.index(hosts[rank]) == rank
+    probe_prefix = f".universal-resize-probe-{_from_rank0(uuid.uuid4().hex)}-"
+    probe = os.path.join(directory, f"{probe_prefix}{rank}")
+    error = None
+    if leader:
+        try:
+            os.makedirs(directory, exist_ok=True)
+            with open(probe, "w", encoding="utf-8"):
+                pass
+        except OSError as exc:
+            error = exc
+    _raise_if_any_failed(error, f"creating a probe file in {directory!r}")
+    converts = False
+    if leader:
+        with os.scandir(directory) as entries:
+            seen = [int(e.name[len(probe_prefix) :]) for e in entries if e.name.startswith(probe_prefix)]
+        converts = min(seen) == rank
+    _barrier()
+    if leader:
+        with contextlib.suppress(OSError):
+            os.remove(probe)
+    return converts
+
+
+def load_checkpoint_with_dp_resize(
+    engine, load_dir: str, tag: str | None = None, *, scratch_dir: str | None = None, **load_kwargs
+):
+    """``engine.load_checkpoint`` that also loads a ZeRO-1/2 checkpoint saved at another DP size. Collective.
+
+    At the saved DP size this is a plain ``engine.load_checkpoint``. Otherwise the tag is converted into
+    ``scratch_dir`` (default ``load_dir``) as ``<tag>_universal``, every rank loads that copy universally, and the
+    copy is removed. Each filesystem holding ``scratch_dir`` is written by one rank, which needs every DP rank's
+    optimizer shard under ``load_dir/tag``. Returns what ``engine.load_checkpoint`` returns.
+    """
+    source = resize_source_tag(load_dir, tag, dp_size=engine.seq_dp_world_size)
+    if source is None:
+        return engine.load_checkpoint(load_dir, tag, **load_kwargs)
+    require_resize_support(engine)
+    out_root = scratch_dir or load_dir
+    out_tag = source + UNIVERSAL_TAG_SUFFIX
+    converter = converts_for_filesystem(out_root)
+    error = None
+    if converter:
+        try:
+            src = os.path.join(load_dir, source)
+            saved = require_complete_checkpoint(src)
+            logger.info("resizing %s from DP %d to DP %d via %s", src, saved, engine.seq_dp_world_size, out_tag)
+            convert_to_universal(src, os.path.join(out_root, out_tag))
+        except Exception as exc:
+            error = exc
+    _raise_if_any_failed(error, "universal checkpoint conversion")
+    with universal_load(engine):
+        result = engine.load_checkpoint(out_root, out_tag, **load_kwargs)
+    _barrier()
+    if converter:
+        shutil.rmtree(os.path.join(out_root, out_tag), ignore_errors=True)
+        # ds_to_universal also points ``latest_universal`` at the copy it wrote.
+        marker = os.path.join(out_root, "latest_universal")
+        with contextlib.suppress(OSError):
+            with open(marker, encoding="utf-8") as f:
+                stale = f.read().strip() == out_tag
+            if stale:
+                os.remove(marker)
+    return result
