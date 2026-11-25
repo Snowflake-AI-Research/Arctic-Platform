@@ -756,14 +756,17 @@ def test_using_layout_validates_before_stashing():
 def test_nested_using_layout_restores_previous():
     _, outer = _shared_layout()
     _, inner = _shared_layout(lengths=(5, 5))
-    model, other = FlashAttention(), FlashAttention()
+    model, other, third = FlashAttention(), FlashAttention(), FlashAttention()
     with using_layout(model, outer):
         with using_layout(other, inner):
             assert get_stashed_layout(model) is outer
             assert get_stashed_layout(other.q) is inner
             assert get_active_packed_layout() is inner
-            with using_layout(model, inner):
-                assert get_stashed_layout(model.kv) is inner
+            with using_layout(third, inner):
+                assert get_stashed_layout(third.kv) is inner
+            assert LAYOUT_ATTR not in third.kv.__dict__
+            with using_layout(model, outer):
+                assert get_stashed_layout(model.kv) is outer
             assert get_stashed_layout(model.kv) is outer
         assert LAYOUT_ATTR not in other.__dict__ and LAYOUT_ATTR not in other.q.__dict__
         assert get_active_packed_layout() is outer
@@ -771,15 +774,50 @@ def test_nested_using_layout_restores_previous():
     assert get_active_packed_layout() is None
 
 
-def test_using_layout_restores_after_exception():
+def test_nested_using_layout_refuses_another_layout_on_held_modules():
     _, outer = _shared_layout()
     _, inner = _shared_layout(lengths=(5, 5))
     model = FlashAttention()
+    shares_q = FlashAttention()
+    shares_q.q = model.q
+    with using_layout(model, outer):
+        # The outer call's backward or checkpoint recompute inside the inner context would read the inner layout.
+        for nested_model, nested_layout in ((model, inner), (model, None), (shares_q, inner)):
+            with pytest.raises(RuntimeError, match="already stashed with another layout"):
+                with using_layout(nested_model, nested_layout):
+                    pass
+            assert get_stashed_layout(model.q) is outer and get_active_packed_layout() is outer
+    with using_layout(model, None):
+        with pytest.raises(RuntimeError, match="already stashed with another layout"):
+            with using_layout(model, outer):
+                pass
+    assert all(LAYOUT_ATTR not in module.__dict__ for module in model.modules())
+    assert get_active_packed_layout() is None
+
+
+def test_using_layout_refuses_an_out_of_order_exit():
+    _, layout = _shared_layout()
+    model, other = FlashAttention(), FlashAttention()
+    first, second = using_layout(model, layout), using_layout(other, layout)
+    first.__enter__()
+    second.__enter__()
+    with pytest.raises(RuntimeError, match="innermost first"):
+        first.__exit__(None, None, None)
+    assert get_stashed_layout(other) is layout and LAYOUT_ATTR not in model.__dict__
+    second.__exit__(None, None, None)
+    assert get_active_packed_layout() is None
+    assert all(LAYOUT_ATTR not in module.__dict__ for module in [*model.modules(), *other.modules()])
+
+
+def test_using_layout_restores_after_exception():
+    _, outer = _shared_layout()
+    _, inner = _shared_layout(lengths=(5, 5))
+    model, other = FlashAttention(), FlashAttention()
     with using_layout(model, outer):
         with pytest.raises(RuntimeError, match="boom"):
-            with using_layout(model, inner):
+            with using_layout(other, inner):
                 raise RuntimeError("boom")
-        assert get_stashed_layout(model) is outer
+        assert get_stashed_layout(model) is outer and LAYOUT_ATTR not in other.__dict__
         assert get_active_packed_layout() is outer
     assert get_active_packed_layout() is None
 

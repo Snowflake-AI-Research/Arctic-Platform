@@ -602,6 +602,8 @@ def _require_routed_experts_match(layout: PackedLayout, routed: Sequence[Tensor]
 
 # Innermost last. Process-global: read from autograd threads, written only by the owning thread.
 _ACTIVE_LAYOUTS: list[PackedLayout | None] = []
+# One per entry of _ACTIVE_LAYOUTS, telling apart contexts that hold the same layout.
+_ACTIVE_TOKENS: list[object] = []
 _CONTEXT_LOCK = threading.Lock()
 _CONTEXT_OWNER: int | None = None
 _CONTEXT_DEPTH = 0
@@ -682,6 +684,11 @@ def using_layout(model: torch.nn.Module, layout: PackedLayout | None) -> Iterato
     entry are restored, so contexts nest on one thread; another thread entering while a
     context is active raises.
 
+    Nested contexts must cover disjoint modules unless they hold the same layout: a module stashed by an active
+    context with another layout (the same model, or a submodule two models share) raises, since the outer call's
+    backward or activation-checkpoint recompute inside the inner context would read the inner layout. Contexts
+    must exit innermost first; one exiting out of order raises.
+
     Keep the context open through backward. With activation checkpointing, recompute after
     exit raises ``CheckpointError`` for ``use_reentrant=False`` and silently drops the prefix
     gather for ``use_reentrant=True`` (``transformers<5`` ``gradient_checkpointing_enable()``
@@ -691,26 +698,43 @@ def using_layout(model: torch.nn.Module, layout: PackedLayout | None) -> Iterato
         require_prefix_continuation(model)
         require_router_replay_decision(model, layout)
         require_bottom_right_causal_flash(model)
-    previous_stash = [(module, module.__dict__.get(LAYOUT_ATTR, _MISSING)) for module in model.modules()]
     with ExitStack() as stack:
         stack.enter_context(_owning_thread())
+        previous_stash = [(module, module.__dict__.get(LAYOUT_ATTR, _MISSING)) for module in model.modules()]
+        for module, previous in previous_stash:
+            if previous is not _MISSING and previous is not layout:
+                raise RuntimeError(
+                    f"{type(module).__name__} is already stashed with another layout by an active using_layout; "
+                    "the outer call's backward or activation-checkpoint recompute would read this context's "
+                    "layout. Run the two calls one after the other, or nest only models that share no modules"
+                )
         if layout is not None and layout.has_sharing:
             stack.enter_context(_hf_prefix_attention(model))
+        token = object()
         pushed = False
         try:
             for module, _ in previous_stash:
                 setattr(module, LAYOUT_ATTR, layout)
             _ACTIVE_LAYOUTS.append(layout)
+            _ACTIVE_TOKENS.append(token)
             pushed = True
             yield layout
         finally:
+            in_order = True
             if pushed:
-                _ACTIVE_LAYOUTS.pop()
+                in_order = _ACTIVE_TOKENS[-1] is token
+                index = next(i for i, held in enumerate(_ACTIVE_TOKENS) if held is token)
+                del _ACTIVE_TOKENS[index], _ACTIVE_LAYOUTS[index]
             for module, previous in previous_stash:
                 if previous is _MISSING:
                     module.__dict__.pop(LAYOUT_ATTR, None)
                 else:
                     setattr(module, LAYOUT_ATTR, previous)
+            if not in_order:
+                raise RuntimeError(
+                    "a using_layout context exited while a context entered after it was still active; contexts "
+                    "must exit innermost first, or the inner one's modules lose their stash"
+                )
 
 
 def _unstashed_error(name: str) -> ValueError:
