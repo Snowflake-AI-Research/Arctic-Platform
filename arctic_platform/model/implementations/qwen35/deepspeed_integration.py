@@ -25,6 +25,8 @@ from .model_builder import resolve_weight_source
 
 from .config import DebugModelConfig, ModelConfig
 from .sequence_parallel import apply_sequence_parallelism
+from .mtp_weights import iter_preserved_mtp_weights
+from .mtp_weights import iter_preserved_weights_collectively
 from .model_builder import (
     DTYPE_MAP,
     _reset_runtime_moe_buffers,
@@ -218,6 +220,23 @@ def _configure_family_backend(_config: ModelConfig) -> None:
     pass
 
 
+def _build_iter_full_hf_weights_with_mtp(model: nn.Module):
+    ordinary = _build_iter_full_hf_weights(model)
+
+    def iterator(*, include_skipped: bool = False):
+        names: set[str] = set()
+        for name, tensor in ordinary(include_skipped=include_skipped):
+            names.add(name)
+            yield name, tensor
+        # Finish all ordinary collectives before the serializer-only sidecar.
+        if include_skipped:
+            yield from iter_preserved_weights_collectively(
+                model, iter_preserved_mtp_weights, names, description="Original MTP"
+            )
+
+    return iterator
+
+
 def _apply_sequence_parallelism(model: nn.Module, sp_size: int, sp_group) -> None:
     if sp_size > 1:
         apply_sequence_parallelism(model, sp_size, sp_group)
@@ -274,6 +293,7 @@ def _adapter() -> MoEDeepSpeedAdapter:
         resolve_weight_source=resolve_weight_source,
         prepare_weight_conversion=prepare_weight_conversion,
         vllm_weight_export=_build_iter_full_vllm_weights,
+        hf_weight_export=_build_iter_full_hf_weights_with_mtp,
     )
 
 
@@ -372,6 +392,7 @@ def _generic_adapter() -> MoEDeepSpeedAdapter:
         _adapter(),
         apply_sequence_parallelism=_apply_generic_sequence_parallelism,
         vllm_weight_export=build_iter_full_vllm_weights,
+        hf_weight_export=_build_iter_full_hf_weights_with_mtp,
     )
 
 

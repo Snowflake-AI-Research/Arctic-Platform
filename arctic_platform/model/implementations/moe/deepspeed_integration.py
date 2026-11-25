@@ -68,6 +68,9 @@ class MoEDeepSpeedAdapter:
     prepare_weight_conversion: Callable[..., Path | None] | None = None
 
 
+    hf_weight_export: Callable[[nn.Module], Callable] | None = None
+
+
 # Largest EP-group gather assembled on the master GPU in one piece during weight export.
 
 
@@ -959,7 +962,7 @@ def load_moe_model_for_deepspeed(
     register_weight_export(
         model,
         WeightExportContract(
-            hf=build_iter_full_hf_weights,
+            hf=adapter.hf_weight_export or build_iter_full_hf_weights,
             vllm=adapter.vllm_weight_export,
         ),
     )
