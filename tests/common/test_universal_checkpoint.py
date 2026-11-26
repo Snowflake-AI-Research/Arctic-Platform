@@ -23,6 +23,7 @@ import os
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from arctic_platform.common.utils import universal_checkpoint as uc
 from arctic_platform.testing_utils import TestCasePlus
@@ -182,6 +183,43 @@ class TestConversion(TestCasePlus):
         _write_checkpoint(root / TAG, dp=2)
         with self.assertRaisesRegex(RuntimeError, r"(?s)exit 3.*AssertionError: boom"):
             uc.convert_to_universal(str(root / TAG), str(root / "out"))
+
+    def _convert_with(self, *, cpus: int, memory: int | None, dp: int = 4, shard_bytes: int = 0):
+        root = Path(self.get_auto_remove_tmp_dir())
+        _write_checkpoint(root / TAG, dp=dp)
+        for shard in (root / TAG).glob("*_optim_states.pt"):
+            shard.write_bytes(b"\0" * shard_bytes)
+        runs = []
+
+        def fake_run(cmd, **kwargs):
+            runs.append((cmd, kwargs["env"]))
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        for name, value in (("_usable_cpus", lambda: cpus), ("_available_memory_bytes", lambda: memory)):
+            self.addCleanup(setattr, uc, name, getattr(uc, name))
+            setattr(uc, name, value)
+        original = uc.subprocess.run
+        uc.subprocess.run = fake_run
+        self.addCleanup(setattr, uc.subprocess, "run", original)
+        with mock.patch.dict(os.environ, {"OMP_NUM_THREADS": "1"}):
+            uc.convert_to_universal(str(root / TAG), str(root / "out"))
+        ((cmd, env),) = runs
+        extract = int(cmd[cmd.index("--num_extract_workers") + 1])
+        merge = int(cmd[cmd.index("--num_merge_workers") + 1])
+        return extract, merge, int(env["OMP_NUM_THREADS"])
+
+    def test_converter_uses_the_cpus_of_a_single_threaded_job(self):
+        extract, merge, threads = self._convert_with(cpus=64, memory=None)
+        self.assertEqual(extract, 4)
+        self.assertGreater(merge, 2)
+        self.assertGreater(threads, 1)
+        self.assertLessEqual(max(extract, merge) * threads, 64)
+
+    def test_converter_fits_extract_workers_in_host_memory(self):
+        extract, _, _ = self._convert_with(cpus=64, memory=5000, shard_bytes=1000)
+        self.assertEqual(extract, 2)
+        extract, merge, threads = self._convert_with(cpus=1, memory=None)
+        self.assertEqual((extract, merge, threads), (1, 1, 1))
 
     def test_expert_shards_are_staged_as_autoep_input_and_removed(self):
         root = Path(self.get_auto_remove_tmp_dir())

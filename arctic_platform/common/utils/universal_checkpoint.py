@@ -65,6 +65,11 @@ _OUTPUT_TAIL_CHARS = 4000
 _EXPERT_WEIGHT_RE = re.compile(r"^(.+\.experts)\.(w[123])$")
 _EXPERT_WEIGHTS = ("w1", "w2", "w3")
 _AUTOEP_INPUT_SUFFIX = ".autoep-input"
+# ds_to_universal's CLI defaults (4 extract and 2 merge workers) leave most of a GPU node's cores idle, and a process
+# started by torchrun inherits OMP_NUM_THREADS=1, which makes every converter worker single-threaded.
+_MAX_MERGE_WORKERS = 16
+# A DeepSpeed release that does not memory-map the shard holds a whole one per extract worker, plus its fragments.
+_EXTRACT_BYTES_PER_SHARD_BYTE = 2
 
 
 def optimizer_shard_ranks(names: Iterable[str]) -> set[int]:
@@ -243,13 +248,48 @@ def stage_autoep_input(src_tag_dir: str, staging_dir: str, expert_shards: Sequen
     return layers
 
 
+def _usable_cpus() -> int:
+    if hasattr(os, "sched_getaffinity"):
+        return len(os.sched_getaffinity(0))
+    return os.cpu_count() or 1
+
+
+def _available_memory_bytes() -> int | None:
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _converter_parallelism(input_dir: str) -> tuple[int, int, int]:
+    """``ds_to_universal`` extract workers, merge workers and threads per worker for converting ``input_dir``.
+
+    Each extract worker takes one optimizer shard, so more workers than shards, CPUs or host memory allow do not help.
+    """
+    shards = [os.path.join(input_dir, name) for name in os.listdir(input_dir) if _OPTIM_SHARD_RE.search(name)]
+    cpus = _usable_cpus()
+    extract = max(1, min(len(shards), cpus))
+    memory = _available_memory_bytes()
+    if memory is not None and shards:
+        largest = max(os.path.getsize(path) for path in shards)
+        extract = max(1, min(extract, memory // max(1, _EXTRACT_BYTES_PER_SHARD_BYTE * largest)))
+    merge = max(1, min(_MAX_MERGE_WORKERS, cpus))
+    threads = max(1, cpus // max(extract, merge))
+    return extract, merge, threads
+
+
 def convert_to_universal(src_tag_dir: str, out_tag_dir: str, *, expert_shards: Sequence[str] | None = None) -> None:
     """Convert one checkpoint tag with ``ds_to_universal`` into ``out_tag_dir``, replacing anything there.
 
     Runs in a subprocess: the converter forks worker processes, which a process holding CUDA and NCCL state must not.
-    A checkpoint without TP or PP needs no client merge patterns, so the converter may add the version-only
-    ``universal_checkpoint_info`` that older DeepSpeed releases do not write. ``expert_shards`` lists each EP rank's
-    ``{name: tensor}`` expert file, in EP rank order, for a checkpoint with expert parallelism (see
+    The subprocess spreads its workers and their threads over this process's CPUs, whatever ``OMP_NUM_THREADS`` the
+    training job runs with. A checkpoint without TP or PP needs no client merge patterns, so the converter may add the
+    version-only ``universal_checkpoint_info`` that older DeepSpeed releases do not write. ``expert_shards`` lists
+    each EP rank's ``{name: tensor}`` expert file, in EP rank order, for a checkpoint with expert parallelism (see
     ``stage_autoep_input``); the staged input is removed afterwards.
     """
     shutil.rmtree(out_tag_dir, ignore_errors=True)
@@ -267,8 +307,11 @@ def convert_to_universal(src_tag_dir: str, out_tag_dir: str, *, expert_shards: S
         cmd += ["--input_folder", input_dir, "--output_folder", out_tag_dir]
         if not _has_model_parallelism(_saved_model_state(src_tag_dir)):
             cmd.append("--inject_missing_state")
+        extract, merge, threads = _converter_parallelism(input_dir)
+        cmd += ["--num_extract_workers", str(extract), "--num_merge_workers", str(merge)]
+        env = {**os.environ, "OMP_NUM_THREADS": str(threads)}
         started = time.monotonic()
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, env=env)
     finally:
         if staging is not None:
             shutil.rmtree(staging, ignore_errors=True)
@@ -278,7 +321,13 @@ def convert_to_universal(src_tag_dir: str, out_tag_dir: str, *, expert_shards: S
             f"{result.stdout[-_OUTPUT_TAIL_CHARS:]}\n{result.stderr[-_OUTPUT_TAIL_CHARS:]}"
         )
     logger.info(
-        "converted %s to universal checkpoint %s in %.1fs", src_tag_dir, out_tag_dir, time.monotonic() - started
+        "converted %s to universal checkpoint %s in %.1fs (%d extract, %d merge workers, %d threads each)",
+        src_tag_dir,
+        out_tag_dir,
+        time.monotonic() - started,
+        extract,
+        merge,
+        threads,
     )
 
 
