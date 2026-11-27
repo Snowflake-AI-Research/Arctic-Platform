@@ -22,9 +22,10 @@ restores the fp32 master weights exactly, and the Adam moments and LR scheduler 
 building blocks, for callers that choose where the converted copy goes and which ranks convert it. Torch and
 DeepSpeed are imported lazily.
 
-Expert-parallel checkpoints convert through DeepSpeed's AutoEP support when the caller saved each EP rank's experts
-as a ``{name: tensor}`` file: ``convert_to_universal(..., expert_shards=...)`` lays the checkpoint out as AutoEP saves
-it. The universal load then gives each EP rank its contiguous block of experts, so the EP size must not change.
+Expert-parallel checkpoints saved in the format of ``expert_parallel_checkpoint``, with each EP rank's experts in a
+``{name: tensor}`` file, convert through DeepSpeed's AutoEP support: ``convert_to_universal(..., expert_shards=...)``
+lays the checkpoint out as AutoEP saves it. The universal load then gives each EP rank its contiguous block of
+experts, so the EP size must not change.
 """
 
 from __future__ import annotations
@@ -39,6 +40,7 @@ import subprocess
 import sys
 import time
 import uuid
+from collections.abc import Callable
 from collections.abc import Iterable
 from collections.abc import Iterator
 from collections.abc import Mapping
@@ -72,6 +74,46 @@ _EXTRACT_BYTES_PER_SHARD_BYTE = 2
 def optimizer_shard_ranks(names: Iterable[str]) -> set[int]:
     """DP ranks with a ZeRO optimizer shard among the file names or paths in ``names``."""
     return {int(m.group(1)) for name in names if (m := _OPTIM_SHARD_RE.search(name))}
+
+
+def saved_dp_from_files(names: Iterable[str]) -> int | None:
+    """DP size a checkpoint tag was saved at, from a listing of its files; ``None`` when it lists no optimizer shard.
+
+    Raises unless the shards are those of DP ranks ``0..N-1``: a listing with gaps does not give the DP size.
+    """
+    ranks = optimizer_shard_ranks(names)
+    if not ranks:
+        return None
+    if ranks != set(range(len(ranks))):
+        missing = sorted(set(range(max(ranks) + 1)) - ranks)
+        raise RuntimeError(f"the checkpoint's optimizer shards lack DP rank(s) {missing}")
+    return len(ranks)
+
+
+def resize_needed(saved_dp: int | None, dp_size: int) -> bool:
+    """Whether a checkpoint saved at ``saved_dp`` must be converted to load at ``dp_size`` (the ZeRO sequence-DP size).
+
+    A resize reads the whole checkpoint, so every copy of the checkpoint directory needs every file of the tag.
+    """
+    return saved_dp is not None and saved_dp != dp_size
+
+
+def checkpoint_copy_key(node_local_storage: bool) -> str:
+    """Ranks with equal keys share one copy of the checkpoint directory: a node's ranks, or every rank.
+
+    The caller declares the storage, as DeepSpeed's ``checkpoint.use_node_local_storage`` does; a node-local-looking
+    path such as ``/tmp`` may be shared, so it is not inspected.
+    """
+    return socket.gethostname() if node_local_storage else ""
+
+
+def is_copy_leader(keys: Sequence[str], rank: int) -> bool:
+    """Whether ``rank`` is the lowest rank sharing its copy, given every rank's ``checkpoint_copy_key``.
+
+    The leader prepares and converts its copy for the others: it empties a reused tag directory before a resize
+    download, since the conversion reads every file there, and writes the universal copy.
+    """
+    return keys.index(keys[rank]) == rank
 
 
 def latest_tag(load_dir: str) -> str | None:
@@ -408,21 +450,32 @@ def _wait_group(timeout_s: float) -> Iterator[Any]:
         dist.destroy_process_group(group)
 
 
-def _raise_if_any_failed(error: BaseException | None, what: str, group=None) -> None:
-    """Collective: re-raise this rank's ``error``, or tell ranks that succeeded which ranks failed."""
+class CheckpointPeerFailed(RuntimeError):
+    """Another rank failed a step of a collective checkpoint load that this rank completed."""
+
+
+def _raise_if_any_failed(
+    error: BaseException | None,
+    what: str,
+    group=None,
+    peer_error: Callable[[str], BaseException] = CheckpointPeerFailed,
+) -> None:
+    """Collective: re-raise this rank's ``error``, or raise ``peer_error`` naming the ranks that failed."""
     failed = [
         rank for rank, err in enumerate(_gather(None if error is None else repr(error), group)) if err is not None
     ]
     if error is not None:
         raise error
     if failed:
-        raise RuntimeError(f"{what} failed on rank(s) {failed}")
+        raise peer_error(f"{what} failed on rank(s) {failed}")
 
 
-def resize_source_tag(load_dir: str, tag: str | None, *, dp_size: int) -> str | None:
+def resize_source_tag(load_dir: str, tag: str | None, *, dp_size: int, saved_dp: int | None = None) -> str | None:
     """The tag to convert when ``load_dir/tag`` was saved at a DP size other than ``dp_size``, else ``None``.
 
-    Collective: rank 0 reads the checkpoint and broadcasts its decision. ``tag=None`` means the ``latest`` tag.
+    Collective: rank 0 decides and broadcasts. ``tag=None`` means the ``latest`` tag. ``saved_dp`` is the saved DP size
+    when the caller knows it, e.g. ``saved_dp_from_files`` over the listing it downloaded from; otherwise rank 0 reads
+    it from the model states.
     """
     rank, _ = _world()
     decision = error = None
@@ -430,8 +483,8 @@ def resize_source_tag(load_dir: str, tag: str | None, *, dp_size: int) -> str | 
         try:
             resolved = tag if tag is not None else latest_tag(load_dir)
             if resolved is not None:
-                saved = saved_dp_world_size(os.path.join(load_dir, resolved))
-                if saved and saved != dp_size:
+                saved = saved_dp if saved_dp is not None else saved_dp_world_size(os.path.join(load_dir, resolved))
+                if resize_needed(saved, dp_size):
                     decision = resolved
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
@@ -441,20 +494,20 @@ def resize_source_tag(load_dir: str, tag: str | None, *, dp_size: int) -> str | 
     return decision
 
 
-def is_universal_converter(engine) -> bool:
+def is_universal_converter(engine, *, node_local_storage: bool | None = None) -> bool:
     """Whether this rank writes the universal copy that the ranks sharing its checkpoint directory read.
 
-    The caller declares the storage with DeepSpeed's ``checkpoint.use_node_local_storage`` and must set it to match
-    the filesystem, which cannot be inspected reliably: a node-local-looking path such as ``/tmp`` may be shared.
-    With it every node holds its own copy and each node's lowest rank converts; without it one directory is shared by
-    every node and rank 0 converts it once. Collective under node-local storage.
+    Under node-local storage (``node_local_storage``, by default DeepSpeed's ``checkpoint.use_node_local_storage``)
+    every node holds its own copy and each node's lowest rank converts; otherwise one directory is shared by every
+    node and rank 0 converts it once. See ``checkpoint_copy_key``. Collective under node-local storage.
     """
+    if node_local_storage is None:
+        node_local_storage = engine.use_node_local_storage()
     rank, _ = _world()
-    if not engine.use_node_local_storage():
+    if not node_local_storage:
         return rank == 0
     # LOCAL_RANK does not identify a node's ranks when each process sees one GPU, so group by host.
-    hosts = _gather(socket.gethostname())
-    return hosts.index(hosts[rank]) == rank
+    return is_copy_leader(_gather(checkpoint_copy_key(True)), rank)
 
 
 def load_checkpoint_with_dp_resize(
@@ -463,31 +516,49 @@ def load_checkpoint_with_dp_resize(
     tag: str | None = None,
     *,
     scratch_dir: str | None = None,
+    node_local_storage: bool | None = None,
+    saved_dp: int | None = None,
+    load_fn: Callable[..., Any] | None = None,
+    peer_error: Callable[[str], BaseException] = CheckpointPeerFailed,
     conversion_timeout_s: float = DEFAULT_CONVERSION_TIMEOUT_S,
     **load_kwargs,
 ):
-    """``engine.load_checkpoint`` that also loads a ZeRO-1/2 checkpoint saved at another DP size. Collective.
+    """Load a checkpoint, converting a ZeRO-1/2 checkpoint saved at another DP size. Collective.
 
-    At the saved DP size this is a plain ``engine.load_checkpoint``. Otherwise the tag is converted into
-    ``scratch_dir`` (default ``load_dir``) as ``<tag>_universal_<id>``, a name unique to this load so that jobs
-    resizing the same checkpoint do not share a copy; every rank loads it universally, and it is removed, also when
-    the conversion or any rank's load fails. The copy is written by rank 0, or by one rank per node under DeepSpeed's
-    ``checkpoint.use_node_local_storage`` (see ``is_universal_converter``), and that rank needs every DP rank's
-    optimizer shard under ``load_dir/tag``. The other ranks wait up to ``conversion_timeout_s`` for it. Returns what
-    ``engine.load_checkpoint`` returns.
+    At the saved DP size this is ``load_fn(load_dir, tag, universal=False, **load_kwargs)``. Otherwise the tag is
+    converted into ``scratch_dir`` (default ``load_dir``) as ``<tag>_universal_<id>``, a name unique to this load so
+    that jobs resizing the same checkpoint do not share a copy; every rank loads it with ``load_fn(scratch_dir,
+    <copy tag>, universal=True, **load_kwargs)``, and it is removed, also when the conversion or any rank's load fails.
+
+    - The copy is written by rank 0, or by one rank per node under ``node_local_storage`` (see
+      ``is_universal_converter``), and that rank needs every DP rank's optimizer shard under ``load_dir/tag``.
+    - ``saved_dp``: see ``resize_source_tag``. The converting rank checks it against the model states.
+    - ``load_fn`` defaults to ``load_deepspeed_checkpoint``, for checkpoints saved by ``engine.save_checkpoint`` or in
+      the expert-parallel format of ``save_expert_parallel_checkpoint``. A checkpoint of an expert-parallel engine
+      converts through its per-EP-rank expert files and keeps the EP size. Another ``load_fn`` must load a universal
+      copy as ``load_deepspeed_checkpoint(universal=True)`` does.
+    - A rank whose conversion or load fails raises its own error; the others raise ``peer_error(message)``. Ranks wait
+      for each other up to ``conversion_timeout_s``.
+
+    Returns what ``load_fn`` returns.
     """
-    source = resize_source_tag(load_dir, tag, dp_size=engine.seq_dp_world_size)
+    from .expert_parallel_checkpoint import expert_shard_paths
+    from .expert_parallel_checkpoint import has_expert_shards
+    from .expert_parallel_checkpoint import load_deepspeed_checkpoint
+
+    if load_fn is None:
+
+        def load_fn(load_dir, tag, *, universal, **kwargs):
+            return load_deepspeed_checkpoint(engine, load_dir, tag, universal=universal, **kwargs)
+
+    source = resize_source_tag(load_dir, tag, dp_size=engine.seq_dp_world_size, saved_dp=saved_dp)
     if source is None:
-        return engine.load_checkpoint(load_dir, tag, **load_kwargs)
+        return load_fn(load_dir, tag, universal=False, **load_kwargs)
     require_resize_support(engine)
-    if expert_parallel_parameter_names(engine.module):
-        raise RuntimeError(
-            "load_checkpoint_with_dp_resize does not convert expert-parallel checkpoints, whose experts it cannot "
-            "locate; pass each EP rank's expert file to convert_to_universal(expert_shards=...) instead"
-        )
+    expert_parallel = bool(expert_parallel_parameter_names(engine.module))
     out_root = scratch_dir or load_dir
     out_tag = f"{source}{UNIVERSAL_TAG_SUFFIX}_{_from_rank0(uuid.uuid4().hex[:8])}"
-    converter = is_universal_converter(engine)
+    converter = is_universal_converter(engine, node_local_storage=node_local_storage)
     try:
         # Created before converting: joining a new group is bounded by the default timeout, not ``conversion_timeout_s``.
         with _wait_group(conversion_timeout_s) as group:
@@ -496,21 +567,33 @@ def load_checkpoint_with_dp_resize(
                 try:
                     src = os.path.join(load_dir, source)
                     saved = require_complete_checkpoint(src)
+                    if saved_dp is not None and saved != saved_dp:
+                        raise RuntimeError(
+                            f"{src!r} was saved at DP size {saved}, but its listing has {saved_dp} optimizer shards"
+                        )
+                    shards = None
+                    if expert_parallel:
+                        if not has_expert_shards(src):
+                            raise RuntimeError(
+                                f"{src!r} is in DeepSpeed's MoE checkpoint format, which ds_to_universal cannot "
+                                "convert; save expert-parallel checkpoints with save_expert_parallel_checkpoint to "
+                                "load them at another DP size"
+                            )
+                        shards = expert_shard_paths(engine, src)
                     logger.info(
                         "resizing %s from DP %d to DP %d via %s", src, saved, engine.seq_dp_world_size, out_tag
                     )
-                    convert_to_universal(src, os.path.join(out_root, out_tag))
+                    convert_to_universal(src, os.path.join(out_root, out_tag), expert_shards=shards)
                 except Exception as exc:
                     error = exc
-            _raise_if_any_failed(error, "universal checkpoint conversion", group)
-        result = error = None
-        try:
-            with universal_load(engine):
-                result = engine.load_checkpoint(out_root, out_tag, **load_kwargs)
-        except Exception as exc:
-            error = exc
-        _raise_if_any_failed(error, "universal checkpoint load")
-        return result
+            _raise_if_any_failed(error, "universal checkpoint conversion", group, peer_error)
+            result = error = None
+            try:
+                result = load_fn(out_root, out_tag, universal=True, **load_kwargs)
+            except Exception as exc:
+                error = exc
+            _raise_if_any_failed(error, "universal checkpoint load", group, peer_error)
+            return result
     finally:
         if converter:
             shutil.rmtree(os.path.join(out_root, out_tag), ignore_errors=True)

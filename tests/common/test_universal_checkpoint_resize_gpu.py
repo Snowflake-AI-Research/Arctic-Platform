@@ -22,7 +22,6 @@ needing four ranks skip on smaller machines.
 
 from __future__ import annotations
 
-import contextlib
 import os
 from datetime import timedelta
 from pathlib import Path
@@ -213,17 +212,6 @@ class _MoEModel(torch.nn.Module):
         return h.float().sum()
 
 
-@contextlib.contextmanager
-def _non_moe_checkpoint(engine):
-    # As DSS saves expert parallelism: dense state through DeepSpeed's non-MoE path, experts in per-rank files.
-    saved = engine.has_moe_layers
-    engine.has_moe_layers = False
-    try:
-        yield
-    finally:
-        engine.has_moe_layers = saved
-
-
 def _ep_engine(world: int, stage: int, ep_size: int):
     import deepspeed
     import deepspeed.runtime.engine as ds_engine
@@ -286,7 +274,7 @@ def _ep_train_step(engine) -> float:
 def _ep_save(rank: int, world: int, port: int, root: str, stage: int, ep_size: int) -> None:
     import torch.distributed as dist
 
-    from arctic_platform.common.utils.universal_checkpoint import expert_parallel_parameter_names
+    from arctic_platform.common.utils.expert_parallel_checkpoint import save_expert_parallel_checkpoint
 
     _init(rank, world, port)
     try:
@@ -297,16 +285,9 @@ def _ep_save(rank: int, world: int, port: int, root: str, stage: int, ep_size: i
                 group.add_(2**-12)
         engine.optimizer.update_lp_params()
         reference = _full_state(engine, with_moments=True)
-        ckpt = Path(root) / "ckpt"
-        with _non_moe_checkpoint(engine):
-            engine.save_checkpoint(str(ckpt), tag=_EP_TAG)
+        assert save_expert_parallel_checkpoint(engine, str(Path(root) / "ckpt")) == _EP_TAG
         ep_rank, edp_rank = _ep_ranks(group_name)
         if edp_rank == 0:
-            params = dict(engine.module.named_parameters())
-            experts = {
-                name: params[name].detach().cpu().clone() for name in expert_parallel_parameter_names(engine.module)
-            }
-            torch.save(experts, ckpt / _EP_TAG / f"experts_ep_rank_{ep_rank:03d}.pt")
             torch.save(
                 {"state": reference, "adam_steps": _adam_steps(engine)}, Path(root) / f"reference_ep{ep_rank}.pt"
             )
@@ -318,27 +299,19 @@ def _ep_save(rank: int, world: int, port: int, root: str, stage: int, ep_size: i
 def _ep_load(rank: int, world: int, port: int, root: str, stage: int, ep_size: int, load_optimizer_states: bool):
     import torch.distributed as dist
 
-    from arctic_platform.common.utils.universal_checkpoint import UNIVERSAL_TAG_SUFFIX
-    from arctic_platform.common.utils.universal_checkpoint import convert_to_universal
-    from arctic_platform.common.utils.universal_checkpoint import universal_load
+    from arctic_platform.common.utils.universal_checkpoint import load_checkpoint_with_dp_resize
 
     _init(rank, world, port)
     try:
         engine, group_name = _ep_engine(world, stage, ep_size)
-        src = Path(root) / "ckpt" / _EP_TAG
-        out_root = Path(root) / f"universal-{world}"
-        out_tag = _EP_TAG + UNIVERSAL_TAG_SUFFIX
-        if rank == 0:
-            shards = [str(src / f"experts_ep_rank_{r:03d}.pt") for r in range(ep_size)]
-            convert_to_universal(str(src), str(out_root / out_tag), expert_shards=shards)
-        dist.barrier()
-        with universal_load(engine), _non_moe_checkpoint(engine):
-            load_path, _ = engine.load_checkpoint(
-                str(out_root),
-                out_tag,
-                load_optimizer_states=load_optimizer_states,
-                load_lr_scheduler_states=load_optimizer_states,
-            )
+        ckpt = Path(root) / "ckpt"
+        before = sorted(p.name for p in ckpt.iterdir())
+        load_path, _ = load_checkpoint_with_dp_resize(
+            engine,
+            str(ckpt),
+            load_optimizer_states=load_optimizer_states,
+            load_lr_scheduler_states=load_optimizer_states,
+        )
         assert load_path is not None
         assert engine.global_steps == 1, engine.global_steps
         ep_rank, _ = _ep_ranks(group_name)
@@ -354,6 +327,8 @@ def _ep_load(rank: int, world: int, port: int, root: str, stage: int, ep_size: i
             assert torch.equal(param.detach().cpu(), saved["state"][name]["fp32"].to(torch.bfloat16)), name
         if load_optimizer_states:
             assert _adam_steps(engine) == saved["adam_steps"], (_adam_steps(engine), saved["adam_steps"])
+        dist.barrier()
+        assert sorted(p.name for p in ckpt.iterdir()) == before, "the universal copy was not removed"
         assert torch.isfinite(torch.tensor(_ep_train_step(engine)))
         assert engine.global_steps == 2
     finally:
@@ -404,8 +379,8 @@ class TestUniversalCheckpointResize(TestCasePlus):
                 self._spawn(world, _ep_load, root, stage, 2, load_optimizer_states)
 
     def test_expert_parallel_zero2_shrink(self):
-        # EP 2 throughout: expert data parallelism 2 -> 1.
-        self._check_ep(2, 4, [(2, True), (2, False)])
+        # EP 2 throughout: expert data parallelism 2 -> 2 (no conversion), 2 -> 1.
+        self._check_ep(2, 4, [(4, True), (2, True), (2, False)])
 
     def test_expert_parallel_zero1_grow(self):
         self._check_ep(1, 2, [(4, True)])

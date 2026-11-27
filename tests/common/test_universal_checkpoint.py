@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import os
+import socket
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -97,7 +98,7 @@ def _slow_conversion_worker(rank: int, world_size: int, init_method: str, root: 
 
     import torch.distributed as dist
 
-    def slow_convert(src, out):
+    def slow_convert(src, out, **kwargs):
         time.sleep(_CONVERSION_S)
         Path(out).mkdir(parents=True)
 
@@ -136,6 +137,25 @@ class TestCheckpointInspection(TestCasePlus):
         _write_checkpoint(root / TAG, dp=4)
         self.assertEqual(uc.latest_tag(str(root)), TAG)
         self.assertEqual(uc.saved_dp_world_size(str(root / TAG)), 4)
+
+    def test_saved_dp_from_a_listing_needs_every_rank(self):
+        listing = [f"{TAG}/bf16_zero_pp_rank_{r}_mp_rank_00_optim_states.pt" for r in range(4)]
+        self.assertEqual(uc.saved_dp_from_files(listing + [f"{TAG}/mp_rank_00_model_states.pt"]), 4)
+        self.assertIsNone(uc.saved_dp_from_files([f"{TAG}/mp_rank_00_model_states.pt"]))
+        # A listing with gaps would read as a smaller DP size and skip a conversion it needs.
+        with self.assertRaisesRegex(RuntimeError, r"lack DP rank\(s\) \[1\]"):
+            uc.saved_dp_from_files([listing[0], listing[2]])
+
+    def test_resize_rules(self):
+        self.assertTrue(uc.resize_needed(4, 2))
+        self.assertFalse(uc.resize_needed(4, 4))
+        self.assertFalse(uc.resize_needed(None, 2))
+        self.assertEqual(uc.checkpoint_copy_key(False), "")
+        self.assertEqual(uc.checkpoint_copy_key(True), socket.gethostname())
+        # Ranks placed on hosts out of order: each copy's leader is its lowest rank.
+        keys = ["b", "a", "b", "a"]
+        self.assertEqual([r for r in range(4) if uc.is_copy_leader(keys, r)], [0, 1])
+        self.assertEqual([r for r in range(4) if uc.is_copy_leader([""] * 4, r)], [0])
 
     def test_partial_checkpoint_is_refused(self):
         root = Path(self.get_auto_remove_tmp_dir())
@@ -337,9 +357,11 @@ class TestLoadWithDpResize(TestCasePlus):
         super().setUp()
         self.root = Path(self.get_auto_remove_tmp_dir())
         self.converted = []
+        self.expert_shards = []
 
-        def fake_convert(src, out):
+        def fake_convert(src, out, expert_shards=None):
             self.converted.append((src, out))
+            self.expert_shards.append(expert_shards)
             Path(out).mkdir(parents=True)
             (Path(out).parent / "latest_universal").write_text(Path(out).name, encoding="utf-8")
 
@@ -399,7 +421,7 @@ class TestLoadWithDpResize(TestCasePlus):
     def test_a_failed_conversion_removes_its_partial_copy(self):
         _write_checkpoint(self.root / TAG, dp=4)
 
-        def failing_convert(src, out):
+        def failing_convert(src, out, **kwargs):
             Path(out).mkdir(parents=True)
             raise RuntimeError("ds_to_universal failed")
 
@@ -416,13 +438,74 @@ class TestLoadWithDpResize(TestCasePlus):
         _write_checkpoint(self.root / TAG, dp=4)
         mp.spawn(_slow_conversion_worker, args=(2, (self.root / "rendezvous").as_uri(), str(self.root)), nprocs=2)
 
-    def test_expert_parallel_engine_is_refused_before_converting(self):
+    def test_expert_parallel_checkpoint_in_deepspeeds_moe_format_is_refused(self):
         _write_checkpoint(self.root / TAG, dp=4)
         expert = SimpleNamespace(allreduce=False, group_name="ep_size_2")
         engine = _FakeEngine(dp=2, params={f"{_EXPERTS}.w1": expert, "dense.weight": SimpleNamespace()})
-        with self.assertRaisesRegex(RuntimeError, r"convert_to_universal\(expert_shards=\.\.\.\)"):
+        with self.assertRaisesRegex(
+            RuntimeError, r"DeepSpeed's MoE checkpoint format.*save_expert_parallel_checkpoint"
+        ):
             uc.load_checkpoint_with_dp_resize(engine, str(self.root))
         self.assertEqual((self.converted, engine.loads), ([], []))
+
+    def test_expert_parallel_checkpoint_converts_through_its_expert_files(self):
+        from arctic_platform.common.utils import expert_parallel_checkpoint as epc
+
+        tag_dir = self.root / TAG
+        _write_expert_parallel_checkpoint(tag_dir)
+        expert = SimpleNamespace(allreduce=False, group_name="ep_size_2")
+        engine = _FakeEngine(dp=1, params={f"{_EXPERTS}.w1": expert, "dense.weight": SimpleNamespace()})
+        original = epc.expert_shard_paths
+        epc.expert_shard_paths = lambda engine, src: _expert_shard_paths(Path(src))
+        self.addCleanup(setattr, epc, "expert_shard_paths", original)
+        loads = []
+        uc.load_checkpoint_with_dp_resize(
+            engine, str(self.root), load_fn=lambda d, t, *, universal, **kw: loads.append((t, universal, kw))
+        )
+        self.assertEqual(self.expert_shards, [_expert_shard_paths(tag_dir)])
+        ((out_tag, universal, kwargs),) = loads
+        self.assertEqual((universal, kwargs), (True, {}))
+        self.assertTrue(out_tag.startswith(TAG + uc.UNIVERSAL_TAG_SUFFIX))
+
+    def test_load_fn_loads_at_the_saved_and_at_another_dp(self):
+        _write_checkpoint(self.root / TAG, dp=2)
+        loads = []
+
+        def load_fn(load_dir, tag, *, universal, **kwargs):
+            loads.append((load_dir, tag, universal, kwargs))
+            return 7
+
+        engine = _FakeEngine(dp=2)
+        self.assertEqual(uc.load_checkpoint_with_dp_resize(engine, str(self.root), TAG, load_fn=load_fn, x=1), 7)
+        engine = _FakeEngine(dp=1)
+        self.assertEqual(uc.load_checkpoint_with_dp_resize(engine, str(self.root), TAG, load_fn=load_fn, x=1), 7)
+        (same, resized) = loads
+        self.assertEqual(same, (str(self.root), TAG, False, {"x": 1}))
+        self.assertEqual((resized[0], resized[2], resized[3]), (str(self.root), True, {"x": 1}))
+        self.assertEqual(engine.loads, [])
+
+    def test_a_listing_decides_and_must_match_the_model_states(self):
+        # Rank 0's local directory may hold a partial or stale checkpoint; the caller's listing decides.
+        _write_checkpoint(self.root / TAG, dp=2)
+        uc.load_checkpoint_with_dp_resize(_FakeEngine(dp=2), str(self.root), TAG, saved_dp=2)
+        self.assertEqual(self.converted, [])
+        with self.assertRaisesRegex(RuntimeError, "saved at DP size 2, but its listing has 4 optimizer shards"):
+            uc.load_checkpoint_with_dp_resize(_FakeEngine(dp=2), str(self.root), TAG, saved_dp=4)
+        self.assertEqual(self.converted, [])
+
+    def test_peers_raise_the_callers_peer_error(self):
+        class PeerFailed(RuntimeError):
+            pass
+
+        original = uc._gather
+        self.addCleanup(setattr, uc, "_gather", original)
+        uc._gather = lambda value, group=None: [value, "OSError('disk full')"]
+        with self.assertRaisesRegex(PeerFailed, r"universal checkpoint load failed on rank\(s\) \[1\]"):
+            uc._raise_if_any_failed(None, "universal checkpoint load", peer_error=PeerFailed)
+        with self.assertRaisesRegex(uc.CheckpointPeerFailed, r"rank\(s\) \[1\]"):
+            uc._raise_if_any_failed(None, "universal checkpoint load")
+        with self.assertRaisesRegex(OSError, "mine"):
+            uc._raise_if_any_failed(OSError("mine"), "universal checkpoint load", peer_error=PeerFailed)
 
     def test_converter_follows_the_declared_storage(self):
         # Ranks 0-3 on host a, 4-7 on host b; every process sees one GPU, so LOCAL_RANK would be 0 everywhere.
@@ -436,6 +519,14 @@ class TestLoadWithDpResize(TestCasePlus):
             for rank in range(8):
                 uc._world = lambda rank=rank: (rank, 8)
                 if uc.is_universal_converter(_FakeEngine(dp=8, node_local=node_local)):
+                    found.append(rank)
+            self.assertEqual(found, converters, node_local)
+            # The caller's declaration wins over DeepSpeed's flag.
+            found = []
+            for rank in range(8):
+                uc._world = lambda rank=rank: (rank, 8)
+                engine = _FakeEngine(dp=8, node_local=not node_local)
+                if uc.is_universal_converter(engine, node_local_storage=node_local):
                     found.append(rank)
             self.assertEqual(found, converters, node_local)
 

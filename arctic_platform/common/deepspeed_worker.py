@@ -179,6 +179,7 @@ class DeepSpeedWorker:
         debug_config = job_config.get("training_config")
         debug = gpu_memory_debug_config(debug_config if debug_config is not None else ds_worker_config)
         ep_size = int(ds_worker_config.get("ep_size", 1))
+        self._expert_parallel = ep_size > 1
         # The MoE loader owns expert- and sequence-parallel layout, so only dense loading is gated here.
         if ep_size > 1:
             spec = ds_worker_moe_model_spec(model_name, {**ds_worker_config, "debug": debug})
@@ -676,8 +677,16 @@ class DeepSpeedWorker:
         return dict(metrics=metrics, batch=dict())
 
     def save_checkpoint(self, path: str, export_hf: bool = False) -> dict:
-        """Save DeepSpeed checkpoint; optionally export HF weights to ``{path}/hf/`` (rank 0)."""
-        self.engine.save_checkpoint(path)
+        """Save DeepSpeed checkpoint; optionally export HF weights to ``{path}/hf/`` (rank 0).
+
+        Expert parallelism saves in the format of ``expert_parallel_checkpoint``, which loads at another DP size.
+        """
+        if self._expert_parallel:
+            from arctic_platform.common.utils.expert_parallel_checkpoint import save_expert_parallel_checkpoint
+
+            save_expert_parallel_checkpoint(self.engine, path)
+        else:
+            self.engine.save_checkpoint(path)
         hf_path = None
         if export_hf:
             hf_path = self.export_hf_checkpoint(path)
@@ -693,12 +702,13 @@ class DeepSpeedWorker:
         With ``universal_checkpoint_resize``, a ZeRO-1/2 checkpoint saved at another DP size is converted to a
         DeepSpeed universal checkpoint under ``path`` and loaded from there.
         """
-        if universal_checkpoint_resize:
-            from arctic_platform.common.utils.universal_checkpoint import load_checkpoint_with_dp_resize
+        from arctic_platform.common.utils.expert_parallel_checkpoint import load_deepspeed_checkpoint
+        from arctic_platform.common.utils.universal_checkpoint import load_checkpoint_with_dp_resize
 
+        if universal_checkpoint_resize:
             load_path, _ = load_checkpoint_with_dp_resize(self.engine, path)
         else:
-            load_path, _ = self.engine.load_checkpoint(path)
+            load_path, _ = load_deepspeed_checkpoint(self.engine, path)
         if load_path is None:
             return 0
         return int(self.engine.global_steps)
