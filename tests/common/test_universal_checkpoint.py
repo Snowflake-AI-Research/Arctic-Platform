@@ -12,9 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-# Copyright 2025 Snowflake Inc.
-# SPDX-License-Identifier: Apache-2.0
 """CPU tests for the universal-checkpoint DP resize helpers, without torch.distributed (a single rank)."""
 
 from __future__ import annotations

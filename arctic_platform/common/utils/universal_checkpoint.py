@@ -12,9 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-# Copyright 2025 Snowflake Inc.
-# SPDX-License-Identifier: Apache-2.0
 """Load a DeepSpeed ZeRO-1/2 checkpoint at a different DP size through a universal checkpoint.
 
 A ZeRO-1/2 checkpoint is rigid: one optimizer shard per DP rank, so ``engine.load_checkpoint`` refuses it at any other

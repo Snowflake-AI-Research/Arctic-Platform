@@ -12,9 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-# Copyright 2025 Snowflake Inc.
-# SPDX-License-Identifier: Apache-2.0
 """GPU tests for ``load_checkpoint_with_dp_resize`` on real DeepSpeed ZeRO-1/2 engines.
 
 A checkpoint saved with ``engine.save_checkpoint`` at one DP size is loaded at other DP sizes. The fp32 masters, and
