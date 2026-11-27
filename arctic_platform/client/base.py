@@ -323,11 +323,24 @@ class ArcticClient(_ArcticClientCore):
         step: int | None = None,
         checkpoint_id: str | None = None,
         source_job_id: JobId | None = None,
+        universal_checkpoint_resize: bool = False,
     ) -> dict:
-        """Restore weights/optimizer/LR/step: Cortex by ``checkpoint_id``, on-prem by ``path``/``step``."""
+        """Restore weights/optimizer/LR/step: Cortex by ``checkpoint_id``, on-prem by ``path``/``step``.
+
+        On-prem, ``universal_checkpoint_resize=True`` also loads a ZeRO-1/2 checkpoint saved at another DP size by
+        converting it to a DeepSpeed universal checkpoint inside the checkpoint directory first. Rank 0 converts the
+        directory once, as shared by every node, unless the DeepSpeed config sets
+        ``checkpoint.use_node_local_storage``: then each node converts its own copy. The setting must match the
+        storage, which is not detected.
+        """
         return self._call(
             load_checkpoint_request(
-                self.jobs, path=path, step=step, checkpoint_id=checkpoint_id, source_job_id=source_job_id
+                self.jobs,
+                path=path,
+                step=step,
+                checkpoint_id=checkpoint_id,
+                source_job_id=source_job_id,
+                universal_checkpoint_resize=universal_checkpoint_resize,
             )
         )
 
@@ -552,10 +565,16 @@ class AsyncArcticClient(_ArcticClientCore):
         step: int | None = None,
         checkpoint_id: str | None = None,
         source_job_id: JobId | None = None,
+        universal_checkpoint_resize: bool = False,
     ) -> dict:
         return await self._acall(
             load_checkpoint_request(
-                self.jobs, path=path, step=step, checkpoint_id=checkpoint_id, source_job_id=source_job_id
+                self.jobs,
+                path=path,
+                step=step,
+                checkpoint_id=checkpoint_id,
+                source_job_id=source_job_id,
+                universal_checkpoint_resize=universal_checkpoint_resize,
             )
         )
 
